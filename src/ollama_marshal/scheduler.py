@@ -132,11 +132,9 @@ class Scheduler:
         # Step 3: Handle unskippable requests (skip limit reached)
         await self._handle_unskippable_requests()
 
-        # Step 4: Bin-pack — load models that fit in remaining VRAM
+        # Step 4: Bin-pack — load fitting models + increment skip counters
+        # for models that were passed over this round
         await self._bin_pack_models()
-
-        # Step 5: Increment skip counters for models that couldn't be served
-        await self._increment_remaining_skips()
 
     async def _forward_loaded_model_requests(self) -> None:
         """Forward all pending requests whose model is already loaded."""
@@ -198,6 +196,7 @@ class Scheduler:
                 seen.add(envelope.model)
                 models_to_try.append(envelope.model)
 
+        skipped_models: list[str] = []
         for model in models_to_try:
             model_size = await self.registry.get_or_estimate_size(model)
             if self.memory.can_fit_model(model_size):
@@ -211,15 +210,13 @@ class Scheduler:
                 if success:
                     self.metrics.model_swaps += 1
                     await self.memory.refresh()
+            else:
+                skipped_models.append(model)
 
-    async def _increment_remaining_skips(self) -> None:
-        """Increment skip counters for unloaded models with pending requests."""
-        loaded = self.memory.get_loaded_models()
-        models_with_pending = await self.queues.peek_models()
-
-        for model in models_with_pending:
-            if model not in loaded:
-                await self.queues.increment_skips_for_model(model)
+        # Only increment skip counters for models that were actually
+        # passed over this round (didn't fit in VRAM), not every tick.
+        for model in skipped_models:
+            await self.queues.increment_skips_for_model(model)
 
     async def _ensure_model_loaded(self, model: str) -> bool:
         """Ensure a model is loaded, evicting others if needed.
@@ -264,11 +261,21 @@ class Scheduler:
         """
         pending_counts = await self.queues.pending_by_model()
 
-        # Build priority map from loaded models' pending request program IDs
+        # Build priority map: use the highest priority of any pending
+        # request for each loaded model (critical > normal)
         program_priorities: dict[str, str] = {}
+        all_pending = await self.queues.get_all_sorted_by_arrival()
+        for envelope in all_pending:
+            prog_cfg = self.config.get_program_config(envelope.program_id)
+            current = program_priorities.get(envelope.model, "normal")
+            if prog_cfg.priority == Priority.CRITICAL:
+                program_priorities[envelope.model] = "critical"
+            elif envelope.model not in program_priorities:
+                program_priorities[envelope.model] = current
+        # Ensure all loaded models have an entry (default normal)
         for model_name in self.memory.get_loaded_models():
-            # Default to normal priority for loaded models
-            program_priorities[model_name] = "normal"
+            if model_name not in program_priorities:
+                program_priorities[model_name] = "normal"
 
         candidates = self.memory.get_eviction_candidates(
             pending_counts, program_priorities

@@ -469,23 +469,28 @@ class TestBinPackModels:
 
 
 # ---------------------------------------------------------------------------
-# _increment_remaining_skips
+# _bin_pack_models skip counter behavior
 # ---------------------------------------------------------------------------
 
 
-class TestIncrementRemainingSkips:
-    async def test_increments_for_unloaded_models(self):
+class TestBinPackSkipCounters:
+    async def test_increments_skips_for_models_that_dont_fit(self):
         queues = ModelQueues()
-        envelope = _make_envelope(model="unloaded:latest")
+        envelope = _make_envelope(model="big:latest")
         await queues.enqueue(envelope)
 
         memory = MagicMock()
-        memory.get_loaded_models.return_value = {"other:latest": MagicMock()}
+        memory.is_loaded.return_value = False
+        memory.can_fit_model.return_value = False
+        memory.refresh = AsyncMock()
 
-        sched = _make_scheduler(queues=queues, memory=memory)
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=50 * 1024**3)
+
+        sched = _make_scheduler(queues=queues, memory=memory, registry=registry)
 
         assert envelope.skip_count == 0
-        await sched._increment_remaining_skips()
+        await sched._bin_pack_models()
         assert envelope.skip_count == 1
 
     async def test_does_not_increment_for_loaded_models(self):
@@ -494,22 +499,38 @@ class TestIncrementRemainingSkips:
         await queues.enqueue(envelope)
 
         memory = MagicMock()
-        memory.get_loaded_models.return_value = {"loaded:latest": MagicMock()}
+        memory.is_loaded.return_value = True
 
         sched = _make_scheduler(queues=queues, memory=memory)
 
-        await sched._increment_remaining_skips()
+        await sched._bin_pack_models()
         assert envelope.skip_count == 0
 
-    async def test_no_pending_models(self):
+    async def test_does_not_increment_for_models_that_fit(self):
         queues = ModelQueues()
+        envelope = _make_envelope(model="small:latest")
+        await queues.enqueue(envelope)
+
         memory = MagicMock()
-        memory.get_loaded_models.return_value = {}
+        memory.is_loaded.return_value = False
+        memory.can_fit_model.return_value = True
+        memory.refresh = AsyncMock()
 
-        sched = _make_scheduler(queues=queues, memory=memory)
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=1 * 1024**3)
 
-        # Should not raise
-        await sched._increment_remaining_skips()
+        lifecycle = MagicMock()
+        lifecycle.preload = AsyncMock(return_value=True)
+
+        sched = _make_scheduler(
+            queues=queues,
+            memory=memory,
+            registry=registry,
+            lifecycle=lifecycle,
+        )
+
+        await sched._bin_pack_models()
+        assert envelope.skip_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -881,18 +902,12 @@ class TestRunAndTick:
                 new_callable=AsyncMock,
             ) as mock_hur,
             patch.object(sched, "_bin_pack_models", new_callable=AsyncMock) as mock_bp,
-            patch.object(
-                sched,
-                "_increment_remaining_skips",
-                new_callable=AsyncMock,
-            ) as mock_irs,
         ):
             await sched._tick()
             mock_flm.assert_called_once()
             mock_hcp.assert_called_once()
             mock_hur.assert_called_once()
             mock_bp.assert_called_once()
-            mock_irs.assert_called_once()
 
     async def test_run_calls_tick(self):
         sched = _make_scheduler()

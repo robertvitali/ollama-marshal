@@ -886,5 +886,5 @@ class TestRouteHandlers:
             new_callable=AsyncMock,
             return_value=mock_resp,
         ):
-            result = await handler(request, "pull")
+            result = await handler(request, "show")
             assert result.status_code == 200

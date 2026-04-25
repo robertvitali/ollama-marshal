@@ -12,6 +12,7 @@ import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from ollama_marshal import __version__
 from ollama_marshal.config import MarshalConfig, ShutdownMode, load_config
 from ollama_marshal.lifecycle import ModelLifecycle
 from ollama_marshal.memory import MemoryManager
@@ -78,19 +79,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     yield
 
-    # Shutdown
+    # Shutdown — drain BEFORE stopping the scheduler so requests
+    # can still be processed during the drain phase
     logger.info("server.shutting_down", mode=_config.shutdown.mode.value)
-    await _scheduler.stop()
-    await _memory.stop_polling()
 
     if _config.shutdown.mode == ShutdownMode.DRAIN:
         pending = await _queues.total_pending()
         if pending > 0:
             logger.info("server.draining", pending_requests=pending)
-            # Wait for queue to drain with timeout
             deadline = time.monotonic() + _config.shutdown.drain_timeout
             while await _queues.total_pending() > 0 and time.monotonic() < deadline:
                 await asyncio.sleep(0.5)
+
+    await _scheduler.stop()
+    await _memory.stop_polling()
 
     if _config.shutdown.unload_models:
         loaded = list(_memory.get_loaded_models().keys())
@@ -116,7 +118,7 @@ def create_app(config: MarshalConfig | None = None) -> FastAPI:
     app = FastAPI(
         title="ollama-marshal",
         description="Model-aware scheduling proxy for Ollama",
-        version="0.1.0",
+        version=__version__,
         lifespan=lifespan,
     )
     app.state.config = config
@@ -221,25 +223,44 @@ def _register_routes(app: FastAPI) -> None:
             },
         }
 
-    # -- Pass-through endpoints --
+    # -- Pass-through endpoints (safe read-only allowlist) --
+
+    safe_passthrough = {
+        "/api/tags",
+        "/api/ps",
+        "/api/show",
+        "/api/version",
+    }
 
     @app.api_route(
         "/api/{path:path}",
-        methods=["GET", "POST", "PUT", "DELETE"],
+        methods=["GET", "POST"],
     )
     async def passthrough(request: Request, path: str) -> Response:
-        """Pass non-inference requests directly to Ollama."""
-        body = await request.body() if request.method in ("POST", "PUT") else None
+        """Pass safe read-only requests to Ollama.
+
+        Only allowlisted endpoints are forwarded. Destructive
+        endpoints (/api/pull, /api/delete, /api/copy) are blocked.
+        """
+        full_path = f"/api/{path}"
+        if full_path not in safe_passthrough:
+            return JSONResponse(
+                {
+                    "error": f"Endpoint {full_path} is not proxied. "
+                    "Use Ollama directly for model management."
+                },
+                status_code=403,
+            )
+        body = await request.body() if request.method == "POST" else None
         resp = await forward_passthrough(
             ollama_host=_config.ollama.host,
             method=request.method,
-            path=f"/api/{path}",
+            path=full_path,
             body=body,
         )
         return Response(
             content=resp.content,
             status_code=resp.status_code,
-            headers=dict(resp.headers),
         )
 
 
@@ -279,7 +300,19 @@ async def _enqueue_inference(
     )
 
     await _queues.enqueue(envelope)
-    await envelope.done_event.wait()
+    try:
+        await asyncio.wait_for(envelope.done_event.wait(), timeout=300)
+    except TimeoutError:
+        logger.error(
+            "server.request_timeout",
+            model=model,
+            program=program_id,
+            wait_s=300,
+        )
+        return JSONResponse(
+            {"error": "Request timed out waiting for model scheduling"},
+            status_code=504,
+        )
 
     if envelope.error:
         logger.error(
@@ -288,7 +321,7 @@ async def _enqueue_inference(
             error=str(envelope.error),
         )
         return JSONResponse(
-            {"error": str(envelope.error)},
+            {"error": "Internal proxy error"},
             status_code=502,
         )
 
@@ -343,11 +376,17 @@ async def _enqueue_and_wait(
     )
 
     await _queues.enqueue(envelope)
-    await envelope.done_event.wait()
+    try:
+        await asyncio.wait_for(envelope.done_event.wait(), timeout=300)
+    except TimeoutError:
+        return JSONResponse(
+            {"error": {"message": "Request timed out", "type": "timeout"}},
+            status_code=504,
+        )
 
     if envelope.error:
         return JSONResponse(
-            {"error": {"message": str(envelope.error), "type": "proxy_error"}},
+            {"error": {"message": "Internal proxy error", "type": "proxy_error"}},
             status_code=502,
         )
 

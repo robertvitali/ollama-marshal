@@ -116,7 +116,7 @@ class TestPydanticModelDefaults:
 
     def test_proxy_config_defaults(self):
         cfg = ProxyConfig()
-        assert cfg.host == "0.0.0.0"  # noqa: S104
+        assert cfg.host == "127.0.0.1"
         assert cfg.port == 11435
 
     def test_memory_config_defaults(self):

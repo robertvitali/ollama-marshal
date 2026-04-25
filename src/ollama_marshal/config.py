@@ -50,7 +50,7 @@ class OllamaConfig(BaseModel):
 class ProxyConfig(BaseModel):
     """Proxy server settings."""
 
-    host: str = Field(default="0.0.0.0", description="Proxy bind address")  # noqa: S104
+    host: str = Field(default="127.0.0.1", description="Proxy bind address")
     port: int = Field(default=11435, description="Proxy listen port")
 
 
@@ -264,7 +264,7 @@ def load_config(
     # Layer 1: Load from YAML file
     found_path = _find_config_file(config_path)
     if found_path:
-        with open(found_path) as f:
+        with open(found_path, encoding="utf-8") as f:
             file_data = yaml.safe_load(f)
             if file_data and isinstance(file_data, dict):
                 data = file_data
