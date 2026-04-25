@@ -1,0 +1,50 @@
+# ollama-marshal configuration
+# All values shown are defaults — omit any section to use defaults.
+# Every value can be overridden via environment variables with the MARSHAL_ prefix.
+# Example: MARSHAL_PROXY_PORT=11435, MARSHAL_MEMORY_SAFETY_MARGIN=4GB
+
+# Ollama connection
+ollama:
+  host: "http://localhost:11434"    # MARSHAL_OLLAMA_HOST
+
+# Proxy settings
+proxy:
+  host: "0.0.0.0"                  # MARSHAL_PROXY_HOST
+  port: 11435                       # MARSHAL_PROXY_PORT
+
+# Memory management
+memory:
+  # total_ram is auto-detected. Set to override (e.g., "64GB").
+  # total_ram: "64GB"              # MARSHAL_MEMORY_TOTAL_RAM
+  os_overhead: "4GB"               # MARSHAL_MEMORY_OS_OVERHEAD — reserved for OS
+  safety_margin: "2GB"             # MARSHAL_MEMORY_SAFETY_MARGIN — buffer
+  poll_interval: 5                 # MARSHAL_MEMORY_POLL_INTERVAL — seconds between /api/ps polls
+
+# Scheduler
+scheduler:
+  max_skips: 3                     # MARSHAL_SCHEDULER_MAX_SKIPS — per-request skip limit
+  model_detect_interval: 30        # MARSHAL_SCHEDULER_MODEL_DETECT_INTERVAL — seconds between /api/tags polls
+
+# Per-program configuration
+# Programs identify themselves via the X-Program-ID header.
+# Programs not listed here use the "default" settings.
+programs:
+  default:
+    priority: normal               # normal | critical
+  # Example: give your coding assistant critical priority
+  # coding-assistant:
+  #   priority: critical
+  # Example: batch jobs stay at normal priority
+  # batch-processor:
+  #   priority: normal
+
+# Shutdown behavior
+shutdown:
+  mode: drain                      # MARSHAL_SHUTDOWN_MODE — drain | immediate
+  drain_timeout: 30                # MARSHAL_SHUTDOWN_DRAIN_TIMEOUT — seconds (drain mode only)
+  unload_models: true              # MARSHAL_SHUTDOWN_UNLOAD_MODELS — unload all models on exit
+
+# Logging
+logging:
+  level: INFO                      # MARSHAL_LOGGING_LEVEL — DEBUG | INFO | WARNING | ERROR
+  format: console                  # MARSHAL_LOGGING_FORMAT — console (colored) | json

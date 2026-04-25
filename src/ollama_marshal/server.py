@@ -1,0 +1,365 @@
+"""FastAPI application wiring all components together."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
+
+import structlog
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from ollama_marshal.config import MarshalConfig, ShutdownMode, load_config
+from ollama_marshal.lifecycle import ModelLifecycle
+from ollama_marshal.memory import MemoryManager
+from ollama_marshal.openai_compat import (
+    ollama_chat_to_openai,
+    ollama_embedding_to_openai,
+    ollama_generate_to_openai,
+    parse_openai_chat_request,
+    parse_openai_completion_request,
+    parse_openai_embedding_request,
+)
+from ollama_marshal.queue import ModelQueues, RequestEnvelope
+from ollama_marshal.registry import ModelRegistry
+from ollama_marshal.scheduler import Scheduler
+from ollama_marshal.stream import forward_passthrough
+
+logger = structlog.get_logger()
+
+# Module-level state (initialized in lifespan)
+_config: MarshalConfig
+_queues: ModelQueues
+_memory: MemoryManager
+_registry: ModelRegistry
+_lifecycle: ModelLifecycle
+_scheduler: Scheduler
+_started_at: float
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Application lifespan managing startup and shutdown of all components."""
+    global _config, _queues, _memory, _registry, _lifecycle, _scheduler, _started_at
+
+    # Load config from app state (set by create_app)
+    _config = app.state.config
+    _started_at = time.monotonic()
+
+    # Initialize components
+    _queues = ModelQueues()
+    _memory = MemoryManager(_config)
+    _registry = ModelRegistry(
+        ollama_host=_config.ollama.host,
+    )
+    _lifecycle = ModelLifecycle(ollama_host=_config.ollama.host)
+    _scheduler = Scheduler(
+        queues=_queues,
+        memory=_memory,
+        registry=_registry,
+        lifecycle=_lifecycle,
+        config=_config,
+    )
+
+    # Start background tasks
+    await _memory.start_polling()
+    await _registry.initialize()
+    asyncio.create_task(_registry.benchmark_unknown())
+    await _scheduler.start()
+
+    logger.info(
+        "server.started",
+        proxy_port=_config.proxy.port,
+        ollama_host=_config.ollama.host,
+    )
+
+    yield
+
+    # Shutdown
+    logger.info("server.shutting_down", mode=_config.shutdown.mode.value)
+    await _scheduler.stop()
+    await _memory.stop_polling()
+
+    if _config.shutdown.mode == ShutdownMode.DRAIN:
+        pending = await _queues.total_pending()
+        if pending > 0:
+            logger.info("server.draining", pending_requests=pending)
+            # Wait for queue to drain with timeout
+            deadline = time.monotonic() + _config.shutdown.drain_timeout
+            while await _queues.total_pending() > 0 and time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
+
+    if _config.shutdown.unload_models:
+        loaded = list(_memory.get_loaded_models().keys())
+        if loaded:
+            logger.info("server.unloading_models", models=loaded)
+            await _lifecycle.unload_all(loaded)
+
+    logger.info("server.stopped")
+
+
+def create_app(config: MarshalConfig | None = None) -> FastAPI:
+    """Create and configure the FastAPI application.
+
+    Args:
+        config: Configuration to use. Loads from default sources if None.
+
+    Returns:
+        Configured FastAPI app instance.
+    """
+    if config is None:
+        config = load_config()
+
+    app = FastAPI(
+        title="ollama-marshal",
+        description="Model-aware scheduling proxy for Ollama",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+    app.state.config = config
+
+    _register_routes(app)
+    return app
+
+
+def _register_routes(app: FastAPI) -> None:
+    """Register all route handlers on the FastAPI app.
+
+    Args:
+        app: The FastAPI application.
+    """
+    # -- Queued inference endpoints (Ollama-native) --
+
+    @app.post("/api/chat")
+    async def api_chat(request: Request) -> Response:
+        """Handle Ollama /api/chat requests through the scheduler."""
+        body = await request.json()
+        return await _enqueue_inference(request, body, "/api/chat")
+
+    @app.post("/api/generate")
+    async def api_generate(request: Request) -> Response:
+        """Handle Ollama /api/generate requests through the scheduler."""
+        body = await request.json()
+        return await _enqueue_inference(request, body, "/api/generate")
+
+    @app.post("/api/embeddings")
+    async def api_embeddings(request: Request) -> Response:
+        """Handle Ollama /api/embeddings requests through the scheduler."""
+        body = await request.json()
+        return await _enqueue_inference(request, body, "/api/embeddings")
+
+    # -- Queued inference endpoints (OpenAI-compatible) --
+
+    @app.post("/v1/chat/completions")
+    async def openai_chat(request: Request) -> Response:
+        """Handle OpenAI /v1/chat/completions requests."""
+        body = await request.json()
+        model, ollama_body, stream = parse_openai_chat_request(body)
+        resp = await _enqueue_and_wait(request, model, ollama_body, "/api/chat", stream)
+        if isinstance(resp, dict):
+            return JSONResponse(ollama_chat_to_openai(resp, model))
+        return resp
+
+    @app.post("/v1/completions")
+    async def openai_completions(request: Request) -> Response:
+        """Handle OpenAI /v1/completions requests."""
+        body = await request.json()
+        model, ollama_body, stream = parse_openai_completion_request(body)
+        resp = await _enqueue_and_wait(
+            request, model, ollama_body, "/api/generate", stream
+        )
+        if isinstance(resp, dict):
+            return JSONResponse(ollama_generate_to_openai(resp, model))
+        return resp
+
+    @app.post("/v1/embeddings")
+    async def openai_embeddings(request: Request) -> Response:
+        """Handle OpenAI /v1/embeddings requests."""
+        body = await request.json()
+        model, ollama_body = parse_openai_embedding_request(body)
+        resp = await _enqueue_and_wait(
+            request, model, ollama_body, "/api/embeddings", stream=False
+        )
+        if isinstance(resp, dict):
+            return JSONResponse(ollama_embedding_to_openai(resp, model))
+        return resp
+
+    # -- Marshal status endpoint --
+
+    @app.get("/api/marshal/status")
+    async def marshal_status() -> dict[str, Any]:
+        """Return proxy status as JSON."""
+        loaded = _memory.get_loaded_models()
+        pending_by_model = await _queues.pending_by_model()
+        return {
+            "uptime_seconds": round(time.monotonic() - _started_at, 1),
+            "loaded_models": [
+                {
+                    "name": m.name,
+                    "size_vram": m.size_vram,
+                    "pending_requests": pending_by_model.get(m.name, 0),
+                }
+                for m in loaded.values()
+            ],
+            "memory": {
+                "total": _memory.budget.total_ram,
+                "available": _memory.available_vram(),
+                "used_by_models": _memory.used_vram(),
+            },
+            "queue": {
+                "total_pending": await _queues.total_pending(),
+                "by_model": pending_by_model,
+            },
+            "metrics": {
+                "requests_served": _scheduler.metrics.requests_served,
+                "model_swaps": _scheduler.metrics.model_swaps,
+                "evictions": _scheduler.metrics.evictions,
+                "average_wait_ms": round(_scheduler.metrics.average_wait_ms, 1),
+            },
+        }
+
+    # -- Pass-through endpoints --
+
+    @app.api_route(
+        "/api/{path:path}",
+        methods=["GET", "POST", "PUT", "DELETE"],
+    )
+    async def passthrough(request: Request, path: str) -> Response:
+        """Pass non-inference requests directly to Ollama."""
+        body = await request.body() if request.method in ("POST", "PUT") else None
+        resp = await forward_passthrough(
+            ollama_host=_config.ollama.host,
+            method=request.method,
+            path=f"/api/{path}",
+            body=body,
+        )
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+        )
+
+
+async def _enqueue_inference(
+    request: Request,
+    body: dict[str, Any],
+    endpoint: str,
+) -> Response:
+    """Enqueue an Ollama-native inference request and wait for the result.
+
+    Args:
+        request: The incoming FastAPI request.
+        body: Parsed request body.
+        endpoint: The Ollama endpoint path.
+
+    Returns:
+        The proxied response from Ollama.
+    """
+    model = body.get("model", "")
+    stream = body.get("stream", False)
+    program_id = request.headers.get("x-program-id", "default")
+
+    envelope = RequestEnvelope(
+        model=model,
+        program_id=program_id,
+        request_body=body,
+        endpoint=endpoint,
+        stream=stream,
+    )
+
+    logger.info(
+        "server.request_enqueued",
+        model=model,
+        program=program_id,
+        endpoint=endpoint,
+        stream=stream,
+    )
+
+    await _queues.enqueue(envelope)
+    await envelope.done_event.wait()
+
+    if envelope.error:
+        logger.error(
+            "server.request_error",
+            model=model,
+            error=str(envelope.error),
+        )
+        return JSONResponse(
+            {"error": str(envelope.error)},
+            status_code=502,
+        )
+
+    response = envelope.response
+    if stream and hasattr(response, "__aiter__"):
+        return StreamingResponse(
+            response,
+            media_type="application/x-ndjson",
+        )
+
+    # Non-streaming httpx.Response
+    if hasattr(response, "status_code"):
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+        )
+
+    return JSONResponse(response)
+
+
+async def _enqueue_and_wait(
+    request: Request,
+    model: str,
+    ollama_body: dict[str, Any],
+    endpoint: str,
+    stream: bool,
+) -> dict[str, Any] | Response:
+    """Enqueue a translated request and return the Ollama response data.
+
+    For OpenAI-compat endpoints, we need the parsed response dict
+    (not the raw httpx.Response) so we can translate it.
+
+    Args:
+        request: The incoming FastAPI request.
+        model: Extracted model name.
+        ollama_body: Translated Ollama request body.
+        endpoint: The Ollama endpoint to forward to.
+        stream: Whether streaming is requested.
+
+    Returns:
+        Parsed response dict, or a Response for streaming/errors.
+    """
+    program_id = request.headers.get("x-program-id", "default")
+
+    envelope = RequestEnvelope(
+        model=model,
+        program_id=program_id,
+        request_body=ollama_body,
+        endpoint=endpoint,
+        stream=stream,
+    )
+
+    await _queues.enqueue(envelope)
+    await envelope.done_event.wait()
+
+    if envelope.error:
+        return JSONResponse(
+            {"error": {"message": str(envelope.error), "type": "proxy_error"}},
+            status_code=502,
+        )
+
+    response = envelope.response
+    if stream and hasattr(response, "__aiter__"):
+        return StreamingResponse(
+            response,
+            media_type="text/event-stream",
+        )
+
+    # Extract JSON from httpx.Response
+    if hasattr(response, "json"):
+        return response.json()  # type: ignore[no-any-return]
+
+    return response  # type: ignore[no-any-return]

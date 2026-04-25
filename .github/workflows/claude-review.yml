@@ -1,0 +1,36 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    if: |
+      (github.event_name == 'pull_request') ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude Code Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_md: |
+            Review this PR for:
+            - Code quality and adherence to project conventions (see CLAUDE.md)
+            - Type safety (all functions must have type annotations)
+            - Test coverage (new code must have tests, 95% coverage target)
+            - No hardcoded values (everything configurable)
+            - Async correctness (proper await, no blocking calls)
+            - Security (no secrets, no injection vectors)

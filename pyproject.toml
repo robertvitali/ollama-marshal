@@ -1,0 +1,168 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ollama-marshal"
+version = "0.1.0"
+description = "Model-aware scheduling proxy for Ollama — eliminates model thrashing with intelligent FIFO + bin-packing scheduling"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [
+    { name = "Robert Vitali", email = "robert.dominic.vitali@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "httpx>=0.27.0",
+    "typer>=0.12.0",
+    "pyyaml>=6.0",
+    "structlog>=24.0.0",
+    "psutil>=5.9.0",
+    "pydantic>=2.7.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "pytest-asyncio>=0.23.0",
+    "mypy>=1.10.0",
+    "ruff>=0.5.0",
+    "pre-commit>=3.7.0",
+    "types-PyYAML>=6.0.0",
+    "types-psutil>=5.9.0",
+]
+
+[project.scripts]
+ollama-marshal = "ollama_marshal.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/robertvitali/ollama-marshal"
+Repository = "https://github.com/robertvitali/ollama-marshal"
+Issues = "https://github.com/robertvitali/ollama-marshal/issues"
+Changelog = "https://github.com/robertvitali/ollama-marshal/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ollama_marshal"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "TC",    # flake8-type-checking
+    "RUF",   # ruff-specific rules
+    "D",     # pydocstyle
+    "ANN",   # flake8-annotations
+    "S",     # flake8-bandit (security)
+    "PT",    # flake8-pytest-style
+    "C4",    # flake8-comprehensions
+    "PIE",   # flake8-pie
+    "T20",   # flake8-print
+    "RSE",   # flake8-raise
+    "RET",   # flake8-return
+    "ARG",   # flake8-unused-arguments
+]
+ignore = [
+    "D100",   # missing docstring in public module (we use module-level docstrings selectively)
+    "D104",   # missing docstring in public package
+    "D203",   # one-blank-line-before-class (conflicts with D211)
+    "D213",   # multi-line-docstring-summary-second-line (conflicts with D212)
+    "ANN401", # dynamically typed Any allowed for proxy response types
+    "D105",   # missing docstring in magic method
+    "D107",   # missing docstring in __init__ (class docstring suffices)
+    "TC001",  # move import into type-checking block (breaks Pydantic/FastAPI)
+    "TC003",  # move stdlib import into type-checking block
+    "RET504", # unnecessary assignment before return (clearer code)
+    "SIM105", # contextlib.suppress vs try/except (less readable for async)
+    "RUF006", # store asyncio.create_task reference (managed by lifespan)
+    "S101",   # use of assert (needed in tests)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "D",      # docstrings not required in tests
+    "ANN",    # annotations not required in tests
+    "S101",   # assert allowed in tests
+    "ARG",    # unused arguments allowed in fixtures
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+follow_imports = "normal"
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = "tests"
+disallow_untyped_defs = false
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: requires a running Ollama instance",
+]
+addopts = [
+    "--strict-markers",
+    "--cov=ollama_marshal",
+    "--cov-report=term-missing",
+    "--cov-report=html:htmlcov",
+    "--cov-fail-under=95",
+]
+
+[tool.coverage.run]
+source = ["ollama_marshal"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "@overload",
+]
