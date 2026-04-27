@@ -112,17 +112,24 @@ class StatusSnapshot:
 
 
 def get_status() -> StatusSnapshot:
-    """Fetch /api/marshal/status and reduce to assertion-relevant fields."""
+    """Fetch /api/marshal/status and reduce to assertion-relevant fields.
+
+    Uses .get() with defaults so a partial response (e.g. during marshal
+    startup before metrics are initialized) doesn't crash the harness with
+    KeyError.
+    """
     resp = httpx.get(f"{MARSHAL_URL}/api/marshal/status", timeout=5)
     resp.raise_for_status()
     data = resp.json()
+    metrics = data.get("metrics", {})
+    queue = data.get("queue", {})
     return StatusSnapshot(
-        requests_served=data["metrics"]["requests_served"],
-        model_swaps=data["metrics"]["model_swaps"],
-        evictions=data["metrics"]["evictions"],
-        avg_wait_ms=data["metrics"]["average_wait_ms"],
-        loaded_models=[m["name"] for m in data["loaded_models"]],
-        pending_total=data["queue"]["total_pending"],
+        requests_served=metrics.get("requests_served", 0),
+        model_swaps=metrics.get("model_swaps", 0),
+        evictions=metrics.get("evictions", 0),
+        avg_wait_ms=metrics.get("average_wait_ms", 0.0),
+        loaded_models=[m["name"] for m in data.get("loaded_models", [])],
+        pending_total=queue.get("total_pending", 0),
     )
 
 

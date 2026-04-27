@@ -20,6 +20,8 @@ from ollama_marshal.dashboard import (
     _event_color,
     _format_uptime,
     fetch_status,
+    fetch_status_async,
+    log_follower,
     make_layout,
     parse_log_line,
     render_events,
@@ -47,6 +49,10 @@ class TestFormatUptime:
 
     def test_zero(self):
         assert _format_uptime(0) == "0m 0s"
+
+    def test_negative_clamps_to_zero(self):
+        # Don't render "-1h 59m 55s" if marshal returns nonsense.
+        assert _format_uptime(-5) == "0m 0s"
 
 
 class TestDeltaStr:
@@ -232,6 +238,88 @@ class TestFetchStatus:
         assert snap.total_bytes == 0
         assert snap.requests_served == 0
 
+    @patch("ollama_marshal.dashboard.httpx.get")
+    def test_non_dict_response_returns_error(self, mock_get):
+        # If marshal (or a misconfigured proxy) returns a list or string
+        # instead of a dict, we surface a clear error rather than crashing.
+        mock_get.return_value = _MockResponse(200, ["not", "a", "dict"])
+        snap = fetch_status("http://localhost:11435")
+        assert snap.error is not None
+        assert "list" in snap.error or "type" in snap.error.lower()
+
+    @patch("ollama_marshal.dashboard.httpx.get")
+    def test_system_ram_and_swap_fields_populated(self, mock_get):
+        # v0.2.0 added memory.system + memory.swap to the status payload.
+        # Verify the snapshot pulls them through.
+        mock_get.return_value = _MockResponse(
+            200,
+            {
+                "uptime_seconds": 100,
+                "memory": {
+                    "total": 256 * 1024**3,
+                    "available": 240 * 1024**3,
+                    "used_by_models": 16 * 1024**3,
+                    "system": {
+                        "total": 256 * 1024**3,
+                        "available": 100 * 1024**3,
+                        "used": 156 * 1024**3,
+                        "percent": 60.9,
+                    },
+                    "swap": {
+                        "total": 16 * 1024**3,
+                        "used": 0,
+                        "free": 16 * 1024**3,
+                        "percent": 0.0,
+                    },
+                },
+                "loaded_models": [],
+                "queue": {"total_pending": 0, "by_model": {}},
+                "metrics": {
+                    "requests_served": 0,
+                    "model_swaps": 0,
+                    "evictions": 0,
+                    "average_wait_ms": 0,
+                },
+            },
+        )
+        snap = fetch_status("http://localhost:11435")
+        assert snap.error is None
+        assert snap.sys_total == 256 * 1024**3
+        assert snap.sys_used == 156 * 1024**3
+        assert snap.sys_percent == 60.9
+        assert snap.swap_total == 16 * 1024**3
+        assert snap.swap_used == 0
+        assert snap.swap_percent == 0.0
+
+    @patch("ollama_marshal.dashboard.httpx.get")
+    def test_v01x_payload_without_system_or_swap_still_works(self, mock_get):
+        # Backward compat: a v0.1.x marshal returns memory{} without
+        # nested system/swap keys. Snapshot should still build fine
+        # with sys_total=0, swap_total=0 (renderer handles those).
+        mock_get.return_value = _MockResponse(
+            200,
+            {
+                "uptime_seconds": 5,
+                "memory": {
+                    "total": 1024**3,
+                    "available": 1024**3,
+                    "used_by_models": 0,
+                },
+                "loaded_models": [],
+                "queue": {"total_pending": 0, "by_model": {}},
+                "metrics": {
+                    "requests_served": 0,
+                    "model_swaps": 0,
+                    "evictions": 0,
+                    "average_wait_ms": 0,
+                },
+            },
+        )
+        snap = fetch_status("http://localhost:11435")
+        assert snap.error is None
+        assert snap.sys_total == 0
+        assert snap.swap_total == 0
+
 
 # ---------------------------------------------------------------------------
 # Renderers — smoke-test that they don't crash on edge inputs
@@ -274,13 +362,42 @@ class TestRenderers:
         assert panel is not None
 
     def test_render_memory_no_data(self):
-        # total_bytes=0 → "no data" branch
+        # total_bytes=0 AND sys_total=0 → "no data" branch
         panel = render_memory(StatusSnapshot())
         assert panel is not None
 
     def test_render_memory_high_usage(self):
         s = _full_status()
         s.used_bytes = int(s.total_bytes * 0.95)  # >90% → red bar
+        panel = render_memory(s)
+        assert panel is not None
+
+    def test_render_memory_with_system_ram_and_swap(self):
+        s = _full_status()
+        s.sys_total = 256 * 1024**3
+        s.sys_used = 200 * 1024**3
+        s.sys_available = 56 * 1024**3
+        s.sys_percent = 78.1
+        s.swap_total = 16 * 1024**3
+        s.swap_used = 4 * 1024**3
+        s.swap_percent = 25.0
+        panel = render_memory(s)
+        assert panel is not None
+
+    def test_render_memory_system_only_no_marshal_budget(self):
+        # When marshal hasn't finished startup but psutil is already populated.
+        s = StatusSnapshot()
+        s.sys_total = 256 * 1024**3
+        s.sys_used = 100 * 1024**3
+        s.sys_percent = 39.0
+        panel = render_memory(s)
+        assert panel is not None
+
+    def test_render_memory_swap_zero_size_skipped(self):
+        # Hosts without swap have swap_total=0; renderer must not crash.
+        s = _full_status()
+        s.swap_total = 0
+        s.swap_used = 0
         panel = render_memory(s)
         assert panel is not None
 
@@ -399,8 +516,10 @@ class TestAsyncCoordinators:
 
         state: dict = {"status": StatusSnapshot(), "baseline": None, "stopped": False}
 
-        with patch("ollama_marshal.dashboard.httpx.get") as mock_get:
-            mock_get.return_value = _MockResponse(
+        # AsyncClient.get is what status_poller uses now; patch the class so
+        # any instance returns our mock response.
+        async def fake_get(*_args, **_kwargs):
+            return _MockResponse(
                 200,
                 {
                     "uptime_seconds": 5,
@@ -415,10 +534,16 @@ class TestAsyncCoordinators:
                     },
                 },
             )
+
+        with patch.object(httpx.AsyncClient, "get", new=fake_get):
             import asyncio
 
             task = asyncio.create_task(status_poller(state, "http://x", 0.05))
-            await asyncio.sleep(0.15)
+            # Wait until the poller has run at least once.
+            for _ in range(20):
+                if state.get("baseline") is not None:
+                    break
+                await asyncio.sleep(0.02)
             state["stopped"] = True
             task.cancel()
             try:
@@ -428,3 +553,100 @@ class TestAsyncCoordinators:
 
         assert state["status"].uptime_s == 5
         assert state["baseline"] is not None
+
+    @pytest.mark.asyncio
+    async def test_fetch_status_async_uses_async_client(self):
+        async def fake_get(*_args, **_kwargs):
+            return _MockResponse(
+                200,
+                {
+                    "uptime_seconds": 7,
+                    "memory": {"total": 1, "available": 1, "used_by_models": 0},
+                    "loaded_models": [],
+                    "queue": {"total_pending": 0, "by_model": {}},
+                    "metrics": {
+                        "requests_served": 2,
+                        "model_swaps": 0,
+                        "evictions": 0,
+                        "average_wait_ms": 0,
+                    },
+                },
+            )
+
+        async with httpx.AsyncClient() as client:
+            with patch.object(httpx.AsyncClient, "get", new=fake_get):
+                snap = await fetch_status_async(client, "http://x")
+        assert snap.error is None
+        assert snap.uptime_s == 7
+        assert snap.requests_served == 2
+
+    @pytest.mark.asyncio
+    async def test_fetch_status_async_returns_error_on_http_error(self):
+        async def boom(*_args, **_kwargs):
+            raise httpx.ConnectError("nope")
+
+        async with httpx.AsyncClient() as client:
+            with patch.object(httpx.AsyncClient, "get", new=boom):
+                snap = await fetch_status_async(client, "http://x")
+        assert snap.error is not None
+        assert "nope" in snap.error
+
+    @pytest.mark.asyncio
+    async def test_log_follower_appends_parsed_events(self, tmp_path):
+        # Write structlog-format lines to a file and verify the follower
+        # picks them up and turns them into LogEvent entries.
+        import asyncio
+        from collections import deque
+
+        log_file = tmp_path / "marshal.out.log"
+        log_file.write_text("")  # exists but empty
+
+        state: dict = {"events": deque(maxlen=10), "stopped": False}
+        task = asyncio.create_task(log_follower(state, log_file))
+        await asyncio.sleep(0.1)  # let follower seek to end + start polling
+
+        # Append a matching line.
+        with log_file.open("a") as f:
+            f.write(
+                "2026-04-27T05:35:12.514Z [info  ] "
+                "scheduler.bin_pack_load model=qwen3.5:4b\n"
+            )
+            f.flush()
+
+        # Wait up to 1s for the follower to consume it.
+        for _ in range(20):
+            if state["events"]:
+                break
+            await asyncio.sleep(0.05)
+
+        state["stopped"] = True
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert len(state["events"]) == 1
+        assert state["events"][0].event_name == "scheduler.bin_pack_load"
+
+    @pytest.mark.asyncio
+    async def test_log_follower_handles_unreadable_file(self, tmp_path):
+        # File exists but cannot be opened — follower should set log_error
+        # and exit cleanly instead of crashing the dashboard.
+        import asyncio
+        from collections import deque
+
+        log_file = tmp_path / "marshal.out.log"
+        log_file.write_text("")
+        log_file.chmod(0o000)  # remove all perms
+
+        try:
+            state: dict = {"events": deque(maxlen=10), "stopped": False}
+            task = asyncio.create_task(log_follower(state, log_file))
+            # Follower should hit the OSError path and return.
+            await asyncio.wait_for(task, timeout=2.0)
+
+            assert "log_error" in state
+            assert "cannot read" in state["log_error"].lower()
+        finally:
+            log_file.chmod(0o644)  # restore so tmp_path cleanup works

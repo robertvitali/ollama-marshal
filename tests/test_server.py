@@ -125,6 +125,57 @@ class TestRouteRegistration:
 
 
 # ---------------------------------------------------------------------------
+# _resolve_timeout (per-request timeout override via X-Request-Timeout header)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveTimeout:
+    """Cover the per-request X-Request-Timeout header + config fallback."""
+
+    def _request(self, headers: dict, *, with_config: bool = True) -> MagicMock:
+        req = MagicMock()
+        req.headers = headers
+        if with_config:
+            cfg = MarshalConfig()
+            cfg.proxy.request_timeout_s = 1234
+            req.app.state.config = cfg
+        else:
+            req.app.state = MagicMock(spec=[])
+        return req
+
+    def test_no_header_uses_config(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        assert _resolve_timeout(self._request({})) == 1234
+
+    def test_header_overrides_config(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        assert _resolve_timeout(self._request({"x-request-timeout": "60"})) == 60
+
+    def test_header_zero_falls_back_to_config(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        # 0 is invalid; we ignore it and use config.
+        assert _resolve_timeout(self._request({"x-request-timeout": "0"})) == 1234
+
+    def test_header_negative_falls_back_to_config(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        assert _resolve_timeout(self._request({"x-request-timeout": "-5"})) == 1234
+
+    def test_header_non_int_falls_back_to_config(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        assert _resolve_timeout(self._request({"x-request-timeout": "abc"})) == 1234
+
+    def test_no_config_uses_3600s_default(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        assert _resolve_timeout(self._request({}, with_config=False)) == 3600
+
+
+# ---------------------------------------------------------------------------
 # _enqueue_inference
 # ---------------------------------------------------------------------------
 

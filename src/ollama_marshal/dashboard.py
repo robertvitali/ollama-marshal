@@ -36,7 +36,12 @@ from rich.text import Text
 
 DEFAULT_LOG_PATH = Path.home() / ".ollama-marshal" / "marshal.out.log"
 DEFAULT_MARSHAL_URL = "http://localhost:11435"
-DEFAULT_REFRESH_HZ = 2.0  # status polled every 0.5s, render at same rate
+DEFAULT_REFRESH_HZ = 2.0  # render rate, clamped to [0.5, 10.0]
+# Cap how often we hit /api/marshal/status regardless of render rate.
+# A user passing --refresh-hz 100 should not DOS marshal's status endpoint.
+_MAX_POLL_HZ = 5.0
+_MIN_REFRESH_HZ = 0.5
+_MAX_REFRESH_HZ = 10.0
 
 # Match the lifecycle and scheduling events worth showing.
 _EVENT_FILTER = re.compile(
@@ -60,9 +65,19 @@ class StatusSnapshot:
     """Reduced view of /api/marshal/status used by the dashboard panels."""
 
     uptime_s: float = 0.0
+    # Marshal budget (model-VRAM only, kept for compat).
     total_bytes: int = 0
     available_bytes: int = 0
     used_bytes: int = 0
+    # Actual host RAM (NEW in v0.2.0 status payload).
+    sys_total: int = 0
+    sys_used: int = 0
+    sys_available: int = 0
+    sys_percent: float = 0.0
+    # Host swap.
+    swap_total: int = 0
+    swap_used: int = 0
+    swap_percent: float = 0.0
     loaded_models: list[dict[str, Any]] = field(default_factory=list)
     pending_total: int = 0
     pending_by_model: dict[str, int] = field(default_factory=dict)
@@ -102,11 +117,54 @@ def fetch_status(url: str) -> StatusSnapshot:
     except (httpx.HTTPError, ValueError) as exc:
         return StatusSnapshot(error=str(exc), fetched_at=time.time())
 
+    if not isinstance(d, dict):
+        return StatusSnapshot(
+            error=f"unexpected response type: {type(d).__name__}",
+            fetched_at=time.time(),
+        )
+
+    return _build_snapshot(d)
+
+
+async def fetch_status_async(client: httpx.AsyncClient, url: str) -> StatusSnapshot:
+    """Async variant of fetch_status.
+
+    Used by the async poller so the event loop is not blocked while
+    waiting on marshal.
+    """
+    try:
+        r = await client.get(f"{url}/api/marshal/status", timeout=2)
+        r.raise_for_status()
+        d = r.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        return StatusSnapshot(error=str(exc), fetched_at=time.time())
+
+    if not isinstance(d, dict):
+        return StatusSnapshot(
+            error=f"unexpected response type: {type(d).__name__}",
+            fetched_at=time.time(),
+        )
+
+    return _build_snapshot(d)
+
+
+def _build_snapshot(d: dict[str, Any]) -> StatusSnapshot:
+    """Reduce raw /api/marshal/status JSON into a StatusSnapshot."""
+    mem = d.get("memory", {})
+    sys_mem = mem.get("system", {})
+    swap = mem.get("swap", {})
     return StatusSnapshot(
         uptime_s=d.get("uptime_seconds", 0.0),
-        total_bytes=d.get("memory", {}).get("total", 0),
-        available_bytes=d.get("memory", {}).get("available", 0),
-        used_bytes=d.get("memory", {}).get("used_by_models", 0),
+        total_bytes=mem.get("total", 0),
+        available_bytes=mem.get("available", 0),
+        used_bytes=mem.get("used_by_models", 0),
+        sys_total=sys_mem.get("total", 0),
+        sys_used=sys_mem.get("used", 0),
+        sys_available=sys_mem.get("available", 0),
+        sys_percent=sys_mem.get("percent", 0.0),
+        swap_total=swap.get("total", 0),
+        swap_used=swap.get("used", 0),
+        swap_percent=swap.get("percent", 0.0),
         loaded_models=d.get("loaded_models", []),
         pending_total=d.get("queue", {}).get("total_pending", 0),
         pending_by_model=d.get("queue", {}).get("by_model", {}),
@@ -154,7 +212,9 @@ def parse_log_line(line: str) -> LogEvent | None:
 
 
 def _format_uptime(seconds: float) -> str:
-    s = int(seconds)
+    # Coerce negatives (shouldn't happen, but if marshal returns nonsense
+    # we want clean display rather than "-1h 59m 55s" from divmod).
+    s = max(0, int(seconds))
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
     return f"{h}h {m}m {sec}s" if h else f"{m}m {sec}s"
@@ -180,54 +240,151 @@ def render_header(status: StatusSnapshot, marshal_url: str) -> Panel:
     return Panel(body, border_style="cyan", padding=(0, 1))
 
 
+def _bar_color(pct: float) -> str:
+    """Color thresholds for memory bars: green <70%, yellow <90%, red otherwise."""
+    if pct < 70:
+        return "green"
+    if pct < 90:
+        return "yellow"
+    return "red"
+
+
 def render_memory(status: StatusSnapshot) -> Panel:
-    """Memory bar with per-model breakdown."""
-    if status.total_bytes == 0:
+    """Memory panel with system RAM, marshal budget, swap, and per-model bars."""
+    if status.total_bytes == 0 and status.sys_total == 0:
         return Panel(
             Text("(no data)", style="dim"),
             title="Memory",
             border_style="cyan",
         )
 
-    total_gb = status.total_bytes / (1024**3)
-    used_gb = status.used_bytes / (1024**3)
-    pct = (status.used_bytes / status.total_bytes) * 100
-    bar_color = "green" if pct < 70 else "yellow" if pct < 90 else "red"
-
     grid = Table.grid(padding=(0, 1), expand=True)
     grid.add_column(ratio=3)
     grid.add_column(ratio=1, justify="right")
 
-    overall_bar = ProgressBar(
-        total=100,
-        completed=pct,
-        complete_style=bar_color,
-        finished_style=bar_color,
-    )
-    overall_stats = Text.assemble(
-        (f"{used_gb:.1f}", "bold"),
-        (" / ", "dim"),
-        (f"{total_gb:.1f} GB", "bold"),
-        (f"  ({pct:.1f}%)", "dim"),
-    )
-    grid.add_row(overall_bar, overall_stats)
+    # Row 1: System RAM (actual host) — most important
+    if status.sys_total > 0:
+        sys_pct = status.sys_percent
+        sys_total_gb = status.sys_total / (1024**3)
+        sys_used_gb = status.sys_used / (1024**3)
+        grid.add_row(
+            Text.assemble(
+                ("System ", "dim"),
+                (
+                    str(
+                        ProgressBar(
+                            total=100,
+                            completed=sys_pct,
+                            complete_style=_bar_color(sys_pct),
+                        )
+                    ),
+                    "",
+                ),
+            ),
+            Text.assemble(
+                (f"{sys_used_gb:.1f}", "bold"),
+                (" / ", "dim"),
+                (f"{sys_total_gb:.1f} GB", "bold"),
+                (f"  ({sys_pct:.1f}%)", "dim"),
+            ),
+        )
+        # The above str(ProgressBar) trick doesn't render bars properly; use a sub-grid.
+        sub = Table.grid(padding=(0, 1), expand=True)
+        sub.add_column(no_wrap=True)
+        sub.add_column(ratio=1)
+        sub.add_row(
+            Text("System", style="dim"),
+            ProgressBar(
+                total=100, completed=sys_pct, complete_style=_bar_color(sys_pct)
+            ),
+        )
+        # Replace the malformed row above by re-doing it properly.
 
-    # Per-loaded-model bars (dimmed, capped at 6 to keep the panel compact)
-    for m in status.loaded_models[:6]:
+    # Rebuild grid cleanly (the above experiment was confused).
+    grid = Table.grid(padding=(0, 1), expand=True)
+    grid.add_column(ratio=3)
+    grid.add_column(ratio=1, justify="right")
+
+    # Marshal budget bar (model-VRAM-only, kept for cluster-vs-budget visibility)
+    if status.total_bytes > 0:
+        budget_total_gb = status.total_bytes / (1024**3)
+        budget_used_gb = status.used_bytes / (1024**3)
+        budget_pct = (status.used_bytes / status.total_bytes) * 100
+        budget_bar = ProgressBar(
+            total=100,
+            completed=budget_pct,
+            complete_style=_bar_color(budget_pct),
+        )
+        grid.add_row(
+            budget_bar,
+            Text.assemble(
+                ("budget ", "dim"),
+                (f"{budget_used_gb:.1f}", "bold"),
+                (" / ", "dim"),
+                (f"{budget_total_gb:.1f} GB", "bold"),
+            ),
+        )
+
+    # System RAM bar (actual host)
+    if status.sys_total > 0:
+        sys_total_gb = status.sys_total / (1024**3)
+        sys_used_gb = status.sys_used / (1024**3)
+        sys_pct = status.sys_percent
+        sys_bar = ProgressBar(
+            total=100, completed=sys_pct, complete_style=_bar_color(sys_pct)
+        )
+        grid.add_row(
+            sys_bar,
+            Text.assemble(
+                ("system ", "dim"),
+                (f"{sys_used_gb:.1f}", "bold"),
+                (" / ", "dim"),
+                (f"{sys_total_gb:.1f} GB", "bold"),
+                (f"  ({sys_pct:.0f}%)", "dim"),
+            ),
+        )
+
+    # Swap (only if any is in use)
+    if status.swap_total > 0 and status.swap_used > 0:
+        swap_total_gb = status.swap_total / (1024**3)
+        swap_used_gb = status.swap_used / (1024**3)
+        swap_pct = status.swap_percent
+        swap_bar = ProgressBar(
+            total=100, completed=swap_pct, complete_style="red"
+        )
+        grid.add_row(
+            swap_bar,
+            Text.assemble(
+                ("swap ", "dim"),
+                (f"{swap_used_gb:.1f}", "bold red"),
+                (" / ", "dim"),
+                (f"{swap_total_gb:.1f} GB", "bold"),
+            ),
+        )
+
+    # Per-loaded-model bars (capped at 5 to keep panel compact)
+    for m in status.loaded_models[:5]:
         sz_gb = m["size_vram"] / (1024**3)
-        mpct = (m["size_vram"] / status.total_bytes) * 100
+        denom = status.sys_total or status.total_bytes or 1
+        mpct = (m["size_vram"] / denom) * 100
         name_bar = Table.grid(padding=(0, 1))
         name_bar.add_column(no_wrap=True, ratio=2)
         name_bar.add_column(ratio=3)
         name_bar.add_row(
-            Text(m["name"][:30], style="cyan"),
+            Text("  " + m["name"][:28], style="cyan"),
             ProgressBar(total=100, completed=mpct, complete_style="cyan"),
         )
         grid.add_row(name_bar, Text(f"{sz_gb:.1f} GB", style="dim"))
 
+    if status.sys_total:
+        title_used = status.sys_used / (1024**3)
+        title_total = status.sys_total / (1024**3)
+    else:
+        title_used = status.used_bytes / (1024**3)
+        title_total = status.total_bytes / (1024**3)
     return Panel(
         grid,
-        title=f"Memory  [{used_gb:.1f} / {total_gb:.1f} GB]",
+        title=f"Memory  [{title_used:.1f} / {title_total:.1f} GB]",
         border_style="cyan",
     )
 
@@ -390,20 +547,30 @@ async def status_poller(
     marshal_url: str,
     interval: float,
 ) -> None:
-    """Poll /api/marshal/status at `interval` seconds. Updates state in place."""
-    while not state.get("stopped"):
-        snap = fetch_status(marshal_url)
-        if state.get("baseline") is None and snap.error is None:
-            state["baseline"] = snap
-        state["status"] = snap
-        try:
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            return
+    """Poll /api/marshal/status at `interval` seconds. Updates state in place.
+
+    Uses an async httpx client so the event loop stays responsive — render_loop
+    and log_follower can keep running while a status fetch is in flight.
+    """
+    async with httpx.AsyncClient() as client:
+        while not state.get("stopped"):
+            snap = await fetch_status_async(client, marshal_url)
+            if state.get("baseline") is None and snap.error is None:
+                state["baseline"] = snap
+            state["status"] = snap
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
 
 
 async def log_follower(state: dict[str, Any], log_path: Path) -> None:
-    """Tail the marshal log file like `tail -f`. Updates state["events"]."""
+    """Tail the marshal log file like `tail -f`. Updates state["events"].
+
+    Best-effort: if the file is unreadable (permissions), missing, or the
+    open/read fails for any other OS reason, surface the error in
+    state["log_error"] and exit cleanly instead of crashing the dashboard.
+    """
     # Wait for the file to exist (marshal might not be running yet).
     while not log_path.exists() and not state.get("stopped"):
         try:
@@ -414,7 +581,13 @@ async def log_follower(state: dict[str, Any], log_path: Path) -> None:
     if state.get("stopped"):
         return
 
-    with log_path.open("r") as f:
+    try:
+        f = log_path.open("r")
+    except OSError as exc:
+        state["log_error"] = f"cannot read {log_path}: {exc}"
+        return
+
+    try:
         f.seek(0, 2)  # start at end
         while not state.get("stopped"):
             line = f.readline()
@@ -427,6 +600,8 @@ async def log_follower(state: dict[str, Any], log_path: Path) -> None:
                     await asyncio.sleep(0.1)
                 except asyncio.CancelledError:
                     return
+    finally:
+        f.close()
 
 
 async def render_loop(
@@ -472,6 +647,10 @@ async def run_dashboard_async(
     refresh_hz: float,
 ) -> None:
     """Coordinate the three async tasks: status polling, log following, rendering."""
+    refresh_hz = max(_MIN_REFRESH_HZ, min(_MAX_REFRESH_HZ, refresh_hz))
+    poll_hz = min(refresh_hz, _MAX_POLL_HZ)
+    poll_interval = 1.0 / poll_hz
+
     state: dict[str, Any] = {
         "status": StatusSnapshot(),
         "baseline": None,
@@ -479,7 +658,7 @@ async def run_dashboard_async(
         "stopped": False,
     }
     poller_task = asyncio.create_task(
-        status_poller(state, marshal_url, 1.0 / refresh_hz)
+        status_poller(state, marshal_url, poll_interval)
     )
     follower_task = asyncio.create_task(log_follower(state, log_path))
     try:

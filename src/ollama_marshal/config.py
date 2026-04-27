@@ -52,6 +52,15 @@ class ProxyConfig(BaseModel):
 
     host: str = Field(default="127.0.0.1", description="Proxy bind address")
     port: int = Field(default=11435, description="Proxy listen port")
+    request_timeout_s: int = Field(
+        default=3600,
+        description=(
+            "Server-side max wait for a queued request to be served, in seconds. "
+            "Default is 1 hour — generous enough for big-model loads. "
+            "Returns 504 if exceeded. Clients can override per-request via the "
+            "X-Request-Timeout header (value in seconds, must be > 0)."
+        ),
+    )
 
 
 class MemoryConfig(BaseModel):
@@ -85,6 +94,14 @@ class SchedulerConfig(BaseModel):
     model_detect_interval: int = Field(
         default=30,
         description="Seconds between /api/tags polls for new models",
+    )
+    idle_eviction_minutes: int = Field(
+        default=15,
+        description=(
+            "Evict a loaded model after this many minutes of inactivity. "
+            "0 disables time-based eviction (only memory-pressure eviction). "
+            "Models with pending requests are never time-evicted."
+        ),
     )
 
 

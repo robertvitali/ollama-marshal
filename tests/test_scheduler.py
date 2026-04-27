@@ -942,3 +942,82 @@ class TestRunAndTick:
 
         # Should have continued after the error
         assert call_count >= 2
+
+
+# ---------------------------------------------------------------------------
+# _idle_evict_unused_models  (time-based eviction added in v0.2.0)
+# ---------------------------------------------------------------------------
+
+
+class TestIdleEvictUnusedModels:
+    async def test_disabled_when_threshold_zero(self):
+        cfg = _make_config(**{"scheduler.idle_eviction_minutes": 0})
+        sched = _make_scheduler(config=cfg)
+        sched.memory.get_loaded_models.return_value = {"foo": object()}
+        # Even with old activity, threshold=0 disables time-eviction.
+        sched._last_activity["foo"] = time.monotonic() - 99999
+        await sched._idle_evict_unused_models()
+        sched.lifecycle.unload.assert_not_called()
+
+    async def test_evicts_after_threshold(self):
+        cfg = _make_config(**{"scheduler.idle_eviction_minutes": 15})
+        sched = _make_scheduler(config=cfg)
+        sched.memory.get_loaded_models.return_value = {"foo": object()}
+        # Mark "foo" as idle for 16 minutes (threshold is 15).
+        sched._last_activity["foo"] = time.monotonic() - (16 * 60)
+        sched.queues.pending_count = AsyncMock(return_value=0)
+
+        await sched._idle_evict_unused_models()
+
+        sched.lifecycle.unload.assert_awaited_once_with("foo")
+        # Eviction counter incremented + activity entry removed on success.
+        assert sched.metrics.evictions == 1
+        assert "foo" not in sched._last_activity
+
+    async def test_skips_models_with_pending_requests(self):
+        cfg = _make_config(**{"scheduler.idle_eviction_minutes": 15})
+        sched = _make_scheduler(config=cfg)
+        sched.memory.get_loaded_models.return_value = {"foo": object()}
+        sched._last_activity["foo"] = time.monotonic() - (16 * 60)
+        # Pending > 0 — never time-evict.
+        sched.queues.pending_count = AsyncMock(return_value=2)
+
+        await sched._idle_evict_unused_models()
+
+        sched.lifecycle.unload.assert_not_called()
+        assert sched.metrics.evictions == 0
+
+    async def test_first_seen_models_get_full_idle_window(self):
+        cfg = _make_config(**{"scheduler.idle_eviction_minutes": 15})
+        sched = _make_scheduler(config=cfg)
+        sched.memory.get_loaded_models.return_value = {"new-model": object()}
+        # No prior _last_activity entry — should be initialized, not evicted.
+        await sched._idle_evict_unused_models()
+        sched.lifecycle.unload.assert_not_called()
+        assert "new-model" in sched._last_activity
+
+    async def test_below_threshold_keeps_loaded(self):
+        cfg = _make_config(**{"scheduler.idle_eviction_minutes": 15})
+        sched = _make_scheduler(config=cfg)
+        sched.memory.get_loaded_models.return_value = {"foo": object()}
+        # Idle for 5 minutes — well under 15.
+        sched._last_activity["foo"] = time.monotonic() - (5 * 60)
+        await sched._idle_evict_unused_models()
+        sched.lifecycle.unload.assert_not_called()
+
+    async def test_only_evicts_one_per_tick(self):
+        cfg = _make_config(**{"scheduler.idle_eviction_minutes": 15})
+        sched = _make_scheduler(config=cfg)
+        sched.memory.get_loaded_models.return_value = {
+            "foo": object(),
+            "bar": object(),
+        }
+        old_ts = time.monotonic() - (20 * 60)
+        sched._last_activity["foo"] = old_ts
+        sched._last_activity["bar"] = old_ts
+        sched.queues.pending_count = AsyncMock(return_value=0)
+
+        await sched._idle_evict_unused_models()
+
+        # Loop breaks after first eviction. Next tick handles the rest.
+        assert sched.lifecycle.unload.await_count == 1

@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import psutil
 import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -192,9 +193,19 @@ def _register_routes(app: FastAPI) -> None:
     # -- Marshal status endpoint (registered at two paths) --
 
     async def _marshal_status_payload() -> dict[str, Any]:
-        """Build the marshal status JSON payload (shared by both routes)."""
+        """Build the marshal status JSON payload (shared by both routes).
+
+        The `memory` section has three subsections:
+        - `system`: actual host RAM via psutil (what `top` would show)
+        - `swap`: host swap usage via psutil (0 if unused)
+        - top-level `total`/`available`/`used_by_models`: marshal's *budget*
+          (total_ram - os_overhead - safety_margin), preserved for backward
+          compatibility with v0.1.x consumers.
+        """
         loaded = _memory.get_loaded_models()
         pending_by_model = await _queues.pending_by_model()
+        sysmem = psutil.virtual_memory()
+        sysswap = psutil.swap_memory()
         return {
             "uptime_seconds": round(time.monotonic() - _started_at, 1),
             "loaded_models": [
@@ -206,9 +217,23 @@ def _register_routes(app: FastAPI) -> None:
                 for m in loaded.values()
             ],
             "memory": {
+                # Marshal's budget (kept for backward compat with v0.1.x).
                 "total": _memory.budget.total_ram,
                 "available": _memory.available_vram(),
                 "used_by_models": _memory.used_vram(),
+                # NEW in v0.2.0: actual host RAM and swap from psutil.
+                "system": {
+                    "total": sysmem.total,
+                    "available": sysmem.available,
+                    "used": sysmem.used,
+                    "percent": sysmem.percent,
+                },
+                "swap": {
+                    "total": sysswap.total,
+                    "used": sysswap.used,
+                    "free": sysswap.free,
+                    "percent": sysswap.percent,
+                },
             },
             "queue": {
                 "total_pending": await _queues.total_pending(),
@@ -276,6 +301,28 @@ def _register_routes(app: FastAPI) -> None:
         )
 
 
+def _resolve_timeout(request: Request) -> int:
+    """Resolve the wait-for-scheduler timeout for this request.
+
+    Per-request override via `X-Request-Timeout: <seconds>` header wins;
+    otherwise fall back to `proxy.request_timeout_s` from marshal.yaml.
+    Defaults to 3600s (1h) if no config is reachable (defensive).
+    """
+    hdr = request.headers.get("x-request-timeout")
+    if hdr:
+        try:
+            v = int(hdr)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    # Read from app.state (set in create_app), with a sane default if missing.
+    cfg = getattr(request.app.state, "config", None)
+    if cfg is not None:
+        return int(cfg.proxy.request_timeout_s)
+    return 3600
+
+
 async def _enqueue_inference(
     request: Request,
     body: dict[str, Any],
@@ -294,6 +341,7 @@ async def _enqueue_inference(
     model = body.get("model", "")
     stream = body.get("stream", False)
     program_id = request.headers.get("x-program-id", "default")
+    timeout_s = _resolve_timeout(request)
 
     envelope = RequestEnvelope(
         model=model,
@@ -309,17 +357,18 @@ async def _enqueue_inference(
         program=program_id,
         endpoint=endpoint,
         stream=stream,
+        timeout_s=timeout_s,
     )
 
     await _queues.enqueue(envelope)
     try:
-        await asyncio.wait_for(envelope.done_event.wait(), timeout=300)
+        await asyncio.wait_for(envelope.done_event.wait(), timeout=timeout_s)
     except TimeoutError:
         logger.error(
             "server.request_timeout",
             model=model,
             program=program_id,
-            wait_s=300,
+            wait_s=timeout_s,
         )
         return JSONResponse(
             {"error": "Request timed out waiting for model scheduling"},
@@ -378,6 +427,7 @@ async def _enqueue_and_wait(
         Parsed response dict, or a Response for streaming/errors.
     """
     program_id = request.headers.get("x-program-id", "default")
+    timeout_s = _resolve_timeout(request)
 
     envelope = RequestEnvelope(
         model=model,
@@ -389,7 +439,7 @@ async def _enqueue_and_wait(
 
     await _queues.enqueue(envelope)
     try:
-        await asyncio.wait_for(envelope.done_event.wait(), timeout=300)
+        await asyncio.wait_for(envelope.done_event.wait(), timeout=timeout_s)
     except TimeoutError:
         return JSONResponse(
             {"error": {"message": "Request timed out", "type": "timeout"}},

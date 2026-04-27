@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Time-based idle eviction** — new `scheduler.idle_eviction_minutes`
+  config field (default 15). Loaded models with no activity for that many
+  minutes are evicted, regardless of memory pressure. Models with pending
+  requests are never time-evicted. Set to `0` to disable. Behavior change
+  vs v0.1.x — set to 0 in marshal.yaml to preserve old behavior.
+- **Configurable request timeout** — new `proxy.request_timeout_s` config
+  field (default 3600 = 1 hour, was hardcoded 300s in v0.1.x). Clients
+  can override per-request via the `X-Request-Timeout: <seconds>` header
+  so different programs can set their own SLAs.
+- **System RAM and swap in `/api/marshal/status`** — `memory.system` and
+  `memory.swap` blocks added (via psutil). The pre-existing top-level
+  `total`/`available`/`used_by_models` keys are preserved for backward
+  compatibility — they still report marshal's *budget* (model VRAM only).
+  CLI `status` command and the new TUI dashboard render all three.
 - `ollama-marshal dashboard` — live single-window TUI observability,
   btop-style. Polls `/api/marshal/status` and tails the structured log
   in one auto-refreshing layout: header (uptime), memory bar with
@@ -46,6 +60,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that `mock_structlog.get_level_from_name` resolved to a MagicMock and
   the bug never surfaced. Added unmocked parametrized tests that exercise
   the real codepath for each standard log level.
+- `scheduler.request_failed` log entry was emitting `error=` (empty
+  string) for httpx exceptions whose `str()` is empty. Now includes
+  `error_type=<ExceptionClassName>` and falls back to `repr(exc)` when
+  `str(exc)` is empty.
+- `dashboard.fetch_status` could crash on a non-dict JSON response (e.g.
+  if a misconfigured intermediary returned a list). Now returns a
+  StatusSnapshot with a clear `.error` instead of raising.
+- `scripts/dryrun.py:get_status` did direct `data["metrics"][...]` access
+  that would `KeyError` on a partial response (e.g. during marshal
+  startup). Switched to `.get(...)` defaults.
+
+### Changed
+
+- Dashboard's `status_poller` now uses `httpx.AsyncClient` instead of
+  blocking `httpx.get` so the event loop stays responsive (previously
+  the render loop and log follower could freeze for up to the 2s status
+  timeout per tick).
+- `_format_uptime(-N)` now clamps to `0m 0s` instead of producing
+  ugly negative output (defensive — shouldn't happen, but doesn't hurt).
+- Dashboard refresh rate is now clamped to [0.5, 10.0] Hz, and status
+  polling is decoupled from refresh rate (capped at 5 Hz) so a user
+  passing `--refresh-hz 100` cannot DOS marshal's status endpoint.
+- Dashboard `log_follower` now catches `OSError` on file open/read and
+  surfaces the error in `state["log_error"]` instead of silently dying.
 
 ## [0.1.0] - 2026-04-24
 

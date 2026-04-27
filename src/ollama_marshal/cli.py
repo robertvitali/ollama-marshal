@@ -176,15 +176,37 @@ def status(
             )
     typer.echo()
 
-    # Memory
+    # Memory: marshal budget + system RAM + swap
     mem = data.get("memory", {})
-    total_gb = mem.get("total", 0) / (1024**3)
-    used_gb = mem.get("used_by_models", 0) / (1024**3)
-    avail_gb = mem.get("available", 0) / (1024**3)
+    budget_total_gb = mem.get("total", 0) / (1024**3)
+    budget_used_gb = mem.get("used_by_models", 0) / (1024**3)
+    budget_avail_gb = mem.get("available", 0) / (1024**3)
     typer.echo(
-        f"  Memory:  {used_gb:.1f} / {total_gb:.1f} GB used"
-        f"  ({avail_gb:.1f} GB available)"
+        f"  Marshal budget:  {budget_used_gb:.1f} / {budget_total_gb:.1f} GB"
+        f" used by models  ({budget_avail_gb:.1f} GB available)"
     )
+
+    sys_mem = mem.get("system")
+    if sys_mem:
+        sys_total_gb = sys_mem["total"] / (1024**3)
+        sys_used_gb = sys_mem["used"] / (1024**3)
+        sys_avail_gb = sys_mem["available"] / (1024**3)
+        typer.echo(
+            f"  System RAM:      {sys_used_gb:.1f} / {sys_total_gb:.1f} GB"
+            f" used  ({sys_avail_gb:.1f} GB available, {sys_mem['percent']}%)"
+        )
+
+    swap = mem.get("swap")
+    if swap and swap.get("total", 0) > 0:
+        swap_total_gb = swap["total"] / (1024**3)
+        swap_used_gb = swap["used"] / (1024**3)
+        if swap_used_gb > 0.01:
+            typer.echo(
+                f"  Swap:            {swap_used_gb:.1f} / {swap_total_gb:.1f} GB"
+                f" used  ({swap['percent']}%)"
+            )
+        else:
+            typer.echo(f"  Swap:            unused ({swap_total_gb:.1f} GB available)")
     typer.echo()
 
     # Queue
