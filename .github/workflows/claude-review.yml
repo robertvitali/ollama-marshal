@@ -25,8 +25,8 @@ jobs:
       - name: Claude Code Review
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_md: |
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
             Review this PR for:
             - Code quality and adherence to project conventions (see CLAUDE.md)
             - Type safety (all functions must have type annotations)
