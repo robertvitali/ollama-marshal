@@ -26,9 +26,37 @@ If requests arrive as `[modelA, modelB, modelA, modelB]`, Ollama performs
 `[modelA, modelA, modelB, modelB]` — only **2 loads**, and can go further
 by fitting both models in memory simultaneously for **0 unnecessary loads**.
 
-The [QLM paper](https://dl.acm.org/doi/10.1145/3698038.3698528) (ACM SoCC
-2024) proves this class of algorithm delivers 40-90% SLO improvement. No
-practical implementation exists for Ollama — until now.
+## Why this proxy exists
+
+Ollama serves requests with a simple FIFO queue. When VRAM pressure
+forces a model swap, it evicts via LRU. Neither decision considers
+what's queued behind the current request, so models load and unload
+reactively as different programs hit the proxy.
+
+The [QLM paper](https://dl.acm.org/doi/10.1145/3698038.3698523) (Patke
+et al., ACM SoCC 2024) introduces a **global scheduler** for LLM
+serving that orchestrates request pulling, eviction, load balancing,
+and model swapping together, instead of treating each as an
+independent decision. They report 40–90% SLO improvement and 20–400%
+throughput gains in their evaluation.
+
+ollama-marshal applies that *global-scheduler* insight to a single
+Ollama instance. We don't implement QLM's full machinery (no Request
+Waiting Time Estimator), but we do replace Ollama's reactive
+per-request behavior with batch-aware decisions:
+
+| Decision | Ollama natively | ollama-marshal |
+|---|---|---|
+| Order of dispatch | FIFO arrival order | Group by already-loaded model, dispatch all at once |
+| Eviction trigger | LRU on VRAM pressure | Score by pending request count + program priority |
+| When to evict | Whenever a different model is requested | After draining the in-flight model's pending batch |
+| Bin-packing | None | Load smaller queued models into remaining VRAM |
+| Fairness | None | `max_skips` forces service after N bin-pack passes |
+| Priority | All requests equal | `critical` priority can preempt loaded models |
+
+In the `[modelA, modelB, modelA, modelB]` example above, Ollama does 4
+model loads. ollama-marshal drops that to 2, or 0 if both fit in VRAM
+together.
 
 ## Features
 

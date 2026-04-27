@@ -6,6 +6,7 @@ By participating in this project, you agree to abide by its terms.
 
 ## Enforcement
 
-Instances of unacceptable behavior may be reported to the project maintainer
-at **robert.dominic.vitali@gmail.com**. All complaints will be reviewed and
-investigated promptly and fairly.
+Instances of unacceptable behavior may be reported to the project
+maintainers by opening a [private security advisory](https://github.com/robertvitali/ollama-marshal/security/advisories/new)
+on GitHub. All complaints will be reviewed and investigated promptly and
+fairly.
