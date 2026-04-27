@@ -1,0 +1,225 @@
+"""Per-model request queues with skip tracking for fairness."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class RequestEnvelope:
+    """Wraps an incoming request with scheduling metadata.
+
+    Attributes:
+        model: The model name this request targets.
+        program_id: Identifier of the calling program.
+        request_body: The raw request body to forward to Ollama.
+        endpoint: The Ollama endpoint path (e.g., '/api/chat').
+        stream: Whether this is a streaming request.
+        arrived_at: Monotonic timestamp of arrival.
+        skip_count: Number of times this request has been skipped by the scheduler.
+        done_event: Asyncio event set when the response is ready.
+        response: The response object, populated by the scheduler.
+        error: Any error that occurred during processing.
+    """
+
+    model: str
+    program_id: str
+    request_body: dict[str, Any]
+    endpoint: str
+    stream: bool = False
+    arrived_at: float = field(default_factory=time.monotonic)
+    skip_count: int = 0
+    done_event: asyncio.Event = field(default_factory=asyncio.Event)
+    response: Any = None
+    error: Exception | None = None
+
+    def increment_skip(self) -> None:
+        """Increment the skip counter for this request."""
+        self.skip_count += 1
+
+    def is_unskippable(self, max_skips: int) -> bool:
+        """Check if this request has exceeded its skip limit.
+
+        Args:
+            max_skips: Maximum allowed skips before forced service.
+
+        Returns:
+            True if the request must be served next.
+        """
+        return self.skip_count >= max_skips
+
+    def complete(self, response: Any) -> None:
+        """Mark this request as completed with a response.
+
+        Args:
+            response: The response to deliver to the waiting caller.
+        """
+        self.response = response
+        self.done_event.set()
+
+    def fail(self, error: Exception) -> None:
+        """Mark this request as failed with an error.
+
+        Args:
+            error: The exception that caused the failure.
+        """
+        self.error = error
+        self.done_event.set()
+
+    @property
+    def wait_time(self) -> float:
+        """Seconds this request has been waiting."""
+        return time.monotonic() - self.arrived_at
+
+
+class ModelQueues:
+    """Thread-safe per-model request queues.
+
+    Organizes incoming requests into separate FIFO queues by model name,
+    with global arrival-order tracking for fair scheduling.
+    """
+
+    def __init__(self) -> None:
+        self._queues: dict[str, deque[RequestEnvelope]] = defaultdict(deque)
+        self._lock = asyncio.Lock()
+
+    async def enqueue(self, envelope: RequestEnvelope) -> None:
+        """Add a request to the appropriate model queue.
+
+        Args:
+            envelope: The request envelope to enqueue.
+        """
+        async with self._lock:
+            self._queues[envelope.model].append(envelope)
+
+    async def dequeue(self, model: str) -> RequestEnvelope | None:
+        """Remove and return the next request for a model.
+
+        Args:
+            model: The model name to dequeue from.
+
+        Returns:
+            The next RequestEnvelope, or None if the queue is empty.
+        """
+        async with self._lock:
+            queue = self._queues.get(model)
+            if queue:
+                return queue.popleft()
+            return None
+
+    async def dequeue_batch(
+        self, model: str, max_count: int | None = None
+    ) -> list[RequestEnvelope]:
+        """Remove and return multiple requests for a model.
+
+        Args:
+            model: The model name to dequeue from.
+            max_count: Maximum number of requests to dequeue. None means all.
+
+        Returns:
+            List of RequestEnvelopes, possibly empty.
+        """
+        async with self._lock:
+            queue = self._queues.get(model)
+            if not queue:
+                return []
+            if max_count is None:
+                batch = list(queue)
+                queue.clear()
+            else:
+                batch = []
+                for _ in range(min(max_count, len(queue))):
+                    batch.append(queue.popleft())
+            return batch
+
+    async def peek_models(self) -> list[str]:
+        """Get list of model names that have pending requests.
+
+        Returns:
+            List of model names with non-empty queues.
+        """
+        async with self._lock:
+            return [model for model, queue in self._queues.items() if queue]
+
+    async def pending_count(self, model: str) -> int:
+        """Get the number of pending requests for a model.
+
+        Args:
+            model: The model name.
+
+        Returns:
+            Number of pending requests.
+        """
+        async with self._lock:
+            queue = self._queues.get(model)
+            return len(queue) if queue else 0
+
+    async def total_pending(self) -> int:
+        """Get the total number of pending requests across all models.
+
+        Returns:
+            Total pending request count.
+        """
+        async with self._lock:
+            return sum(len(q) for q in self._queues.values())
+
+    async def pending_by_model(self) -> dict[str, int]:
+        """Get pending request counts grouped by model.
+
+        Returns:
+            Dict mapping model name to pending count.
+        """
+        async with self._lock:
+            return {model: len(queue) for model, queue in self._queues.items() if queue}
+
+    async def get_all_sorted_by_arrival(self) -> list[RequestEnvelope]:
+        """Get all pending requests sorted by arrival time (oldest first).
+
+        Does NOT remove requests from queues. Used by the scheduler to
+        inspect the full queue state for bin-packing decisions.
+
+        Returns:
+            Sorted list of all pending requests.
+        """
+        async with self._lock:
+            all_envelopes: list[RequestEnvelope] = []
+            for queue in self._queues.values():
+                all_envelopes.extend(queue)
+            all_envelopes.sort(key=lambda e: e.arrived_at)
+            return all_envelopes
+
+    async def get_unskippable(self, max_skips: int) -> list[RequestEnvelope]:
+        """Get all requests that have exceeded their skip limit.
+
+        Does NOT remove requests from queues.
+
+        Args:
+            max_skips: The skip threshold.
+
+        Returns:
+            List of unskippable requests sorted by arrival time.
+        """
+        async with self._lock:
+            unskippable: list[RequestEnvelope] = []
+            for queue in self._queues.values():
+                for envelope in queue:
+                    if envelope.is_unskippable(max_skips):
+                        unskippable.append(envelope)
+            unskippable.sort(key=lambda e: e.arrived_at)
+            return unskippable
+
+    async def increment_skips_for_model(self, model: str) -> None:
+        """Increment skip count for all pending requests of a model.
+
+        Args:
+            model: The model whose requests were skipped.
+        """
+        async with self._lock:
+            queue = self._queues.get(model)
+            if queue:
+                for envelope in queue:
+                    envelope.increment_skip()
