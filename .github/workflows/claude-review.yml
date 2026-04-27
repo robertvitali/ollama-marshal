@@ -27,6 +27,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.CLAUDE_API_KEY }}
+          use_sticky_comment: true
           prompt: |
             Review this PR against CLAUDE.md (the project's living rulebook).
             Required reading for every review:
@@ -51,3 +52,22 @@ jobs:
               boundary violations)
             - Test coverage gaps for new code (95% target)
             - User-visible changes shipped without a CHANGELOG.md [Unreleased] entry
+
+            How to deliver findings (REQUIRED — without this the review is
+            invisible):
+
+            1. For each concrete finding tied to specific lines, call
+               `mcp__github_inline_comment__create_inline_comment` with the
+               file path, line number, and comment body. Include the severity
+               (CRITICAL / INFORMATIONAL) and a one-line fix suggestion.
+            2. After posting any inline comments, call
+               `mcp__github__update_claude_comment` (or post a top-level PR
+               comment) with a short summary: how many findings, severity
+               breakdown, and overall verdict (LGTM / changes requested).
+            3. If you find no issues at all, still post a one-line summary
+               saying so — "Reviewed against CLAUDE.md. No findings." — so the
+               PR author knows the review actually ran and concluded.
+
+            Do NOT silently complete. The default behavior of this action
+            buffers inline comments for posting; if you don't call the comment
+            tools, nothing is posted and the review is wasted.
