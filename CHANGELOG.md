@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Programs per loaded model in `/api/marshal/status`** — each entry in
+  `loaded_models[*]` now has a `programs: [...]` field listing every
+  program ID with currently-pending requests for that model plus every
+  program that has dispatched against it since it was loaded. Sorted,
+  deduped, cleared on eviction. Surfaces as a "Programs" column in the
+  TUI dashboard's loaded-models table and in `ollama-marshal status`.
 - **Time-based idle eviction** — new `scheduler.idle_eviction_minutes`
   config field (default 15). Loaded models with no activity for that many
   minutes are evicted, regardless of memory pressure. Models with pending

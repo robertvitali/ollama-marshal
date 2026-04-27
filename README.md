@@ -257,12 +257,19 @@ FastAPI auto-generates Swagger UI and the OpenAPI spec:
 {
   "uptime_seconds": 3600,
   "loaded_models": [
-    {"name": "llama3:latest", "size_vram": 4500000000, "pending_requests": 2}
+    {
+      "name": "llama3:latest",
+      "size_vram": 4500000000,
+      "pending_requests": 2,
+      "programs": ["example-chat-a", "example-chat-b"]
+    }
   ],
   "memory": {
     "total": 274877906944,
     "available": 240000000000,
-    "used_by_models": 4500000000
+    "used_by_models": 4500000000,
+    "system": {"total": 274877906944, "available": 60000000000, "used": 214877906944, "percent": 78.2},
+    "swap": {"total": 5368709120, "used": 0, "free": 5368709120, "percent": 0.0}
   },
   "queue": {
     "total_pending": 5,
