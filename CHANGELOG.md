@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dashboard behavior per scenario.
 - `make dryrun-dashboard` — Makefile target that prints the three pane
   commands ready to paste into iTerm splits.
+- `GET /status` — short alias for `/api/marshal/status` so a quick
+  `curl localhost:11435/status` works without remembering the longer path.
 
 ### Fixed
 

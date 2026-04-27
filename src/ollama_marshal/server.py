@@ -189,11 +189,10 @@ def _register_routes(app: FastAPI) -> None:
             return JSONResponse(ollama_embedding_to_openai(resp, model))
         return resp
 
-    # -- Marshal status endpoint --
+    # -- Marshal status endpoint (registered at two paths) --
 
-    @app.get("/api/marshal/status")
-    async def marshal_status() -> dict[str, Any]:
-        """Return proxy status as JSON."""
+    async def _marshal_status_payload() -> dict[str, Any]:
+        """Build the marshal status JSON payload (shared by both routes)."""
         loaded = _memory.get_loaded_models()
         pending_by_model = await _queues.pending_by_model()
         return {
@@ -222,6 +221,19 @@ def _register_routes(app: FastAPI) -> None:
                 "average_wait_ms": round(_scheduler.metrics.average_wait_ms, 1),
             },
         }
+
+    @app.get("/api/marshal/status")
+    async def marshal_status() -> dict[str, Any]:
+        """Return proxy status as JSON (canonical path)."""
+        return await _marshal_status_payload()
+
+    @app.get("/status")
+    async def status_alias() -> dict[str, Any]:
+        """Short alias for /api/marshal/status.
+
+        Convenient for `curl localhost:11435/status` instead of the longer path.
+        """
+        return await _marshal_status_payload()
 
     # -- Pass-through endpoints (safe read-only allowlist) --
 

@@ -116,6 +116,10 @@ class TestRouteRegistration:
     def test_marshal_status_route_exists(self):
         assert "/api/marshal/status" in self._get_routes()
 
+    def test_status_alias_route_exists(self):
+        # Short alias so `curl localhost:11435/status` works.
+        assert "/status" in self._get_routes()
+
     def test_passthrough_route_exists(self):
         assert "/api/{path:path}" in self._get_routes()
 
