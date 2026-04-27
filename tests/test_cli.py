@@ -66,6 +66,21 @@ class TestSetupLogging:
         _setup_logging("DEBUG", "json")
         mock_structlog.configure.assert_called_once()
 
+    # Unmocked tests — exercise the real structlog and stdlib logging codepath
+    # so a missing/wrong attribute call surfaces. The mocked tests above do
+    # not catch this because every structlog attribute resolves to MagicMock.
+    @pytest.mark.parametrize(
+        "level", ["DEBUG", "INFO", "WARNING", "ERROR", "info", "warning"]
+    )
+    def test_real_setup_accepts_standard_levels(self, level):
+        # Should not raise. Idempotent — re-running just reconfigures structlog.
+        _setup_logging(level, "console")
+        _setup_logging(level, "json")
+
+    def test_real_setup_unknown_level_falls_back_to_info(self):
+        # Defensive: unknown level shouldn't crash the CLI.
+        _setup_logging("NOPE", "console")
+
 
 # ---------------------------------------------------------------------------
 # start command
