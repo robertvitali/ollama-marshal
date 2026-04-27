@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
 import httpx
@@ -37,7 +38,7 @@ def _setup_logging(level: str, fmt: str) -> None:
     else:
         processors.append(structlog.dev.ConsoleRenderer())
 
-    log_level: int = structlog.get_level_from_name(level)  # type: ignore[operator]
+    log_level: int = getattr(logging, level.upper(), logging.INFO)
     structlog.configure(
         processors=processors,
         wrapper_class=structlog.make_filtering_bound_logger(log_level),

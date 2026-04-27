@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `ollama-marshal start` crashed on launch with `AttributeError: module
+  structlog has no attribute get_level_from_name`. The function never
+  existed in any structlog version. Replaced with `getattr(logging,
+  level.upper(), logging.INFO)` from the stdlib.
+- `tests/test_cli.py::TestSetupLogging` mocked `structlog` so completely
+  that `mock_structlog.get_level_from_name` resolved to a MagicMock and
+  the bug never surfaced. Added unmocked parametrized tests that exercise
+  the real codepath for each standard log level.
+
 ## [0.1.0] - 2026-04-24
 
 ### Added
