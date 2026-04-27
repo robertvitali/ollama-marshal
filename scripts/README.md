@@ -54,13 +54,16 @@ commands ready to paste.
 
 ### Single-shot (~1-3s, fast feedback)
 
-One request each, with the right `X-Program-ID` header for the program.
+One request each, with the right `X-Program-ID` header for an example
+program. The four placeholder programs (`chat-a`, `chat-b`, `generate-a`,
+`generate-b`) simulate a deployment with two chat clients and two generate
+clients — adjust to your own programs in `scripts/dryrun.py`.
 
 ```bash
-python scripts/dryrun.py single email
-python scripts/dryrun.py single portfolio
-python scripts/dryrun.py single freethink
-python scripts/dryrun.py single aibuyersguide
+python scripts/dryrun.py single chat-a
+python scripts/dryrun.py single chat-b
+python scripts/dryrun.py single generate-a
+python scripts/dryrun.py single generate-b
 ```
 
 Use these to confirm baseline routing and that marshal is up.
@@ -69,8 +72,8 @@ Use these to confirm baseline routing and that marshal is up.
 
 | Command | What it tests | What you should see |
 |---|---|---|
-| `python scripts/dryrun.py email-burst --k 5` | Model-affinity grouping. Mimics AI-Email's K=5 self-consistency vote. | Pane 1: pending spikes to 5 then drains. Pane 2: 5 enqueued, 5 served, **no `evicting`**. Assertion: `model_swaps` Δ = 0. |
-| `python scripts/dryrun.py portfolio-loop --rounds 10` | Sequential same-model loop (AI-Portfolio's tool-calling pattern). | Pane 1: `requests_served` ticks up by 10. Assertion: 0 swaps, 0 evictions. |
+| `python scripts/dryrun.py same-model-burst --k 5` | Model-affinity grouping (e.g. K-vote self-consistency). | Pane 1: pending spikes to 5 then drains. Pane 2: 5 enqueued, 5 served, **no `evicting`**. Assertion: `model_swaps` Δ = 0. |
+| `python scripts/dryrun.py same-model-loop --rounds 10` | Sequential same-model loop (e.g. tool-calling rounds). | Pane 1: `requests_served` ticks up by 10. Assertion: 0 swaps, 0 evictions. |
 | `python scripts/dryrun.py parallel-all` | **Headline test.** One request from each program in parallel, each with a different small model. | Pane 1: pending grows briefly across 4 models, drains in 4 batches grouped by model. Pane 2: at most a few `bin_pack_load` events. **No `request_failed`.** |
 | `python scripts/dryrun.py thrash-test --rounds 10` | Alternating models — provokes bin-packing and (with `--big`) evictions. | Pane 2: visible `bin_pack_load` for each new model. With production-size models: `evicting` events with `pending=0` (drain-before-evict working). |
 | `python scripts/dryrun.py priority-test` | Critical-priority preemption. **Requires** at least one program in `marshal.yaml` set to `priority: critical`. | Pane 2: `scheduler.critical_preemption` event. Critical request served before queued normal-priority work. |
@@ -87,15 +90,14 @@ Use these to confirm baseline routing and that marshal is up.
 
 Scenarios default to small models that load fast (`qwen3.5:4b-bf16` and
 similar) so you can iterate. Pass `--model NAME` for a single scenario, or
-`--big` on `parallel-all` to switch to realistic-size production models
-(matches what each project actually configures). Use `--big` to actually
-provoke memory pressure and eviction events.
+`--big` on `parallel-all` to switch to realistic-size models. Use `--big`
+to actually provoke memory pressure and eviction events.
 
 ## What "marshal is working" looks like
 
 If you fire `parallel-all` and see all 4 programs return 200, with model
 swaps bounded by the number of distinct models (not 4× the number), then
-inter-program scheduling is working. If `email-burst --k 5` completes
+inter-program scheduling is working. If `same-model-burst --k 5` completes
 with **0 swaps**, model-affinity grouping is working. If `thrash-test
 --big` shows `evicting` events that come AFTER `drain_before_evict`,
 graceful eviction is working.

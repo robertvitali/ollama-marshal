@@ -84,6 +84,11 @@ class Scheduler:
         # Used by _idle_evict_unused_models to time-evict models that haven't
         # been used in `config.scheduler.idle_eviction_minutes` minutes.
         self._last_activity: dict[str, float] = {}
+        # Maps model name -> {program_id: monotonic timestamp of last dispatch}.
+        # Surfaces "who is currently using this loaded model" in the status
+        # payload and dashboard. Populated in _forward_single, cleared on
+        # idle/forced eviction so dropped models don't show stale callers.
+        self._active_programs: dict[str, dict[str, float]] = {}
 
     async def start(self) -> None:
         """Start the scheduler loop."""
@@ -144,6 +149,19 @@ class Scheduler:
         # in a while, regardless of memory pressure. Configurable; 0 disables.
         await self._idle_evict_unused_models()
 
+    def active_programs_by_model(self) -> dict[str, list[str]]:
+        """Return programs that have recently dispatched against each loaded model.
+
+        Used by the status payload to show "who is using this loaded model"
+        even when the model is currently idle (no pending requests). Dropped
+        when the model is unloaded.
+        """
+        return {
+            model: sorted(progs.keys())
+            for model, progs in self._active_programs.items()
+            if progs
+        }
+
     async def _idle_evict_unused_models(self) -> None:
         """Evict loaded models that have been idle longer than the threshold.
 
@@ -185,6 +203,7 @@ class Scheduler:
             if success:
                 self.metrics.evictions += 1
                 self._last_activity.pop(model_name, None)
+                self._active_programs.pop(model_name, None)
                 await self.memory.refresh()
             # Only evict one per tick — keeps the loop lightweight.
             break
@@ -363,6 +382,8 @@ class Scheduler:
         success = await self.lifecycle.unload(target)
         if success:
             self.metrics.evictions += 1
+            self._last_activity.pop(target, None)
+            self._active_programs.pop(target, None)
             await self.memory.refresh()
         return success
 
@@ -410,7 +431,11 @@ class Scheduler:
             # Stamp this model as recently active so idle-eviction doesn't
             # touch it. Done on dispatch (not on completion) so a long
             # streaming response doesn't get unloaded mid-flight.
-            self._last_activity[envelope.model] = time.monotonic()
+            now = time.monotonic()
+            self._last_activity[envelope.model] = now
+            self._active_programs.setdefault(envelope.model, {})[
+                envelope.program_id
+            ] = now
             wait_ms = envelope.wait_time * 1000
             self.metrics.requests_served += 1
             self.metrics.total_wait_ms += wait_ms

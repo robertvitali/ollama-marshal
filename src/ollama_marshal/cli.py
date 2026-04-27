@@ -169,10 +169,13 @@ def status(
     else:
         for m in loaded:
             size_gb = m["size_vram"] / (1024**3)
+            progs = m.get("programs") or []
+            progs_str = ", ".join(progs) if progs else "—"
             typer.echo(
                 f"    {m['name']:<30} "
                 f"{size_gb:.1f} GB   "
-                f"{m['pending_requests']} pending"
+                f"{m['pending_requests']} pending   "
+                f"programs: {progs_str}"
             )
     typer.echo()
 

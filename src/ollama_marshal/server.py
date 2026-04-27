@@ -204,6 +204,8 @@ def _register_routes(app: FastAPI) -> None:
         """
         loaded = _memory.get_loaded_models()
         pending_by_model = await _queues.pending_by_model()
+        pending_progs = await _queues.pending_programs_by_model()
+        active_progs = _scheduler.active_programs_by_model()
         sysmem = psutil.virtual_memory()
         sysswap = psutil.swap_memory()
         return {
@@ -213,6 +215,13 @@ def _register_routes(app: FastAPI) -> None:
                     "name": m.name,
                     "size_vram": m.size_vram,
                     "pending_requests": pending_by_model.get(m.name, 0),
+                    # Union of programs with currently-pending requests and
+                    # programs that have dispatched against this loaded model
+                    # since it was loaded. Sorted, deduped.
+                    "programs": sorted(
+                        set(pending_progs.get(m.name, []))
+                        | set(active_progs.get(m.name, []))
+                    ),
                 }
                 for m in loaded.values()
             ],

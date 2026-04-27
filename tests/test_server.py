@@ -36,6 +36,9 @@ def _mock_memory():
 def _mock_queues():
     q = MagicMock(spec=ModelQueues)
     q.pending_by_model = AsyncMock(return_value={"llama3:latest": 2})
+    q.pending_programs_by_model = AsyncMock(
+        return_value={"llama3:latest": ["program-alpha"]}
+    )
     q.total_pending = AsyncMock(return_value=2)
     q.enqueue = AsyncMock()
     return q
@@ -48,6 +51,9 @@ def _mock_scheduler():
         model_swaps=3,
         evictions=1,
         average_wait_ms=42.5,
+    )
+    sched.active_programs_by_model = MagicMock(
+        return_value={"llama3:latest": ["program-beta"]}
     )
     return sched
 
@@ -524,6 +530,12 @@ class TestMarshalStatus:
         # Verify nested structure
         assert len(result["loaded_models"]) == 1
         assert result["loaded_models"][0]["name"] == "llama3:latest"
+        # Programs are the union of pending-queue programs and recently-active
+        # programs from the scheduler, sorted and deduped.
+        assert result["loaded_models"][0]["programs"] == [
+            "program-alpha",
+            "program-beta",
+        ]
         assert result["metrics"]["requests_served"] == 10
         assert result["queue"]["total_pending"] == 2
 

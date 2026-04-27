@@ -176,6 +176,22 @@ class ModelQueues:
         async with self._lock:
             return {model: len(queue) for model, queue in self._queues.items() if queue}
 
+    async def pending_programs_by_model(self) -> dict[str, list[str]]:
+        """Get unique pending-request program IDs grouped by model.
+
+        Returns:
+            Dict mapping model name to a sorted list of distinct program IDs
+            that currently have queued requests for that model.
+        """
+        async with self._lock:
+            out: dict[str, list[str]] = {}
+            for model, queue in self._queues.items():
+                if not queue:
+                    continue
+                progs = sorted({env.program_id for env in queue})
+                out[model] = progs
+            return out
+
     async def get_all_sorted_by_arrival(self) -> list[RequestEnvelope]:
         """Get all pending requests sorted by arrival time (oldest first).
 

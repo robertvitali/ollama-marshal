@@ -44,8 +44,15 @@ _MIN_REFRESH_HZ = 0.5
 _MAX_REFRESH_HZ = 10.0
 
 # Match the lifecycle and scheduling events worth showing.
+# Superset of the legacy `tail | grep "scheduler\.|request_(enqueued|served|
+# timeout|error)"` recipe — adds `lifecycle.*` (model load/unload) and
+# `model_registry.*` (size discovery) so the events panel is the full
+# observability story, not a strict subset.
 _EVENT_FILTER = re.compile(
-    r"scheduler\.|server\.request_(enqueued|served|timeout|error)|model_registry\."
+    r"scheduler\."
+    r"|server\.request_(enqueued|served|timeout|error)"
+    r"|lifecycle\."
+    r"|model_registry\."
 )
 # Strip ANSI color sequences from structlog console output.
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -349,9 +356,7 @@ def render_memory(status: StatusSnapshot) -> Panel:
         swap_total_gb = status.swap_total / (1024**3)
         swap_used_gb = status.swap_used / (1024**3)
         swap_pct = status.swap_percent
-        swap_bar = ProgressBar(
-            total=100, completed=swap_pct, complete_style="red"
-        )
+        swap_bar = ProgressBar(total=100, completed=swap_pct, complete_style="red")
         grid.add_row(
             swap_bar,
             Text.assemble(
@@ -395,9 +400,10 @@ def render_models(status: StatusSnapshot) -> Panel:
     t.add_column("Model", style="cyan", no_wrap=True)
     t.add_column("VRAM", justify="right")
     t.add_column("Pending", justify="right")
+    t.add_column("Programs", overflow="fold")
 
     if not status.loaded_models:
-        t.add_row("[dim](no models loaded)[/dim]", "—", "—")
+        t.add_row("[dim](no models loaded)[/dim]", "—", "—", "—")
     else:
         for m in status.loaded_models:
             sz = f"{m['size_vram'] / (1024**3):.1f} GB"
@@ -405,7 +411,9 @@ def render_models(status: StatusSnapshot) -> Panel:
             pending_text = (
                 f"[yellow]{pending}[/yellow]" if pending > 0 else f"{pending}"
             )
-            t.add_row(m["name"], sz, pending_text)
+            progs = m.get("programs") or []
+            progs_text = ", ".join(progs) if progs else "[dim]—[/dim]"
+            t.add_row(m["name"], sz, pending_text, progs_text)
 
     title = (
         f"Loaded Models ({len(status.loaded_models)})"
@@ -455,6 +463,12 @@ def _event_color(event_name: str) -> str:
     if event_name.startswith("scheduler.forced"):
         return "yellow"
     if event_name.startswith(("server.request_error", "server.request_timeout")):
+        return "red"
+    if event_name == "lifecycle.preloaded":
+        return "green"
+    if event_name == "lifecycle.unloaded":
+        return "yellow"
+    if event_name.endswith(("_failed", "_timeout", "_error")):
         return "red"
     return "cyan"
 
@@ -657,9 +671,7 @@ async def run_dashboard_async(
         "events": deque(maxlen=500),
         "stopped": False,
     }
-    poller_task = asyncio.create_task(
-        status_poller(state, marshal_url, poll_interval)
-    )
+    poller_task = asyncio.create_task(status_poller(state, marshal_url, poll_interval))
     follower_task = asyncio.create_task(log_follower(state, log_path))
     try:
         await render_loop(state, marshal_url, refresh_hz)

@@ -10,9 +10,10 @@ Run from the marshal repo root:
     .venv/bin/python scripts/dryrun.py parallel-all
     .venv/bin/python scripts/dryrun.py thrash-test --rounds 10
 
-The script does NOT import any of the cut-over client projects.
-It mimics their HTTP surface (model + endpoint + X-Program-ID header)
-since the cutover already proved the project-side wiring.
+The harness simulates 4 example client programs hitting marshal with
+different X-Program-ID headers, endpoints, and models. The program
+identifiers and model names below are placeholders — adapt them to
+match your own deployment.
 """
 
 from __future__ import annotations
@@ -32,41 +33,42 @@ from rich.table import Table
 
 MARSHAL_URL = "http://localhost:11435"
 
-# Programs cut over in the v0.1.0 rollout (matches marshal.yaml on this machine).
+# Four example client programs, identified by X-Program-ID header.
+# Replace these placeholders with your own program IDs to match your
+# deployment's marshal.yaml.
 PROGRAMS = {
-    "email": "ai-email-triage",
-    "portfolio": "ai-portfolio-rebalance",
-    "freethink": "projectfreethink-government-analysis",
-    "aibuyersguide": "aibuyersguide-vision",
+    "chat-a": "example-chat-a",
+    "chat-b": "example-chat-b",
+    "generate-a": "example-generate-a",
+    "generate-b": "example-generate-b",
 }
 
 # Endpoint each program tends to hit.
 ENDPOINTS = {
-    "email": "/api/chat",
-    "portfolio": "/api/chat",
-    "freethink": "/api/generate",
-    "aibuyersguide": "/api/generate",
+    "chat-a": "/api/chat",
+    "chat-b": "/api/chat",
+    "generate-a": "/api/generate",
+    "generate-b": "/api/generate",
 }
 
-# Small default model — already loaded in our Ollama after cutover.
+# Small default model — adjust to a model present on your Ollama install.
 SMALL_DEFAULT = "qwen3.5:4b-bf16"
 
 # Realistic-size models per program. Used when --big is passed.
-# Picked to match what each project actually configures.
 BIG_PER_PROGRAM = {
-    "email": "qwen3.5:9b-bf16",
-    "portfolio": "qwen3.5:9b-q8_0",
-    "freethink": "qwen3.5:9b-q4_K_M",
-    "aibuyersguide": "qwen3.5:4b-q4_K_M",
+    "chat-a": "qwen3.5:9b-bf16",
+    "chat-b": "qwen3.5:9b-q8_0",
+    "generate-a": "qwen3.5:9b-q4_K_M",
+    "generate-b": "qwen3.5:4b-q4_K_M",
 }
 
 # Distinct small models for parallel-all so each program loads a different
 # one (the whole point of parallel-all is to test inter-program scheduling).
 PARALLEL_MODELS = {
-    "email": "qwen3.5:4b-bf16",
-    "portfolio": "qwen3.5:2b-q4_K_M",
-    "freethink": "qwen3.5:0.8b-bf16",
-    "aibuyersguide": "qwen3.5:0.8b-q8_0",
+    "chat-a": "qwen3.5:4b-bf16",
+    "chat-b": "qwen3.5:2b-q4_K_M",
+    "generate-a": "qwen3.5:0.8b-bf16",
+    "generate-b": "qwen3.5:0.8b-q8_0",
 }
 
 # Models for thrash-test default (3 distinct small models to alternate between).
@@ -150,9 +152,7 @@ def verdict(passed: bool, label: str, detail: str = "") -> None:
     console.print(f"  {mark} {label}{suffix}")
 
 
-def summary_table(
-    title: str, before: StatusSnapshot, after: StatusSnapshot
-) -> None:
+def summary_table(title: str, before: StatusSnapshot, after: StatusSnapshot) -> None:
     """Print before/after delta of marshal status."""
     t = Table(title=title, show_header=True)
     t.add_column("Metric")
@@ -189,9 +189,7 @@ def _build_chat_payload(model: str, prompt: str, num_predict: int = 20) -> dict:
     }
 
 
-def _build_generate_payload(
-    model: str, prompt: str, num_predict: int = 20
-) -> dict:
+def _build_generate_payload(model: str, prompt: str, num_predict: int = 20) -> dict:
     return {
         "model": model,
         "prompt": prompt,
@@ -296,9 +294,7 @@ def _run_single(program: str, model: str) -> None:
     code, ms, content = fire_sync(program, model)
     after = get_status()
 
-    console.print(
-        f"  HTTP [bold]{code}[/bold]  in {ms}ms  → {content!r}"
-    )
+    console.print(f"  HTTP [bold]{code}[/bold]  in {ms}ms  → {content!r}")
     verdict(code == 200, "request returned 200")
     verdict(
         after.requests_served >= before.requests_served + 1,
@@ -306,64 +302,63 @@ def _run_single(program: str, model: str) -> None:
     )
 
 
-@single_app.command("email")
-def single_email(
+@single_app.command("chat-a")
+def single_chat_a(
     model: Annotated[
         str, typer.Option("--model", "-m", help="Model to use")
     ] = SMALL_DEFAULT,
 ) -> None:
-    """One chat tagged ai-email-triage."""
-    _run_single("email", model)
+    """One chat request tagged example-chat-a."""
+    _run_single("chat-a", model)
 
 
-@single_app.command("portfolio")
-def single_portfolio(
+@single_app.command("chat-b")
+def single_chat_b(
     model: Annotated[str, typer.Option("--model", "-m")] = SMALL_DEFAULT,
 ) -> None:
-    """One chat tagged ai-portfolio-rebalance."""
-    _run_single("portfolio", model)
+    """One chat request tagged example-chat-b."""
+    _run_single("chat-b", model)
 
 
-@single_app.command("freethink")
-def single_freethink(
+@single_app.command("generate-a")
+def single_generate_a(
     model: Annotated[str, typer.Option("--model", "-m")] = SMALL_DEFAULT,
 ) -> None:
-    """One generate tagged projectfreethink-government-analysis."""
-    _run_single("freethink", model)
+    """One generate request tagged example-generate-a."""
+    _run_single("generate-a", model)
 
 
-@single_app.command("aibuyersguide")
-def single_aibuyersguide(
+@single_app.command("generate-b")
+def single_generate_b(
     model: Annotated[str, typer.Option("--model", "-m")] = SMALL_DEFAULT,
 ) -> None:
-    """One generate tagged aibuyersguide-vision."""
-    _run_single("aibuyersguide", model)
+    """One generate request tagged example-generate-b."""
+    _run_single("generate-b", model)
 
 
 # --- Pattern scenarios ------------------------------------------------------
 
 
-@app.command("email-burst")
-def email_burst(
+@app.command("same-model-burst")
+def same_model_burst(
     k: Annotated[int, typer.Option("--k", help="Concurrent count")] = 5,
     model: Annotated[str, typer.Option("--model", "-m")] = SMALL_DEFAULT,
 ) -> None:
-    """K concurrent same-model requests (mimics AI-Email K=5 self-consistency).
+    """K concurrent same-model requests (e.g. self-consistency vote).
 
     Asserts model_swaps delta is 0 — marshal should group all K to the same
     already-loaded model with zero swaps.
     """
     banner(
-        f"email-burst (k={k})",
-        f"K={k} concurrent ai-email-triage requests on {model}. "
-        f"Expect 0 model_swaps.",
+        f"same-model-burst (k={k})",
+        f"K={k} concurrent chat-a requests on {model}. Expect 0 model_swaps.",
     )
     before = get_status()
 
     async def run() -> list[tuple[int, float, str]]:
         return await asyncio.gather(
             *(
-                fire_async("email", model, f"Reply with the digit {i}")
+                fire_async("chat-a", model, f"Reply with the digit {i}")
                 for i in range(k)
             )
         )
@@ -378,7 +373,7 @@ def email_burst(
     for i, (code, ms, content) in enumerate(results):
         console.print(f"    [{i}] {code}  {ms}ms  → {content!r}")
 
-    summary_table("email-burst delta", before, after)
+    summary_table("same-model-burst delta", before, after)
     verdict(ok == k, f"all {k} requests succeeded")
     verdict(
         after.model_swaps == before.model_swaps,
@@ -387,25 +382,25 @@ def email_burst(
     )
 
 
-@app.command("portfolio-loop")
-def portfolio_loop(
+@app.command("same-model-loop")
+def same_model_loop(
     rounds: Annotated[int, typer.Option("--rounds", "-n")] = 10,
     model: Annotated[str, typer.Option("--model", "-m")] = SMALL_DEFAULT,
 ) -> None:
-    """Sequential same-model loop (mimics AI-Portfolio's tool-calling rounds).
+    """Sequential same-model loop (e.g. tool-calling rounds).
 
     Asserts 0 swaps and 0 evictions — same model throughout.
     """
     banner(
-        f"portfolio-loop (rounds={rounds})",
-        f"Sequential ai-portfolio-rebalance on {model}. Expect 0 swaps, 0 evictions.",
+        f"same-model-loop (rounds={rounds})",
+        f"Sequential chat-b requests on {model}. Expect 0 swaps, 0 evictions.",
     )
     before = get_status()
     durations: list[int] = []
     failures = 0
     for i in range(rounds):
         code, ms, _ = fire_sync(
-            "portfolio", model, f"Round {i}: reply with: round-{i}", num_predict=10
+            "chat-b", model, f"Round {i}: reply with: round-{i}", num_predict=10
         )
         if code != 200:
             failures += 1
@@ -413,8 +408,10 @@ def portfolio_loop(
     after = get_status()
 
     avg = sum(durations) // len(durations) if durations else 0
-    console.print(f"  {rounds} rounds, avg {avg}ms, {rounds - failures}/{rounds} succeeded")
-    summary_table("portfolio-loop delta", before, after)
+    console.print(
+        f"  {rounds} rounds, avg {avg}ms, {rounds - failures}/{rounds} succeeded"
+    )
+    summary_table("same-model-loop delta", before, after)
     verdict(failures == 0, f"all {rounds} rounds succeeded")
     verdict(after.model_swaps == before.model_swaps, "0 model swaps")
     verdict(after.evictions == before.evictions, "0 evictions")
@@ -431,21 +428,20 @@ def parallel_all(
     With small distinct models, all 4 should load if VRAM allows (bin-pack).
     With --big, watch for evictions and drain-before-evict in the dashboard.
     """
-    if big:
-        models = BIG_PER_PROGRAM
-    else:
-        models = PARALLEL_MODELS
+    models = BIG_PER_PROGRAM if big else PARALLEL_MODELS
 
     banner(
         "parallel-all",
-        "1 request from each of the 4 cut-over programs, in parallel.\n"
+        "1 request from each of the 4 example programs, in parallel.\n"
         + "\n".join(f"  {p}: {m}" for p, m in models.items()),
     )
     before = get_status()
 
     async def run() -> list[tuple[str, tuple[int, float, str]]]:
         async def one(prog: str) -> tuple[str, tuple[int, float, str]]:
-            r = await fire_async(prog, models[prog], f"Reply: {prog} OK", num_predict=10)
+            r = await fire_async(
+                prog, models[prog], f"Reply: {prog} OK", num_predict=10
+            )
             return prog, r
 
         return await asyncio.gather(*(one(p) for p in PROGRAMS))
@@ -507,7 +503,8 @@ def thrash_test(
     summary_table("thrash-test delta", before, after)
     verdict(failures == 0, f"all {rounds} rounds succeeded")
     console.print(
-        "  [dim]Look at the log pane for scheduler.bin_pack_load / evicting events.[/dim]"
+        "  [dim]Look at the log pane for "
+        "scheduler.bin_pack_load / evicting events.[/dim]"
     )
 
 
@@ -521,15 +518,15 @@ def priority_test() -> None:
     """
     banner(
         "priority-test",
-        "Normal-priority freethink load, then a critical-priority email request.\n"
+        "Normal-priority background load, then a critical-priority request.\n"
         "Requires `priority: critical` for some program in marshal.yaml.",
     )
     before = get_status()
 
-    # Background load: 3 sequential portfolio calls on small model
+    # Background load: 3 sequential calls on small model from a normal-priority program.
     async def background() -> None:
         for i in range(3):
-            await fire_async("portfolio", SMALL_DEFAULT, f"bg {i}", num_predict=20)
+            await fire_async("chat-b", SMALL_DEFAULT, f"bg {i}", num_predict=20)
 
     async def run() -> tuple[tuple[int, float, str], None]:
         bg = asyncio.create_task(background())
@@ -537,7 +534,7 @@ def priority_test() -> None:
         await asyncio.sleep(0.1)
         # Critical preemption candidate (requires marshal.yaml setting):
         crit = await fire_async(
-            "email",
+            "chat-a",
             "qwen3.5:2b-q4_K_M",
             "critical request",
             num_predict=10,
@@ -584,9 +581,7 @@ def passthrough_blocked() -> None:
         "passthrough blocked",
         "POST /api/pull — must 403 (destructive endpoint not proxied).",
     )
-    resp = httpx.post(
-        f"{MARSHAL_URL}/api/pull", json={"name": "fake-model"}, timeout=5
-    )
+    resp = httpx.post(f"{MARSHAL_URL}/api/pull", json={"name": "fake-model"}, timeout=5)
     console.print(f"  HTTP {resp.status_code} → {resp.text[:120]}")
     verdict(
         resp.status_code == 403,
@@ -609,7 +604,7 @@ def bad_model() -> None:
     )
     t0 = time.monotonic()
     code, ms, content = fire_sync(
-        "email", "this-model-does-not-exist:0", "test", num_predict=5, timeout=20
+        "chat-a", "this-model-does-not-exist:0", "test", num_predict=5, timeout=20
     )
     elapsed = int((time.monotonic() - t0) * 1000)
     console.print(f"  HTTP {code} in {elapsed}ms (request itself: {ms}ms)")

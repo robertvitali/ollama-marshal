@@ -294,6 +294,31 @@ class TestModelQueuesPendingCounts:
         result = await queues.pending_by_model()
         assert "llama3:latest" not in result
 
+    async def test_pending_programs_by_model_empty(self, queues):
+        assert await queues.pending_programs_by_model() == {}
+
+    async def test_pending_programs_by_model_dedupes_and_sorts(
+        self, queues, make_envelope
+    ):
+        await queues.enqueue(make_envelope(model="llama3:latest", program_id="b-prog"))
+        await queues.enqueue(make_envelope(model="llama3:latest", program_id="a-prog"))
+        # Duplicate program for same model — should appear once.
+        await queues.enqueue(make_envelope(model="llama3:latest", program_id="a-prog"))
+        await queues.enqueue(make_envelope(model="mistral:latest", program_id="c-prog"))
+        result = await queues.pending_programs_by_model()
+        assert result == {
+            "llama3:latest": ["a-prog", "b-prog"],
+            "mistral:latest": ["c-prog"],
+        }
+
+    async def test_pending_programs_by_model_excludes_drained(
+        self, queues, make_envelope
+    ):
+        await queues.enqueue(make_envelope(model="llama3:latest", program_id="x"))
+        await queues.dequeue("llama3:latest")
+        result = await queues.pending_programs_by_model()
+        assert "llama3:latest" not in result
+
 
 # ---------------------------------------------------------------------------
 # ModelQueues - get_all_sorted_by_arrival

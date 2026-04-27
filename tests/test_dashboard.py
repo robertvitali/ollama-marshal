@@ -90,7 +90,20 @@ class TestEventColor:
 
     def test_default_is_cyan(self):
         assert _event_color("server.request_enqueued") == "cyan"
-        assert _event_color("scheduler.tick_error") == "cyan"
+        assert _event_color("model_registry.cache_loaded") == "cyan"
+
+    def test_error_suffix_is_red(self):
+        # New: anything ending in _error / _failed / _timeout is red,
+        # so unhandled scheduler errors are visible at a glance.
+        assert _event_color("scheduler.tick_error") == "red"
+        assert _event_color("lifecycle.preload_failed") == "red"
+        assert _event_color("lifecycle.preload_timeout") == "red"
+
+    def test_lifecycle_loaded_is_green(self):
+        assert _event_color("lifecycle.preloaded") == "green"
+
+    def test_lifecycle_unloaded_is_yellow(self):
+        assert _event_color("lifecycle.unloaded") == "yellow"
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +144,7 @@ class TestParseLogLine:
     def test_keeps_request_lifecycle(self):
         line = (
             "2026-04-27T05:35:12.514Z [info  ] "
-            "server.request_enqueued program=ai-email-triage"
+            "server.request_enqueued program=program-alpha"
         )
         assert parse_log_line(line) is not None
 

@@ -844,6 +844,53 @@ class TestForwardSingle:
 
         assert sched.metrics.total_wait_ms >= 0
 
+    @patch("ollama_marshal.scheduler.forward_request", new_callable=AsyncMock)
+    async def test_records_program_in_active_programs(self, mock_forward):
+        # Successful dispatch should stamp the model -> program_id in
+        # _active_programs so the dashboard/status payload can show
+        # which programs are using each loaded model.
+        mock_forward.return_value = MagicMock()
+        sched = _make_scheduler()
+
+        e1 = _make_envelope(program_id="program-alpha")
+        e1.model = "llama3:latest"
+        e2 = _make_envelope(program_id="program-beta")
+        e2.model = "llama3:latest"
+
+        await sched._forward_single(e1)
+        await sched._forward_single(e2)
+
+        assert sched.active_programs_by_model() == {
+            "llama3:latest": ["program-alpha", "program-beta"],
+        }
+
+    @patch("ollama_marshal.scheduler.forward_request", new_callable=AsyncMock)
+    async def test_active_programs_not_recorded_on_failure(self, mock_forward):
+        # A failed dispatch must not pollute the active-programs map.
+        mock_forward.side_effect = RuntimeError("boom")
+        sched = _make_scheduler()
+
+        envelope = _make_envelope(program_id="program-alpha")
+        await sched._forward_single(envelope)
+
+        assert sched.active_programs_by_model() == {}
+
+
+class TestActiveProgramsAccessor:
+    async def test_returns_empty_when_nothing_loaded(self):
+        sched = _make_scheduler()
+        assert sched.active_programs_by_model() == {}
+
+    async def test_skips_models_with_no_programs(self):
+        # Defensive: if a model entry exists but is empty, it shouldn't
+        # leak through as `model: []` — those models are filtered out.
+        sched = _make_scheduler()
+        sched._active_programs["empty-model"] = {}
+        sched._active_programs["used-model"] = {"prog-a": 1.0, "prog-b": 2.0}
+        assert sched.active_programs_by_model() == {
+            "used-model": ["prog-a", "prog-b"],
+        }
+
 
 # ---------------------------------------------------------------------------
 # start / stop
