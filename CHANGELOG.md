@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bin-pack, red for evict, magenta for critical preemption, yellow for
   forced-load). Built on `rich.live` + `rich.layout` — zero new
   dependencies.
+- `scripts/dryrun.py` — load harness for validating marshal under
+  realistic concurrent traffic. 12 named scenarios across single-shot,
+  pattern (email-burst, portfolio-loop, parallel-all, thrash-test,
+  priority-test), and boundary (passthrough allowed/blocked, bad-model)
+  groups. Each scenario polls `/api/marshal/status` before/after and
+  asserts expected metric deltas (e.g. `email-burst` checks `model_swaps`
+  Δ is 0).
+- `scripts/README.md` — documents the 3-pane fallback layout (`watch
+  ollama-marshal status` + `tail -f marshal.out.log` + dryrun) for cases
+  where the integrated TUI dashboard isn't preferred. Lists expected
+  dashboard behavior per scenario.
+- `make dryrun-dashboard` — Makefile target that prints the three pane
+  commands ready to paste into iTerm splits.
 
 ### Fixed
 
