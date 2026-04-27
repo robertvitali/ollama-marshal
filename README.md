@@ -190,9 +190,68 @@ use case. If you need to load-balance across multiple Ollama backends, use
 ollamaMQ or LiteLLM. If you need to optimize model scheduling on a single
 instance, use ollama-marshal.
 
-## Status Endpoint
+## API
 
-The proxy exposes a JSON status endpoint at `GET /api/marshal/status`:
+ollama-marshal proxies the full Ollama API surface. Endpoints fall into
+three categories — choose the right path for what you're doing.
+
+### Inference (queued — go through the scheduler)
+
+| Method | Path | What it does | Notes |
+|---|---|---|---|
+| POST | `/api/chat` | Ollama-native chat | Per-program priority via `X-Program-ID` header |
+| POST | `/api/generate` | Ollama-native completion | Same |
+| POST | `/api/embeddings` | Ollama-native embeddings | Embeddings batched concurrently |
+| POST | `/v1/chat/completions` | OpenAI-compatible chat | Auto-translated to Ollama; same scheduling |
+| POST | `/v1/completions` | OpenAI-compatible completion | Same |
+| POST | `/v1/embeddings` | OpenAI-compatible embeddings | Same |
+
+These requests **always** go through the scheduler. Streaming (`stream: true`)
+is passed through transparently. Set `X-Program-ID: <your-app>` to identify
+your program for per-program priority and metrics.
+
+### Pass-through (read-only; no scheduling)
+
+| Method | Path | What it does |
+|---|---|---|
+| GET | `/api/version` | Ollama version |
+| GET | `/api/tags` | List models in Ollama |
+| POST | `/api/show` | Model details (params, template, modelfile) |
+| GET | `/api/ps` | Currently-loaded models (raw from Ollama) |
+
+Allowlisted to keep the proxy boundary tight. Forwarded to Ollama unchanged.
+
+### Blocked (destructive — manage models via Ollama directly)
+
+| Method | Path | Why |
+|---|---|---|
+| POST | `/api/pull` | Download a new model — bypasses marshal |
+| POST | `/api/delete` | Remove a model |
+| POST | `/api/copy` | Copy a model |
+
+These return `403 Forbidden` with a message pointing to direct Ollama use.
+
+### Marshal-specific
+
+| Method | Path | What it does |
+|---|---|---|
+| GET | `/api/marshal/status` | Marshal's runtime state — see schema below |
+| GET | `/status` | Short alias for `/api/marshal/status` |
+
+A live TUI dashboard renders this same data in real time:
+
+```bash
+ollama-marshal dashboard
+```
+
+### Interactive API docs
+
+FastAPI auto-generates Swagger UI and the OpenAPI spec:
+
+- `http://localhost:11435/docs` — interactive UI, try requests in-browser
+- `http://localhost:11435/openapi.json` — machine-readable spec
+
+### Status endpoint schema
 
 ```json
 {
