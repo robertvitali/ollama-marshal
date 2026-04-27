@@ -191,9 +191,14 @@ The Claude PR review action flags these aggressively — these are
 project-specific anti-patterns we want caught every time, no
 false-positive concerns:
 
-1. **Mocking internal modules** — tests must not import or
-   `unittest.mock.patch` anything in `ollama_marshal.*`. Only mock the
-   Ollama HTTP boundary via fixtures in `tests/conftest.py`.
+1. **Mocking internal logic** — tests must not `unittest.mock.patch`
+   internal `ollama_marshal.*` functions, classes, or methods (the
+   logic being tested). External dependencies imported into a module
+   ARE legitimate patch targets — Python's mock system requires patching
+   at the import location, so `patch("ollama_marshal.lifecycle.httpx.
+   AsyncClient", ...)` is the *correct* way to mock the httpx boundary.
+   Same for `psutil`, `os.environ`, etc. Use shared fixtures in
+   `tests/conftest.py` for Ollama HTTP responses where possible.
 2. **Endpoint not registered** — new `/api/*` or `/v1/*` route handler
    in `server.py` without a corresponding row in "Endpoint Routing
    Rules" above.
