@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Annotated
 
 import httpx
@@ -202,6 +203,42 @@ def status(
     typer.echo(f"  Evictions:        {metrics.get('evictions', 0)}")
     typer.echo(f"  Avg wait:         {metrics.get('average_wait_ms', 0):.1f} ms")
     typer.echo("=" * 50)
+
+
+@app.command()
+def dashboard(
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Proxy host to query."),
+    ] = "http://localhost:11435",
+    log_path: Annotated[
+        str,
+        typer.Option(
+            "--log-path",
+            help="Path to marshal's stdout log file (for the events panel).",
+        ),
+    ] = str(Path.home() / ".ollama-marshal" / "marshal.out.log"),
+    refresh_hz: Annotated[
+        float,
+        typer.Option(
+            "--refresh-hz",
+            help="Refresh rate in Hz (default 2.0 = every 0.5s).",
+        ),
+    ] = 2.0,
+) -> None:
+    """Live TUI dashboard — single-window view of marshal's queue and memory.
+
+    Continuously updates with status, loaded models, memory usage, metrics,
+    and a scrolling tail of scheduling events. Replaces the 3-pane
+    `watch + tail -f + dryrun` setup with one window. Ctrl+C to quit.
+    """
+    from ollama_marshal.dashboard import run_dashboard
+
+    run_dashboard(
+        marshal_url=host,
+        log_path=Path(log_path),
+        refresh_hz=refresh_hz,
+    )
 
 
 @app.command()

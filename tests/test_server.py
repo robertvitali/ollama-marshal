@@ -64,10 +64,12 @@ class TestCreateApp:
         assert isinstance(app, FastAPI)
 
     def test_app_title_and_version(self):
+        from ollama_marshal import __version__
+
         config = MarshalConfig()
         app = create_app(config)
         assert app.title == "ollama-marshal"
-        assert app.version == "0.1.0"
+        assert app.version == __version__
 
     def test_stores_config_in_state(self):
         config = MarshalConfig()

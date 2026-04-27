@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-27
+
+### Added
+
+- `ollama-marshal dashboard` — live single-window TUI observability,
+  btop-style. Polls `/api/marshal/status` and tails the structured log
+  in one auto-refreshing layout: header (uptime), memory bar with
+  per-model breakdown, loaded-models table, metrics with delta-
+  since-dashboard-started, scrolling event log filtered to scheduler
+  decisions and request lifecycle. Color-coded events (green for
+  bin-pack, red for evict, magenta for critical preemption, yellow for
+  forced-load). Built on `rich.live` + `rich.layout` — zero new
+  dependencies.
+
 ### Fixed
 
 - `ollama-marshal start` crashed on launch with `AttributeError: module
@@ -36,5 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Structured logging via structlog (console + JSON modes)
 - 95%+ unit test coverage
 
-[Unreleased]: https://github.com/robertvitali/ollama-marshal/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/robertvitali/ollama-marshal/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/robertvitali/ollama-marshal/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/robertvitali/ollama-marshal/releases/tag/v0.1.0
