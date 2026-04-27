@@ -28,10 +28,26 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
-            Review this PR for:
-            - Code quality and adherence to project conventions (see CLAUDE.md)
-            - Type safety (all functions must have type annotations)
-            - Test coverage (new code must have tests, 95% coverage target)
-            - No hardcoded values (everything configurable)
-            - Async correctness (proper await, no blocking calls)
-            - Security (no secrets, no injection vectors)
+            Review this PR against CLAUDE.md (the project's living rulebook).
+            Required reading for every review:
+
+            - "Code Conventions" — type hints, async, structlog, line length,
+              test naming
+            - "Python Conventions" — Pydantic v2, exception handling, async I/O,
+              resource management, Python idioms
+            - "Testing Rules" — mock the Ollama HTTP boundary only, never
+              internal modules
+            - "Documentation Rules" — every PR keeps CHANGELOG.md, README.md,
+              CLAUDE.md, and marshal.example.yaml in sync with code changes
+            - "Versioning" — SemVer rules and per-PR workflow (add to [Unreleased],
+              don't bump version in feature PRs)
+            - "Safety Rules" and "Bright-line Bug Patterns" — flag these
+              aggressively, no false-positive concerns; these are project-specific
+              anti-patterns we want caught every time
+
+            Beyond the rules, use independent judgment for:
+            - Real bugs, race conditions, edge cases the rules don't cover
+            - Security vulnerabilities (injection, secret exposure, trust
+              boundary violations)
+            - Test coverage gaps for new code (95% target)
+            - User-visible changes shipped without a CHANGELOG.md [Unreleased] entry
