@@ -38,7 +38,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request that doesn't already set one. Stops Ollama from silently
   truncating context to fit its slot allocation, which previously
   caused a model that supports 32K to quietly run with 4K with no
-  error or warning. Client-set `num_ctx` is preserved.
+  error or warning. Client-set `num_ctx` is preserved. Embeddings
+  endpoints (`/api/embeddings`, `/v1/embeddings`) are skipped since
+  they aren't bitten by the truncation bug.
+
+  **Behavior change / migration note:** loading a model now reserves
+  KV cache at its full architectural context length, not Ollama's
+  default 2048. VRAM per loaded model can rise 4-16x for models with
+  large max contexts. A loadout that fit in v0.2.x may no longer
+  co-resident the same set of models — bin-packing will evict
+  smaller co-residents to make room. To opt out per-request, set
+  `options.num_ctx` explicitly. To opt out globally for one model,
+  set its expected `num_ctx` in the client request body.
 - **Persisted scheduler metrics** — `requests_served`, `model_swaps`,
   `evictions`, `total_wait_ms` now survive marshal restarts via
   `~/.ollama-marshal/metrics.json`. Loaded on startup, saved on

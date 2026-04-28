@@ -35,6 +35,21 @@ _BURST_HINT_TTL_S = 30.0
 # threshold the user has configured. (Default max_skips=3 → cap=12.)
 _BURST_HINT_CAP_MULTIPLIER = 4
 
+# Hard cap on the total number of LIVE burst hints stored at any time.
+# Prevents an adversarial client from flooding many distinct
+# (program_id, model) pairs to grow the dict unboundedly within the
+# 30s TTL window before prune_expired runs. Excess hints beyond this
+# cap are silently dropped (record() returns 0).
+_MAX_LIVE_HINTS = 256
+
+# Per-model aggregate boost cap. Even if multiple programs each
+# legitimately register a hint at the per-pair cap, the model-level
+# boost can't exceed this multiplier times max_skips. Without this, a
+# malicious client could flood distinct fake program_ids each at
+# the per-pair cap to produce arbitrary aggregate boost on a target
+# model and starve every other program's eviction.
+_BURST_HINT_AGGREGATE_MULTIPLIER = 8
+
 
 @dataclass
 class BurstHint:
@@ -64,10 +79,14 @@ class BurstHints:
         self,
         ttl_s: float = _BURST_HINT_TTL_S,
         cap_multiplier: int = _BURST_HINT_CAP_MULTIPLIER,
+        max_live: int = _MAX_LIVE_HINTS,
+        aggregate_multiplier: int = _BURST_HINT_AGGREGATE_MULTIPLIER,
     ) -> None:
         self._hints: dict[tuple[str, str], BurstHint] = {}
         self._ttl_s = ttl_s
         self._cap_multiplier = cap_multiplier
+        self._max_live = max_live
+        self._aggregate_multiplier = aggregate_multiplier
 
     def record(
         self,
@@ -79,27 +98,56 @@ class BurstHints:
     ) -> int:
         """Record (or refresh) a burst hint for a (program, model) pair.
 
-        The provided `n` is capped at `max_skips * cap_multiplier` so
-        a misbehaving client can't claim infinite priority.
+        Three caps protect against adversarial clients:
+        1. Per-pair cap: `n` is clamped to `max_skips * cap_multiplier`.
+        2. Total-dict cap: if the live hint dict is already at
+           `max_live` entries and this would be a NEW pair, drop the
+           record. Refreshing an existing pair is always allowed.
+        3. Aggregate-per-model cap is enforced by all_boosts_by_model
+           (not here) so it can never exceed `max_skips *
+           aggregate_multiplier` regardless of how many programs hint.
 
-        Returns the effective boost stored after capping.
+        Returns the effective per-pair boost stored after capping (0
+        if the record was dropped by the dict cap).
         """
         if not program_id or not model or n <= 0:
+            return 0
+        key = (program_id, model)
+        # Total-dict cap — drop NEW pairs when over capacity. Refresh
+        # of an existing pair is always allowed.
+        if key not in self._hints and len(self._hints) >= self._max_live:
+            logger.warning(
+                "scheduler.burst_hint_capacity_exceeded",
+                program=program_id,
+                model=model,
+                live_hints=len(self._hints),
+            )
             return 0
         cap = max(1, max_skips * self._cap_multiplier)
         boost = min(int(n), cap)
         ts = time.monotonic() if now is None else now
-        self._hints[(program_id, model)] = BurstHint(
-            boost=boost, expires_at=ts + self._ttl_s
-        )
+        self._hints[key] = BurstHint(boost=boost, expires_at=ts + self._ttl_s)
         return boost
 
-    def boost_for_model(self, model: str, now: float | None = None) -> int:
-        """Sum of all live hint boosts targeting this model.
+    def _aggregate_cap(self, max_skips: int) -> int:
+        """Per-model cap on summed boosts across programs."""
+        return max(1, max_skips * self._aggregate_multiplier)
 
-        Multiple programs hinting the same model add together — the
+    def boost_for_model(
+        self,
+        model: str,
+        max_skips: int = 0,
+        now: float | None = None,
+    ) -> int:
+        """Sum of all live hint boosts targeting this model, capped.
+
+        Multiple programs hinting the same model add together (the
         eviction scorer should treat the model as "expecting all of
-        them combined."
+        them combined"), but the sum is clamped at `max_skips *
+        aggregate_multiplier` so a flood of distinct attacker-controlled
+        program_ids each at the per-pair cap can't produce arbitrary
+        aggregate boost. Pass max_skips=0 to disable the aggregate cap
+        (only safe when caller has already validated all program_ids).
         """
         ts = time.monotonic() if now is None else now
         total = 0
@@ -107,16 +155,31 @@ class BurstHints:
             if m != model or hint.expires_at <= ts:
                 continue
             total += hint.boost
+        if max_skips > 0:
+            total = min(total, self._aggregate_cap(max_skips))
         return total
 
-    def all_boosts_by_model(self, now: float | None = None) -> dict[str, int]:
-        """Return current per-model boost dict (live hints only)."""
+    def all_boosts_by_model(
+        self,
+        max_skips: int = 0,
+        now: float | None = None,
+    ) -> dict[str, int]:
+        """Return current per-model boost dict (live hints only).
+
+        Each per-model sum is clamped at `max_skips *
+        aggregate_multiplier` to prevent the program_id-flooding
+        attack described in `boost_for_model`. Pass max_skips=0 to
+        disable the cap.
+        """
         ts = time.monotonic() if now is None else now
         result: dict[str, int] = {}
         for (_prog, model), hint in self._hints.items():
             if hint.expires_at <= ts:
                 continue
             result[model] = result.get(model, 0) + hint.boost
+        if max_skips > 0:
+            cap = self._aggregate_cap(max_skips)
+            result = {m: min(v, cap) for m, v in result.items()}
         return result
 
     def prune_expired(self, now: float | None = None) -> int:
@@ -633,7 +696,12 @@ class Scheduler:
         # Add live X-Burst-Size hint boosts so a sequential-submission
         # program with only 1 envelope visible but a declared 50-burst
         # is treated as a 50-deep queue for eviction-scoring purposes.
-        burst_boosts = self.burst_hints.all_boosts_by_model()
+        # Pass max_skips so per-model aggregate cap is enforced (prevents
+        # a flood of distinct fake program_ids from bypassing the
+        # per-pair cap to produce arbitrary boost on a target model).
+        burst_boosts = self.burst_hints.all_boosts_by_model(
+            max_skips=self.config.scheduler.max_skips
+        )
         if burst_boosts:
             pending_counts = dict(pending_counts)
             for model_name, boost in burst_boosts.items():

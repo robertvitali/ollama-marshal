@@ -47,6 +47,13 @@ from ollama_marshal.config import AuditConfig
 
 logger = structlog.get_logger()
 
+# Per-record schema version. Embedded in every audit JSONL record so
+# downstream parsers (compliance dashboards, log indexers) can detect
+# schema changes and either migrate or skip incompatible records. Bump
+# on field renames/removals/type changes; pure additions don't require
+# a bump if parsers tolerate unknown fields.
+_AUDIT_SCHEMA_VERSION = 1
+
 # Buffered-write tuning. Flush every 100ms or 50 records, whichever first.
 _FLUSH_INTERVAL_S = 0.1
 _FLUSH_BATCH_SIZE = 50
@@ -151,6 +158,7 @@ class AuditLogger:
         if not self._enabled or self._stopped:
             return
         record: dict[str, Any] = {
+            "schema_version": _AUDIT_SCHEMA_VERSION,
             "ts": datetime.now(UTC).isoformat(),
             "event": event,
         }
@@ -250,19 +258,36 @@ class AuditLogger:
     async def _retention_loop(self) -> None:
         """Background task: hourly sweep deleting lines past retention.
 
-        Implementation: read the file, drop lines whose `ts` is older
-        than `now - retention_days`, write the survivors back. Done in a
-        thread so the event loop isn't blocked even on a multi-MB file.
+        Held under `self._lock` for the read+rewrite+rename window so a
+        concurrent flush can't append records to the original file
+        between the read and the rename — those appends would be lost
+        when tmp.replace() unlinks the original. For an audit log
+        targeting compliance/forensics, lost records compromise the
+        log's value.
         """
         while not self._stopped:
             try:
                 await asyncio.sleep(_RETENTION_SWEEP_INTERVAL_S)
             except asyncio.CancelledError:
                 return
-            await asyncio.to_thread(self._sweep_retention)
+            # Drain the buffer FIRST (outside the sweep lock window) so
+            # any in-flight records make it to the file before the sweep
+            # snapshots it.
+            await self._flush_now()
+            # Now hold the lock for the entire sweep — appenders block
+            # briefly, but no writes are lost.
+            async with self._lock:
+                await asyncio.to_thread(self._sweep_retention)
 
     def _sweep_retention(self) -> None:
-        """One pass of the retention sweep. Best-effort."""
+        """One pass of the retention sweep. Best-effort.
+
+        Caller must hold `self._lock` to prevent concurrent appends to
+        the original file (which would be lost when tmp.replace
+        unlinks it). The lock is acquired by `_retention_loop`; direct
+        unit-test callers run with no concurrent appender so the lack
+        of lock there is safe.
+        """
         if self._config.retention_days <= 0 or not self._path.exists():
             return
         cutoff = datetime.now(UTC) - timedelta(days=self._config.retention_days)

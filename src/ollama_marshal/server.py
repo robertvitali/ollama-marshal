@@ -153,7 +153,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Final metrics snapshot — captures any counter changes from drain
     # phase plus any work that happened after the last periodic write.
-    _scheduler.metrics.save_to(metrics_path)
+    # Hoist sync I/O to a thread per CLAUDE.md async correctness rules.
+    await asyncio.to_thread(_scheduler.metrics.save_to, metrics_path)
     logger.info("server.metrics_persisted", path=str(metrics_path))
 
     # Flush audit buffer + close (no-op when disabled).
@@ -163,7 +164,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 async def _persist_metrics_loop(path: Path) -> None:
-    """Background task: rewrite metrics snapshot every N seconds."""
+    """Background task: rewrite metrics snapshot every N seconds.
+
+    Disk write is hoisted to a thread (asyncio.to_thread) so a slow disk
+    can't briefly stall the event loop and starve request dispatch.
+    Matches the pattern used by the audit module's _flush_now.
+    """
     while True:
         try:
             await asyncio.sleep(_METRICS_PERSIST_INTERVAL_S)
@@ -171,7 +177,7 @@ async def _persist_metrics_loop(path: Path) -> None:
             return
         sched = globals().get("_scheduler")
         if sched is not None and hasattr(sched, "metrics"):
-            sched.metrics.save_to(path)
+            await asyncio.to_thread(sched.metrics.save_to, path)
 
 
 def create_app(config: MarshalConfig | None = None) -> FastAPI:
@@ -491,7 +497,12 @@ async def _enqueue_inference(
     _record_burst_hint(request, program_id, model)
 
     # Stop Ollama from silently shrinking num_ctx to fit its slot budget.
-    await _inject_num_ctx(model, body)
+    # Skip embeddings — they use input_length not generation context, so
+    # forcing model_max_context wastes KV cache without preventing
+    # truncation (embedding workloads aren't bitten by the bug this fix
+    # addresses).
+    if endpoint not in ("/api/embeddings", "/v1/embeddings"):
+        await _inject_num_ctx(model, body)
 
     envelope = RequestEnvelope(
         model=model,
@@ -586,8 +597,9 @@ async def _enqueue_and_wait(
 
     # Same num_ctx injection as the Ollama-native path; OpenAI clients
     # rarely set num_ctx explicitly so they're the most likely to be
-    # bitten by Ollama's silent context truncation.
-    await _inject_num_ctx(model, ollama_body)
+    # bitten by Ollama's silent context truncation. Skip embeddings.
+    if endpoint not in ("/api/embeddings", "/v1/embeddings"):
+        await _inject_num_ctx(model, ollama_body)
 
     envelope = RequestEnvelope(
         model=model,

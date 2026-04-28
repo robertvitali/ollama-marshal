@@ -1208,6 +1208,52 @@ class TestBurstHintsBoostQueries:
         hints.record("p", "m", 5, max_skips=3, now=100.0)
         assert hints.boost_for_model("m", now=200.0) == 0
 
+    def test_aggregate_cap_clamps_per_model_sum(self):
+        """Per-model summed boost is clamped at max_skips * aggregate_multiplier.
+
+        Even if 100 distinct (attacker-controlled) program_ids each
+        register a hint at the per-pair cap, the eviction scorer reads
+        only the aggregate cap value — not 100 * per_pair_cap.
+        """
+        hints = BurstHints()
+        # Default aggregate_multiplier=8, max_skips=3 → cap = 24.
+        # Record 10 distinct programs each with per-pair cap=12 → raw
+        # sum would be 120 without the aggregate cap.
+        for i in range(10):
+            hints.record(f"p{i}", "target", 12, max_skips=3, now=100.0)
+        # Without max_skips passed: returns the raw sum.
+        assert hints.boost_for_model("target", now=101.0) == 120
+        # With max_skips=3 passed: clamped at 3 * 8 = 24.
+        assert hints.boost_for_model("target", max_skips=3, now=101.0) == 24
+
+    def test_all_boosts_by_model_aggregate_cap(self):
+        hints = BurstHints()
+        for i in range(10):
+            hints.record(f"p{i}", "target", 12, max_skips=3, now=100.0)
+        result = hints.all_boosts_by_model(max_skips=3, now=101.0)
+        assert result["target"] == 24
+
+
+class TestBurstHintsCapacity:
+    """Total-dict cap prevents unbounded growth from flooded distinct pairs."""
+
+    def test_drops_new_pair_when_at_capacity(self):
+        hints = BurstHints(max_live=3)
+        assert hints.record("p1", "m1", 5, max_skips=3) == 5
+        assert hints.record("p2", "m2", 5, max_skips=3) == 5
+        assert hints.record("p3", "m3", 5, max_skips=3) == 5
+        # 4th distinct pair is dropped.
+        assert hints.record("p4", "m4", 5, max_skips=3) == 0
+
+    def test_refresh_at_capacity_still_works(self):
+        # Refreshing an EXISTING pair works even when dict is full —
+        # otherwise legitimate burst-refresh traffic would be lost.
+        hints = BurstHints(max_live=2)
+        hints.record("p1", "m1", 5, max_skips=3, now=100.0)
+        hints.record("p2", "m2", 5, max_skips=3, now=100.0)
+        # At capacity. Refresh of an existing pair should succeed.
+        assert hints.record("p1", "m1", 8, max_skips=3, now=110.0) == 8
+
     def test_all_boosts_by_model(self):
         hints = BurstHints()
         hints.record("p1", "model-a", 3, max_skips=3, now=100.0)
@@ -1252,7 +1298,10 @@ class TestBurstHintsIntegration:
         sched = _make_scheduler()
         # No actual envelopes for "burst-protected", so pending=0 normally.
         # But a burst hint of 50 should make it the LEAST evictable model.
-        # max_skips=15 → cap is 60, so the requested 50 stays uncapped.
+        # Default scheduler config: max_skips=3, aggregate_multiplier=8 →
+        # per-model aggregate cap = 24. Even though the per-pair record
+        # accepts 50 (max_skips=15 → per-pair cap=60), the eviction-time
+        # call clamps the per-model sum to scheduler.max_skips * 8 = 24.
         sched.burst_hints.record("ai-portfolio", "burst-protected", 50, max_skips=15)
 
         memory = sched.memory
@@ -1275,9 +1324,10 @@ class TestBurstHintsIntegration:
 
         await sched._evict_one(needed_for="other-model")
 
-        # Burst boost must have been added before scoring.
-        assert captured["pending"]["burst-protected"] == 50
-        # And the chosen target was low-priority (not the burst one).
+        # Boost is added then capped at aggregate_multiplier * max_skips
+        # = 8 * 3 = 24 (using SchedulerConfig.max_skips default of 3).
+        assert captured["pending"]["burst-protected"] == 24
+        # The chosen target is low-priority — burst-protected stays loaded.
         sched.lifecycle.unload.assert_awaited_with("low-priority")
 
 
