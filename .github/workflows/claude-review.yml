@@ -27,6 +27,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.CLAUDE_API_KEY }}
+          # Allow claude[bot] to trigger reviews on its own self-fix commits.
+          # Without this, the bot's own auto-fix push (e.g. updating CLAUDE.md
+          # module count) trips a "non-human actor" guard and the check fails
+          # despite the substantive review on the prior commit being clean.
+          allowed_bots: "claude"
           # track_progress: forces "tag mode" with a sticky tracking comment,
           # so something always posts (visible failure if review didn't run).
           track_progress: true
