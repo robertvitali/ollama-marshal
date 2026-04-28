@@ -13,6 +13,7 @@ import uvicorn
 
 from ollama_marshal import __version__
 from ollama_marshal.config import LogFormat, load_config
+from ollama_marshal.dashboard import format_wait_ms
 
 app = typer.Typer(
     name="ollama-marshal",
@@ -226,7 +227,9 @@ def status(
     typer.echo(f"  Requests served:  {metrics.get('requests_served', 0)}")
     typer.echo(f"  Model swaps:      {metrics.get('model_swaps', 0)}")
     typer.echo(f"  Evictions:        {metrics.get('evictions', 0)}")
-    typer.echo(f"  Avg wait:         {metrics.get('average_wait_ms', 0):.1f} ms")
+    typer.echo(
+        f"  Avg wait:         {format_wait_ms(metrics.get('average_wait_ms', 0))}"
+    )
     typer.echo("=" * 50)
 
 

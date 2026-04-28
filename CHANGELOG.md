@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Average wait time renders adaptively in `ollama-marshal status` and
+  the dashboard metrics panel. Sub-second waits show as `123ms`, 1-60s
+  as `5.2s`, and longer waits as `1m 30s`. Previously always rendered
+  as `50493 ms`. The `/api/marshal/status` JSON payload still returns
+  raw `average_wait_ms` (unchanged) so consumers aren't broken.
+
 ## [0.2.0] - 2026-04-27
 
 ### Added

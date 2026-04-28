@@ -235,6 +235,27 @@ def _format_uptime(seconds: float) -> str:
     return f"{h}h {m}m {sec}s" if h else f"{m}m {sec}s"
 
 
+def format_wait_ms(ms: float) -> str:
+    """Format an average wait duration for human-readable display.
+
+    Wait times can range from a few hundred ms (cached / passthrough)
+    up to multiple minutes (cold-load of a 70B model). Render adaptively:
+
+    - < 1s   → "123ms"   (preserves resolution for fast paths)
+    - < 1min → "5.2s"    (one decimal, easy to compare)
+    - else   → "1m 23s"  (minute format requested for legibility)
+    """
+    if ms < 0:
+        return "0ms"
+    if ms < 1000:
+        return f"{ms:.0f}ms"
+    seconds = ms / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, sec = divmod(int(seconds), 60)
+    return f"{m}m {sec}s"
+
+
 def render_header(status: StatusSnapshot, marshal_url: str) -> Panel:
     """Top bar: marshal URL + uptime + last refresh time."""
     if status.error:
@@ -412,7 +433,7 @@ def render_metrics(status: StatusSnapshot, baseline: StatusSnapshot | None) -> P
     grid.add_row(
         f"Evictions: [bold]{status.evictions}[/bold] "
         f"{_delta_str(status.evictions, base.evictions)}",
-        f"Avg wait: [bold]{status.avg_wait_ms:.0f} ms[/bold]",
+        f"Avg wait: [bold]{format_wait_ms(status.avg_wait_ms)}[/bold]",
     )
     return Panel(grid, title="Metrics", border_style="cyan")
 

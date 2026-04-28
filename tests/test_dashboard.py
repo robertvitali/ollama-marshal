@@ -21,6 +21,7 @@ from ollama_marshal.dashboard import (
     _format_uptime,
     fetch_status,
     fetch_status_async,
+    format_wait_ms,
     log_follower,
     make_layout,
     parse_log_line,
@@ -53,6 +54,36 @@ class TestFormatUptime:
     def test_negative_clamps_to_zero(self):
         # Don't render "-1h 59m 55s" if marshal returns nonsense.
         assert _format_uptime(-5) == "0m 0s"
+
+
+class TestFormatWaitMs:
+    def test_zero(self):
+        assert format_wait_ms(0) == "0ms"
+
+    def test_sub_second_ms(self):
+        # < 1s preserves resolution as ms (cached/passthrough paths).
+        assert format_wait_ms(125) == "125ms"
+        assert format_wait_ms(999) == "999ms"
+
+    def test_seconds_with_decimal(self):
+        # 1s ≤ wait < 60s — render with one decimal.
+        assert format_wait_ms(1000) == "1.0s"
+        assert format_wait_ms(5234) == "5.2s"
+        assert format_wait_ms(59500) == "59.5s"
+
+    def test_minutes_format(self):
+        # >= 60s switches to "Xm Ys" — the format the user asked for.
+        assert format_wait_ms(60_000) == "1m 0s"
+        assert format_wait_ms(90_500) == "1m 30s"
+        assert format_wait_ms(125_000) == "2m 5s"
+
+    def test_long_wait(self):
+        # Cold-load of a giant model: 10+ min waits are plausible.
+        assert format_wait_ms(605_000) == "10m 5s"
+
+    def test_negative_returns_zero(self):
+        # Defensive: don't render "-5ms" if marshal somehow reports it.
+        assert format_wait_ms(-100) == "0ms"
 
 
 class TestDeltaStr:
