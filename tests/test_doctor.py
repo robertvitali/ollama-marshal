@@ -288,3 +288,156 @@ class TestGatherReport:
         assert len(report.all_models) == 1
         assert report.all_models[0].name == "x"
         assert report.all_models[0].probe_ok is True
+
+    async def test_failed_probe_recorded_with_probe_ok_false(self, mock_psutil):
+        async def fake_get(url, *args, **kwargs):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            if "/api/ps" in url:
+                resp.json.return_value = {"models": []}
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        with (
+            patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
+            patch(
+                "ollama_marshal.doctor.httpx.AsyncClient"
+            ) as mock_client_cls,
+        ):
+            mock_reg = MagicMock()
+            mock_reg._fetch_model_list = AsyncMock(return_value=["unprobeable:x"])
+            # probe_metadata returns None when /api/show fails or is unparseable.
+            mock_reg.probe_metadata = AsyncMock(return_value=None)
+            mock_reg_cls.return_value = mock_reg
+
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(side_effect=fake_get)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            report = await gather_report(ollama_host="http://localhost:11434")
+
+        assert len(report.all_models) == 1
+        assert report.all_models[0].probe_ok is False
+        assert report.all_models[0].kv_per_slot_at_max_ctx == 0
+
+    async def test_loaded_models_have_size_vram_populated(self, mock_psutil):
+        from ollama_marshal.registry import ModelMetadata
+
+        meta = ModelMetadata(
+            name="x",
+            architecture="qwen3",
+            max_context_length=32768,
+            num_layers=28,
+            embedding_length=3584,
+            head_count=28,
+            head_count_kv=4,
+        )
+
+        async def fake_get(url, *args, **kwargs):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            if "/api/ps" in url:
+                resp.json.return_value = {
+                    "models": [{"name": "x", "size_vram": 5_000_000_000}]
+                }
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        with (
+            patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
+            patch(
+                "ollama_marshal.doctor.httpx.AsyncClient"
+            ) as mock_client_cls,
+        ):
+            mock_reg = MagicMock()
+            mock_reg._fetch_model_list = AsyncMock(return_value=["x"])
+            mock_reg.probe_metadata = AsyncMock(return_value=meta)
+            mock_reg_cls.return_value = mock_reg
+
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(side_effect=fake_get)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            report = await gather_report(ollama_host="http://localhost:11434")
+
+        assert len(report.loaded_models) == 1
+        assert report.loaded_models[0].size_vram_bytes == 5_000_000_000
+
+    async def test_unexpected_unloads_marshal_unreachable_returns_none(
+        self, mock_psutil
+    ):
+        async def fake_get(url, *args, **kwargs):
+            if "/api/marshal/status" in url:
+                raise httpx.HTTPError("marshal down")
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {"models": []}
+            return resp
+
+        with (
+            patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
+            patch(
+                "ollama_marshal.doctor.httpx.AsyncClient"
+            ) as mock_client_cls,
+        ):
+            mock_reg = MagicMock()
+            mock_reg._fetch_model_list = AsyncMock(return_value=[])
+            mock_reg_cls.return_value = mock_reg
+
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(side_effect=fake_get)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            report = await gather_report(
+                ollama_host="http://localhost:11434",
+                marshal_status_url="http://localhost:11435/api/marshal/status",
+            )
+
+        # Marshal unreachable mid-probe → counter stays None, no crash.
+        assert report.unexpected_unloads is None
+
+    async def test_unexpected_unloads_handles_non_int_payload(
+        self, mock_psutil
+    ):
+        async def fake_get(url, *args, **kwargs):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            if "/api/marshal/status" in url:
+                # Defensive: malformed payload shouldn't crash the report.
+                resp.json.return_value = {
+                    "metrics": {"unexpected_unloads": "not-an-int"}
+                }
+            else:
+                resp.json.return_value = {"models": []}
+            return resp
+
+        with (
+            patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
+            patch(
+                "ollama_marshal.doctor.httpx.AsyncClient"
+            ) as mock_client_cls,
+        ):
+            mock_reg = MagicMock()
+            mock_reg._fetch_model_list = AsyncMock(return_value=[])
+            mock_reg_cls.return_value = mock_reg
+
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(side_effect=fake_get)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            report = await gather_report(
+                ollama_host="http://localhost:11434",
+                marshal_status_url="http://localhost:11435/api/marshal/status",
+            )
+
+        assert report.unexpected_unloads is None

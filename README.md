@@ -216,6 +216,7 @@ is passed through transparently.
 | `X-Program-ID` | Identifies your program for per-program priority, metrics, and the `loaded_models[*].programs` field |
 | `X-Request-Timeout` | Override the scheduler-wait timeout in seconds for this request (defaults to `proxy.request_timeout_s`) |
 | `X-Burst-Size` | **v0.3.0+**: declare expected total demand for sequential-submission programs. Marshal protects this program-model pair from eviction by treating its queue depth as `actual_pending + N` for the next 30s |
+| `X-Marshal-Retry-Max` | **v0.4.0+**: per-request override of `retry.max_attempts`. Send `0` to disable retry on this call (e.g. tool-calling agents that want fail-fast); higher values opt into more aggressive retry. Capped server-side at 10 |
 
 #### When to use `X-Burst-Size`
 
@@ -234,17 +235,75 @@ This is **only** needed if you can't submit concurrently. Programs that use
 `asyncio.gather` (or any other concurrent submission pattern) get the
 benefit automatically — marshal sees the actual queue depth.
 
-### Context window guarantee (v0.3.0+)
+### Dynamic context window sizing (v0.4.0+)
 
 Ollama's slot-allocation logic can silently truncate `num_ctx` to fit its
 KV cache budget. A model that supports 32K context might quietly run with
 4K because Ollama prefers shrinking context over reducing parallelism.
 
-Marshal now intercepts every proxied inference request and injects
-`options.num_ctx = model_max_context_length` (read from `/api/show` and
-cached at `~/.ollama-marshal/model_metadata.json`) **unless the client
-explicitly set `options.num_ctx`**. So your full context window is
-guaranteed unless you opt out.
+**v0.4.0** sizes `num_ctx` to the actual prompt + completion budget,
+rounded up to the next power-of-2 boundary, then clamped to your
+program's `[typical_num_ctx, max_num_ctx]` profile (if set), then to
+the model's max context. Marshal **never silently truncates a real
+prompt** — when a request needs more context than the model has
+allocated, marshal reloads the model at the larger size
+(drain-before-reload) rather than trimming input.
+
+Compared to v0.3.0 (which forced `num_ctx = model_max_context`
+unconditionally), v0.4.0 dramatically reduces KV cache pre-allocation
+on small-prompt programs: a 4B model with a 262K context window no
+longer reserves ~17 GB of KV cache per slot for a 100-token chat.
+
+Set `context.injection_enabled: false` in `marshal.yaml` to opt out
+entirely (restoring Ollama's default behavior + its silent-truncation
+bug). Per-program profiles let tool-calling agents declare a floor
+(`typical_num_ctx`) so round 1's allocation already fits round 5's
+growth — see `marshal.example.yaml` for a worked example.
+
+### Marshal-side retry on transient failures (v0.4.0+)
+
+When Ollama briefly flaps (daemon recycling, transient 502/503),
+marshal absorbs the blip via in-process retry with exponential
+backoff + full jitter. The client never sees the failure.
+
+Conservative by default:
+
+- **Streaming requests are NEVER retried** (would corrupt the byte
+  stream — matches openai-python / litellm / anthropic-sdk behavior).
+- **ReadTimeout is NOT retried** (Ollama may have started generating;
+  retrying could double-bill or re-execute a tool call). Embeddings
+  endpoints opt in automatically since they're idempotent.
+- Only `ConnectError` / `ConnectTimeout` and HTTP 502/503/504 trigger
+  retry.
+
+Per-request override: `X-Marshal-Retry-Max: 0` disables retry on a
+single call; higher values (capped at 10) opt into more aggressive
+retry. See the `retry` section in `marshal.example.yaml`.
+
+### Diagnosing thrashing with `marshal doctor` (v0.4.0+)
+
+If models keep swapping in and out of VRAM despite both fitting in
+RAM, the cause is almost always Ollama's KV cache pre-allocation —
+not marshal. Run:
+
+```bash
+ollama-marshal doctor
+```
+
+The diagnostic reads `/api/tags`, `/api/show`, and `/api/ps`,
+computes per-model KV cache demand, and prints specific `OLLAMA_*`
+env vars to set in your launchd plist (macOS) or systemd unit
+(Linux):
+
+- `OLLAMA_KV_CACHE_TYPE=q8_0` — halves KV cache size
+- `OLLAMA_FLASH_ATTENTION=1` — reduces attention memory
+- `OLLAMA_NUM_PARALLEL=N` — sized so the largest model's KV cache
+  fits in 25% of RAM
+- `OLLAMA_MAX_LOADED_MODELS=N` — sized from mean KV cost
+
+If marshal is running, the report includes the live
+`unexpected_unloads` counter. Apply the recommendations, restart
+Ollama, run `marshal doctor` again — the counter should drop to 0.
 
 ### Per-model concurrent dispatch (v0.3.0+)
 
