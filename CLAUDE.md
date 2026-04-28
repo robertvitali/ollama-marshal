@@ -102,7 +102,7 @@ Queued (through scheduler): /api/chat, /api/generate, /api/embeddings,
 Pass-through (no scheduling): /api/tags, /api/ps, /api/show, /api/version,
 /api/pull, /api/delete, /api/copy
 
-Local (served by proxy): /api/marshal/status
+Local (served by proxy): /api/marshal/status, /status (alias)
 
 ## Scheduling Algorithm
 
