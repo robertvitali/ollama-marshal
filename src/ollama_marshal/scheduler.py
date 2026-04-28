@@ -307,6 +307,20 @@ class SchedulerMetrics:
             return cls()
 
 
+class _NoopAudit:
+    """Sentinel audit logger — used until lifespan installs a real one.
+
+    Defining a tiny no-op class avoids a forward import dependency from
+    scheduler → audit (which would create a circular import in the test
+    fixtures). The real AuditLogger is duck-type-compatible with this.
+    """
+
+    enabled: bool = False
+
+    async def record(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
 class Scheduler:
     """Model-affinity scheduler with FIFO + bin-packing + fairness.
 
@@ -339,6 +353,10 @@ class Scheduler:
         self.lifecycle = lifecycle
         self.config = config
         self.metrics = SchedulerMetrics()
+        # Audit logger — defaults to a NULL implementation so callers
+        # don't need `if audit:` branches everywhere. Replaced by the
+        # server lifespan with a real AuditLogger when audit.enabled.
+        self.audit: Any = _NoopAudit()
         self._task: asyncio.Task[None] | None = None
         self._running = False
         # Maps model name -> monotonic timestamp of last successful dispatch.
@@ -747,6 +765,15 @@ class Scheduler:
                 wait_ms=round(wait_ms, 1),
                 endpoint=envelope.endpoint,
             )
+            # Best-effort audit emission (no-op when audit.enabled=false).
+            await self.audit.record(
+                "request.served",
+                program_id=envelope.program_id,
+                model=envelope.model,
+                endpoint=envelope.endpoint,
+                wait_ms=wait_ms,
+                stream=envelope.stream,
+            )
         except Exception as exc:
             # Some httpx exception subclasses have empty str(); always include
             # the type name so the log entry is useful.
@@ -758,3 +785,10 @@ class Scheduler:
                 error_type=type(exc).__name__,
             )
             envelope.fail(exc)
+            await self.audit.record(
+                "request.failed",
+                program_id=envelope.program_id,
+                model=envelope.model,
+                endpoint=envelope.endpoint,
+                error_type=type(exc).__name__,
+            )

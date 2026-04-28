@@ -152,6 +152,40 @@ class LoggingConfig(BaseModel):
     )
 
 
+class AuditConfig(BaseModel):
+    """Audit-log feature flag and tuning.
+
+    OFF by default. When enabled, marshal appends one JSON record per
+    request lifecycle event (enqueued, served, failed, evicted) to
+    `audit.jsonl`. Records contain ONLY metadata — never prompt text or
+    response content. Designed for compliance / forensics / per-program
+    usage analytics, not perf debugging.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable audit-log writes (default off — opt-in)",
+    )
+    path: str = Field(
+        default="~/.ollama-marshal/audit.jsonl",
+        description="Path to the JSONL audit file",
+    )
+    retention_days: int = Field(
+        default=30,
+        description=(
+            "Auto-delete audit entries older than this many days. "
+            "0 disables retention (file grows unbounded)."
+        ),
+    )
+    max_size_mb: int = Field(
+        default=100,
+        description=(
+            "Rotate the audit file (.1, .2, ...) when it exceeds this "
+            "size in megabytes. 0 disables size-based rotation."
+        ),
+    )
+
+
 class MarshalConfig(BaseModel):
     """Root configuration for ollama-marshal."""
 
@@ -164,6 +198,7 @@ class MarshalConfig(BaseModel):
     )
     shutdown: ShutdownConfig = Field(default_factory=ShutdownConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    audit: AuditConfig = Field(default_factory=AuditConfig)
 
     def get_program_config(self, program_id: str) -> ProgramConfig:
         """Get config for a program, falling back to 'default'."""
@@ -231,9 +266,11 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 "request_timeout_s",
                 "idle_eviction_minutes",
                 "parallel_per_model",
+                "retention_days",
+                "max_size_mb",
             ):
                 data[section][field] = int(value)
-            elif field == "unload_models":
+            elif field in ("unload_models", "enabled"):
                 data[section][field] = value.lower() in ("true", "1", "yes")
             else:
                 data[section][field] = value

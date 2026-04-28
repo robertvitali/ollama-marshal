@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ollama_marshal import __version__
+from ollama_marshal.audit import NULL_AUDIT, AuditLogger
 from ollama_marshal.config import MarshalConfig, ShutdownMode, load_config
 from ollama_marshal.lifecycle import ModelLifecycle
 from ollama_marshal.memory import MemoryManager
@@ -49,13 +50,15 @@ _memory: MemoryManager
 _registry: ModelRegistry
 _lifecycle: ModelLifecycle
 _scheduler: Scheduler
+_audit: AuditLogger | Any = NULL_AUDIT
 _started_at: float
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan managing startup and shutdown of all components."""
-    global _config, _queues, _memory, _registry, _lifecycle, _scheduler, _started_at
+    global _config, _queues, _memory, _registry, _lifecycle, _scheduler
+    global _audit, _started_at
 
     # Load config from app state (set by create_app)
     _config = app.state.config
@@ -94,6 +97,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             model_swaps=restored.model_swaps,
             evictions=restored.evictions,
         )
+
+    # Audit logger — opt-in feature flag. Off by default.
+    _audit = AuditLogger(_config.audit) if _config.audit.enabled else NULL_AUDIT
+    await _audit.start()
+    # Hand to the scheduler so request lifecycle calls can record events
+    # without taking a server-module dependency.
+    _scheduler.audit = _audit
 
     # Start background tasks
     await _memory.start_polling()
@@ -145,6 +155,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # phase plus any work that happened after the last periodic write.
     _scheduler.metrics.save_to(metrics_path)
     logger.info("server.metrics_persisted", path=str(metrics_path))
+
+    # Flush audit buffer + close (no-op when disabled).
+    await _audit.stop()
 
     logger.info("server.stopped")
 
