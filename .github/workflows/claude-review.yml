@@ -27,47 +27,39 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.CLAUDE_API_KEY }}
-          use_sticky_comment: true
+          # track_progress posts a live progress comment AND wires Claude into
+          # the action's built-in inline-comment-classifier pipeline. Without
+          # this, custom prompts complete silently — the action buffers inline
+          # comments expecting Claude to use the action's posting machinery,
+          # and a custom prompt that doesn't trigger it just produces "No
+          # buffered inline comments" at the end of the run.
+          track_progress: true
+          claude_args: --allowedTools mcp__github_inline_comment__create_inline_comment
+          # Project-specific review focus only. The action injects its own
+          # standard review boilerplate ("review the diff and post inline
+          # comments"); this prompt narrows what to look for.
           prompt: |
             Review this PR against CLAUDE.md (the project's living rulebook).
-            Required reading for every review:
+            Focus your review on:
 
-            - "Code Conventions" — type hints, async, structlog, line length,
-              test naming
-            - "Python Conventions" — Pydantic v2, exception handling, async I/O,
-              resource management, Python idioms
-            - "Testing Rules" — mock the Ollama HTTP boundary only, never
-              internal modules
+            - "Bright-line Bug Patterns" — flag any of the 14 listed
+              anti-patterns aggressively (mocking internal logic, endpoint
+              not registered, config field not in marshal.example.yaml,
+              missing CHANGELOG, hardcoded values, time.sleep in async, bare
+              except, print(), f-strings in log messages, missing tests for
+              new modules, forgotten keep_alive override, doc drift, version
+              drift, wrong bump for the change).
+            - "Code Conventions" and "Python Conventions" — type hints, async
+              correctness, structlog usage, Pydantic v2, line length 88.
             - "Documentation Rules" — every PR keeps CHANGELOG.md, README.md,
-              CLAUDE.md, and marshal.example.yaml in sync with code changes
-            - "Versioning" — SemVer rules and per-PR workflow (add to [Unreleased],
-              don't bump version in feature PRs)
-            - "Safety Rules" and "Bright-line Bug Patterns" — flag these
-              aggressively, no false-positive concerns; these are project-specific
-              anti-patterns we want caught every time
+              CLAUDE.md, and marshal.example.yaml in sync.
+            - "Testing Rules" — mock the Ollama HTTP boundary only, never
+              internal `ollama_marshal.*` modules. 95% coverage target.
+            - "Versioning" — pre-1.0 SemVer rules. Don't bump version in
+              feature PRs (add to [Unreleased] instead).
 
-            Beyond the rules, use independent judgment for:
+            Beyond the rules, also flag:
             - Real bugs, race conditions, edge cases the rules don't cover
             - Security vulnerabilities (injection, secret exposure, trust
               boundary violations)
-            - Test coverage gaps for new code (95% target)
-            - User-visible changes shipped without a CHANGELOG.md [Unreleased] entry
-
-            How to deliver findings (REQUIRED — without this the review is
-            invisible):
-
-            1. For each concrete finding tied to specific lines, call
-               `mcp__github_inline_comment__create_inline_comment` with the
-               file path, line number, and comment body. Include the severity
-               (CRITICAL / INFORMATIONAL) and a one-line fix suggestion.
-            2. After posting any inline comments, call
-               `mcp__github__update_claude_comment` (or post a top-level PR
-               comment) with a short summary: how many findings, severity
-               breakdown, and overall verdict (LGTM / changes requested).
-            3. If you find no issues at all, still post a one-line summary
-               saying so — "Reviewed against CLAUDE.md. No findings." — so the
-               PR author knows the review actually ran and concluded.
-
-            Do NOT silently complete. The default behavior of this action
-            buffers inline comments for posting; if you don't call the comment
-            tools, nothing is posted and the review is wasted.
+            - Test coverage gaps for new code
