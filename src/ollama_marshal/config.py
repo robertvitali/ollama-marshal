@@ -368,12 +368,26 @@ class RetryConfig(BaseModel):
             "geometric growth on long retry budgets."
         ),
     )
-    retry_read_timeouts: bool = Field(
+    read_timeouts: bool = Field(
         default=False,
         description=(
             "When True, retry on ReadTimeout (Ollama may have already "
             "started generating — risk of re-execution). Default False. "
-            "Safe to enable for idempotent endpoints (embeddings)."
+            "Safe to enable for idempotent endpoints (embeddings). "
+            "Field name kept short ('read_timeouts' not "
+            "'retry_read_timeouts') so the env-var override "
+            "MARSHAL_RETRY_READ_TIMEOUTS parses correctly: the env "
+            "parser splits at the FIRST underscore, so the field name "
+            "must be the part after 'retry'."
+        ),
+    )
+    max_per_request_attempts: int = Field(
+        default=10,
+        description=(
+            "Server-side cap on the per-request `X-Marshal-Retry-Max` "
+            "header. Even an adversarial client can't extend retry "
+            "beyond this number. Default 10 — generous, but bounds the "
+            "worst-case wall-clock on a stuck request."
         ),
     )
 
@@ -465,14 +479,28 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 "burst_hint_max_live",
                 "retention_days",
                 "max_size_mb",
+                # v0.4.0: retry + context int fields
+                "max_attempts",
+                "max_per_request_attempts",
+                "default_completion_budget",
+                "safety_buffer_tokens",
             ):
                 data[section][field] = int(value)
             elif field in (
                 "burst_hint_ttl_s",
                 "metrics_persist_interval_s",
+                # v0.4.0: retry float fields
+                "base_delay_s",
+                "max_delay_s",
             ):
                 data[section][field] = float(value)
-            elif field in ("unload_models", "enabled"):
+            elif field in (
+                "unload_models",
+                "enabled",
+                # v0.4.0: retry + context bool fields
+                "read_timeouts",
+                "injection_enabled",
+            ):
                 data[section][field] = value.lower() in ("true", "1", "yes")
             else:
                 data[section][field] = value

@@ -101,7 +101,7 @@ async def gather_report(
 
     registry = ModelRegistry(ollama_host=ollama_host)
     try:
-        all_names = await registry._fetch_model_list()
+        all_names = await registry.fetch_model_list()
     except httpx.HTTPError:
         logger.warning("doctor.tags_unreachable")
         return DoctorReport(total_ram_bytes=total_ram, loaded_models=[], all_models=[])

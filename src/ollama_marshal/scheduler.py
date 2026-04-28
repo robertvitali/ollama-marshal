@@ -974,6 +974,13 @@ class Scheduler:
         """
         max_attempts = self._resolve_retry_attempts(envelope)
         retry_cfg = self.config.retry
+        # Compute whether this dispatch site allows ReadTimeout retry.
+        # Embeddings are idempotent — always retryable. Other endpoints
+        # only retry ReadTimeout when the operator opts in.
+        allow_read_retry = retry_cfg.read_timeouts or envelope.endpoint in (
+            "/api/embeddings",
+            "/v1/embeddings",
+        )
         try:
             if max_attempts <= 1:
                 # No-retry fast path: single attempt, no helper overhead.
@@ -984,12 +991,6 @@ class Scheduler:
                     stream=envelope.stream,
                 )
             else:
-                # Embeddings are idempotent — safe to retry on
-                # ReadTimeout. Tool-calling chats are not.
-                allow_read_retry = (
-                    retry_cfg.retry_read_timeouts
-                    or envelope.endpoint in ("/api/embeddings", "/v1/embeddings")
-                )
                 # request_id correlates retries in logs; envelope object
                 # id is unique within the process and cheap.
                 request_id = f"{envelope.model}:{id(envelope):x}"
@@ -1045,7 +1046,22 @@ class Scheduler:
             # When retry was active and exhausted, the helper raised the
             # last exception — count those attempts here so the metric
             # captures both successful-retry and exhausted-retry paths.
-            if max_attempts > 1:
+            #
+            # BUT only when the exception was ACTUALLY retried: if a
+            # non-retryable exception (e.g. ReadTimeout with
+            # read_timeouts=False) propagates, call_with_retry raises it
+            # on attempt 1 without consuming any retry budget. Counting
+            # those would mark every transient ReadTimeout as
+            # "max_attempts - 1 retries used" when zero were.
+            from ollama_marshal.retry import (
+                SAFE_RETRY_EXCEPTIONS,
+                UNSAFE_RETRY_EXCEPTIONS,
+            )
+
+            retryable: tuple[type[Exception], ...] = SAFE_RETRY_EXCEPTIONS
+            if allow_read_retry:
+                retryable = retryable + UNSAFE_RETRY_EXCEPTIONS
+            if max_attempts > 1 and isinstance(exc, retryable):
                 self.metrics.retries_attempted += max_attempts - 1
             # Some httpx exception subclasses have empty str(); always include
             # the type name so the log entry is useful.

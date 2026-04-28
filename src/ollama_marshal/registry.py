@@ -285,8 +285,13 @@ class ModelRegistry:
         if unknown:
             logger.info("model_registry.new_models_found", models=sorted(unknown))
 
-    async def _fetch_model_list(self) -> list[str]:
-        """Fetch the list of downloaded model names from Ollama.
+    async def fetch_model_list(self) -> list[str]:
+        """Fetch the list of downloaded model names from Ollama (public API).
+
+        Used by external modules that need a fresh /api/tags read
+        (e.g. the `marshal doctor` CLI). Internal callers also use this
+        method — `_fetch_model_list` is preserved as a thin alias for
+        backwards compatibility with existing tests.
 
         Returns:
             List of model name strings.
@@ -296,6 +301,10 @@ class ModelRegistry:
             resp.raise_for_status()
             data = resp.json()
             return [m["name"] for m in data.get("models", [])]
+
+    # Kept for backwards compatibility with existing tests that patch
+    # `_fetch_model_list`. New callers should use the public name.
+    _fetch_model_list = fetch_model_list
 
     async def benchmark_model(self, model: str) -> int | None:
         """Benchmark a single model by loading it and measuring VRAM.

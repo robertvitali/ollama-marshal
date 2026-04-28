@@ -1035,8 +1035,8 @@ class TestForwardSingleRetry:
 
     @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
     async def test_retry_exhaustion_records_attempted_only(self, mock_retry):
-        # Helper exhausted retries and reraised → retries_attempted bumps,
-        # retries_succeeded does NOT.
+        # Helper exhausted retries and reraised a RETRYABLE exception →
+        # retries_attempted bumps, retries_succeeded does NOT.
         import httpx
 
         mock_retry.side_effect = httpx.ConnectError("permanent")
@@ -1051,11 +1051,47 @@ class TestForwardSingleRetry:
         assert sched.metrics.retries_succeeded == 0
 
     @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_non_retryable_exception_does_not_bump_retries_attempted(
+        self, mock_retry
+    ):
+        # call_with_retry raises non-retryable exceptions on attempt 1
+        # without consuming retry budget. The metric must not bump as
+        # though all retries were used.
+        import httpx
+
+        mock_retry.side_effect = httpx.ReadTimeout("slow")  # non-retryable by default
+        cfg = _make_config(**{"retry.max_attempts": 3, "retry.read_timeouts": False})
+        sched = _make_scheduler(config=cfg)
+
+        env = _make_envelope()
+        await sched._forward_single(env)
+
+        assert env.error is not None
+        # Crucial: 0, not 2. ReadTimeout was not retried.
+        assert sched.metrics.retries_attempted == 0
+        assert sched.metrics.retries_succeeded == 0
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_unrelated_exception_does_not_bump_retries_attempted(
+        self, mock_retry
+    ):
+        # A non-network exception (e.g. our code has a bug) must also
+        # not count against retry metrics.
+        mock_retry.side_effect = ValueError("scheduler bug")
+        cfg = _make_config(**{"retry.max_attempts": 3})
+        sched = _make_scheduler(config=cfg)
+
+        env = _make_envelope()
+        await sched._forward_single(env)
+
+        assert sched.metrics.retries_attempted == 0
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
     async def test_embeddings_endpoint_enables_read_timeout_retry(self, mock_retry):
         # /api/embeddings is idempotent — the helper is invoked with
         # retry_read_timeouts=True even when the global config is False.
         mock_retry.return_value = (MagicMock(), 1)
-        cfg = _make_config(**{"retry.retry_read_timeouts": False})
+        cfg = _make_config(**{"retry.read_timeouts": False})
         sched = _make_scheduler(config=cfg)
 
         await sched._forward_single(_make_envelope(endpoint="/api/embeddings"))
@@ -1066,7 +1102,7 @@ class TestForwardSingleRetry:
     @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
     async def test_chat_endpoint_does_not_force_read_timeout_retry(self, mock_retry):
         mock_retry.return_value = (MagicMock(), 1)
-        cfg = _make_config(**{"retry.retry_read_timeouts": False})
+        cfg = _make_config(**{"retry.read_timeouts": False})
         sched = _make_scheduler(config=cfg)
 
         await sched._forward_single(_make_envelope(endpoint="/api/chat"))

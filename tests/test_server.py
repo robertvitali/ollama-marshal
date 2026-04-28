@@ -800,6 +800,44 @@ class TestMarshalStatus:
         assert result["metrics"]["requests_served"] == 10
         assert result["queue"]["total_pending"] == 2
 
+    async def test_status_exposes_v040_metrics(self):
+        # Regression test for the doctor-CLI integration: all four new
+        # v0.4.0 SchedulerMetrics counters must appear in the response,
+        # otherwise `marshal doctor` always reads None.
+        config = MarshalConfig()
+        app = create_app(config)
+
+        server_mod._queues = _mock_queues()
+        server_mod._memory = _mock_memory()
+        sched = _mock_scheduler()
+        sched.metrics = MagicMock(
+            requests_served=10,
+            model_swaps=3,
+            evictions=1,
+            average_wait_ms=42.5,
+            retries_attempted=5,
+            retries_succeeded=4,
+            unexpected_unloads=2,
+            reload_count=1,
+        )
+        server_mod._scheduler = sched
+        server_mod._started_at = time.monotonic() - 60
+
+        status_handler = None
+        for route in app.routes:
+            if isinstance(route, Route) and route.path == "/api/marshal/status":
+                status_handler = route.endpoint
+                break
+
+        assert status_handler is not None
+        result = await status_handler()
+
+        m = result["metrics"]
+        assert m["retries_attempted"] == 5
+        assert m["retries_succeeded"] == 4
+        assert m["unexpected_unloads"] == 2
+        assert m["reload_count"] == 1
+
 
 # ---------------------------------------------------------------------------
 # _record_burst_hint — X-Burst-Size header extraction

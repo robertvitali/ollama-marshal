@@ -83,6 +83,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _scheduler.metrics.model_swaps = restored.model_swaps
     _scheduler.metrics.evictions = restored.evictions
     _scheduler.metrics.total_wait_ms = restored.total_wait_ms
+    # v0.4.0 counters — also persist across restarts.
+    _scheduler.metrics.retries_attempted = restored.retries_attempted
+    _scheduler.metrics.retries_succeeded = restored.retries_succeeded
+    _scheduler.metrics.unexpected_unloads = restored.unexpected_unloads
+    _scheduler.metrics.reload_count = restored.reload_count
     if restored.requests_served or restored.model_swaps or restored.evictions:
         logger.info(
             "server.metrics_restored",
@@ -338,6 +343,12 @@ def _register_routes(app: FastAPI) -> None:
                 "model_swaps": _scheduler.metrics.model_swaps,
                 "evictions": _scheduler.metrics.evictions,
                 "average_wait_ms": round(_scheduler.metrics.average_wait_ms, 1),
+                # v0.4.0 counters — wired through to /api/marshal/status
+                # so the doctor CLI (and dashboard) can read them.
+                "retries_attempted": _scheduler.metrics.retries_attempted,
+                "retries_succeeded": _scheduler.metrics.retries_succeeded,
+                "unexpected_unloads": _scheduler.metrics.unexpected_unloads,
+                "reload_count": _scheduler.metrics.reload_count,
             },
         }
 
@@ -616,11 +627,12 @@ def _parse_retry_max_header(request: Request) -> int | None:
 
     Returns None when the header is absent or malformed (use config
     default). Returns 0 when the client explicitly disables retry. Caps
-    at 10 to keep an adversarial header from arbitrarily extending the
-    retry budget.
+    at `retry.max_per_request_attempts` to keep an adversarial header
+    from arbitrarily extending the retry budget.
 
     Returns:
-        None to defer to config.retry, or an int >= 0 (clamped to 10).
+        None to defer to config.retry, or an int >= 0 (clamped to
+        `retry.max_per_request_attempts`, default 10).
     """
     hdr = request.headers.get("x-marshal-retry-max")
     if hdr is None:
@@ -631,7 +643,11 @@ def _parse_retry_max_header(request: Request) -> int | None:
         return None
     if v < 0:
         return 0
-    return min(v, 10)
+    # Read the cap from config, with a defensive default for test paths
+    # that bypass lifespan (no _config global set).
+    config = globals().get("_config")
+    cap = config.retry.max_per_request_attempts if config is not None else 10
+    return min(v, cap)
 
 
 def _resolve_timeout(request: Request) -> int:

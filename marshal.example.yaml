@@ -114,9 +114,12 @@ retry:
   base_delay_s: 0.5                # MARSHAL_RETRY_BASE_DELAY_S — first-retry backoff
                                     # before doubling. Full-jitter random in [0, base_delay_s].
   max_delay_s: 10.0                # MARSHAL_RETRY_MAX_DELAY_S — cap on a single backoff sleep.
-  retry_read_timeouts: false       # MARSHAL_RETRY_READ_TIMEOUTS — when true, also retry
+  read_timeouts: false             # MARSHAL_RETRY_READ_TIMEOUTS — when true, also retry
                                     # ReadTimeout (risk of re-execution). Embeddings
                                     # endpoints opt in automatically regardless of this flag.
+  max_per_request_attempts: 10     # MARSHAL_RETRY_MAX_PER_REQUEST_ATTEMPTS — server-side
+                                    # cap on the X-Marshal-Retry-Max header so an
+                                    # adversarial client can't extend retry indefinitely.
 
 # Dynamic num_ctx injection (default ON).
 # v0.3.0 forced num_ctx = model_max_context, which made Ollama pre-allocate

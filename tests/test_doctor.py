@@ -217,64 +217,120 @@ class TestRenderReport:
 
 
 class TestGatherReport:
+    """Integration tests for gather_report.
+
+    Mocks only at the httpx HTTP boundary — never patches internal
+    `ollama_marshal.*` classes (Bright-line #1). The real ModelRegistry
+    is exercised, hitting the patched httpx.AsyncClient for /api/tags
+    and /api/show.
+    """
+
     @pytest.fixture
     def mock_psutil(self):
         with patch("ollama_marshal.doctor.psutil") as m:
             m.virtual_memory.return_value = MagicMock(total=256 * 1024**3)
             yield m
 
-    async def test_returns_empty_when_tags_unreachable(self, mock_psutil):
-        with patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls:
-            mock_reg = MagicMock()
-            mock_reg._fetch_model_list = AsyncMock(
-                side_effect=httpx.HTTPError("ollama down")
+    @staticmethod
+    def _install_httpx(handlers: dict[str, object]):
+        """Patch both registry+doctor httpx clients with one shared handler.
+
+        `handlers` maps a URL substring to a callable
+        `(method, url, **kwargs) -> response` (or a callable that raises
+        an exception). Each AsyncClient method (.get, .post) routes to
+        the first matching handler.
+
+        Returns a context manager that installs both patches.
+        """
+
+        def _build_response(payload):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = payload
+            return resp
+
+        def _route(method: str, url: str, **kwargs):
+            for substr, handler in handlers.items():
+                if substr in url:
+                    result = handler(method, url, **kwargs)
+                    if isinstance(result, Exception):
+                        raise result
+                    return _build_response(result)
+            return _build_response({})
+
+        def _make_client():
+            client = AsyncMock()
+            # AsyncMock with side_effect=sync-fn awaits the return value.
+            # Returning the response directly (not a coroutine) keeps it
+            # simple and matches httpx.AsyncClient.get's return type.
+            client.get = AsyncMock(
+                side_effect=lambda url, **kw: _route("GET", url, **kw)
             )
-            mock_reg_cls.return_value = mock_reg
+            client.post = AsyncMock(
+                side_effect=lambda url, **kw: _route("POST", url, **kw)
+            )
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            return client
+
+        # Each `with httpx.AsyncClient() as client:` block needs its own
+        # client (calling __aenter__ a second time on a used mock would
+        # confuse some tests). Use a factory side_effect.
+        registry_patch = patch(
+            "ollama_marshal.registry.httpx.AsyncClient",
+            side_effect=lambda *a, **kw: _make_client(),
+        )
+        doctor_patch = patch(
+            "ollama_marshal.doctor.httpx.AsyncClient",
+            side_effect=lambda *a, **kw: _make_client(),
+        )
+
+        class _Combined:
+            def __enter__(self):
+                registry_patch.start()
+                doctor_patch.start()
+
+            def __exit__(self, *exc):
+                doctor_patch.stop()
+                registry_patch.stop()
+                return False
+
+        return _Combined()
+
+    @staticmethod
+    def _qwen3_show_payload():
+        """A realistic /api/show body for an arch-known qwen3 model."""
+        return {
+            "model_info": {
+                "general.architecture": "qwen3",
+                "qwen3.context_length": 32768,
+                "qwen3.block_count": 28,
+                "qwen3.embedding_length": 3584,
+                "qwen3.attention.head_count": 28,
+                "qwen3.attention.head_count_kv": 4,
+            }
+        }
+
+    async def test_returns_empty_when_tags_unreachable(self, mock_psutil):
+        def _tags_fail(method, url, **kw):
+            return httpx.HTTPError("ollama down")
+
+        with self._install_httpx({"/api/tags": _tags_fail}):
             report = await gather_report(ollama_host="http://localhost:11434")
         assert report.all_models == []
         assert report.loaded_models == []
-        # System RAM is still reported.
         assert report.total_ram_bytes == 256 * 1024**3
 
     async def test_includes_unexpected_unloads_from_marshal(self, mock_psutil):
-        from ollama_marshal.registry import ModelMetadata
-
-        meta = ModelMetadata(
-            name="x",
-            architecture="qwen3",
-            max_context_length=32768,
-            num_layers=28,
-            embedding_length=3584,
-            head_count=28,
-            head_count_kv=4,
-        )
-
-        async def fake_get(url, *args, **kwargs):
-            resp = MagicMock()
-            resp.raise_for_status = MagicMock()
-            if "/api/marshal/status" in url:
-                resp.json.return_value = {"metrics": {"unexpected_unloads": 7}}
-            elif "/api/ps" in url:
-                resp.json.return_value = {"models": []}
-            else:
-                resp.json.return_value = {}
-            return resp
-
-        with (
-            patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
-            patch("ollama_marshal.doctor.httpx.AsyncClient") as mock_client_cls,
-        ):
-            mock_reg = MagicMock()
-            mock_reg._fetch_model_list = AsyncMock(return_value=["x"])
-            mock_reg.probe_metadata = AsyncMock(return_value=meta)
-            mock_reg_cls.return_value = mock_reg
-
-            mock_client = AsyncMock()
-            mock_client.get = AsyncMock(side_effect=fake_get)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
+        handlers = {
+            "/api/tags": lambda m, u, **kw: {"models": [{"name": "x"}]},
+            "/api/show": lambda m, u, **kw: self._qwen3_show_payload(),
+            "/api/ps": lambda m, u, **kw: {"models": []},
+            "/api/marshal/status": lambda m, u, **kw: {
+                "metrics": {"unexpected_unloads": 7}
+            },
+        }
+        with self._install_httpx(handlers):
             report = await gather_report(
                 ollama_host="http://localhost:11434",
                 marshal_status_url="http://localhost:11435/api/marshal/status",
@@ -286,31 +342,17 @@ class TestGatherReport:
         assert report.all_models[0].probe_ok is True
 
     async def test_failed_probe_recorded_with_probe_ok_false(self, mock_psutil):
-        async def fake_get(url, *args, **kwargs):
-            resp = MagicMock()
-            resp.raise_for_status = MagicMock()
-            if "/api/ps" in url:
-                resp.json.return_value = {"models": []}
-            else:
-                resp.json.return_value = {}
-            return resp
+        # When /api/show fails, ModelRegistry.probe_metadata returns
+        # None and the doctor records probe_ok=False with KV cost 0.
+        def _show_fail(method, url, **kw):
+            return httpx.HTTPError("show down")
 
-        with (
-            patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
-            patch("ollama_marshal.doctor.httpx.AsyncClient") as mock_client_cls,
-        ):
-            mock_reg = MagicMock()
-            mock_reg._fetch_model_list = AsyncMock(return_value=["unprobeable:x"])
-            # probe_metadata returns None when /api/show fails or is unparseable.
-            mock_reg.probe_metadata = AsyncMock(return_value=None)
-            mock_reg_cls.return_value = mock_reg
-
-            mock_client = AsyncMock()
-            mock_client.get = AsyncMock(side_effect=fake_get)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
+        handlers = {
+            "/api/tags": lambda m, u, **kw: {"models": [{"name": "unprobeable:x"}]},
+            "/api/show": _show_fail,
+            "/api/ps": lambda m, u, **kw: {"models": []},
+        }
+        with self._install_httpx(handlers):
             report = await gather_report(ollama_host="http://localhost:11434")
 
         assert len(report.all_models) == 1
@@ -318,44 +360,14 @@ class TestGatherReport:
         assert report.all_models[0].kv_per_slot_at_max_ctx == 0
 
     async def test_loaded_models_have_size_vram_populated(self, mock_psutil):
-        from ollama_marshal.registry import ModelMetadata
-
-        meta = ModelMetadata(
-            name="x",
-            architecture="qwen3",
-            max_context_length=32768,
-            num_layers=28,
-            embedding_length=3584,
-            head_count=28,
-            head_count_kv=4,
-        )
-
-        async def fake_get(url, *args, **kwargs):
-            resp = MagicMock()
-            resp.raise_for_status = MagicMock()
-            if "/api/ps" in url:
-                resp.json.return_value = {
-                    "models": [{"name": "x", "size_vram": 5_000_000_000}]
-                }
-            else:
-                resp.json.return_value = {}
-            return resp
-
-        with (
-            patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
-            patch("ollama_marshal.doctor.httpx.AsyncClient") as mock_client_cls,
-        ):
-            mock_reg = MagicMock()
-            mock_reg._fetch_model_list = AsyncMock(return_value=["x"])
-            mock_reg.probe_metadata = AsyncMock(return_value=meta)
-            mock_reg_cls.return_value = mock_reg
-
-            mock_client = AsyncMock()
-            mock_client.get = AsyncMock(side_effect=fake_get)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
+        handlers = {
+            "/api/tags": lambda m, u, **kw: {"models": [{"name": "x"}]},
+            "/api/show": lambda m, u, **kw: self._qwen3_show_payload(),
+            "/api/ps": lambda m, u, **kw: {
+                "models": [{"name": "x", "size_vram": 5_000_000_000}]
+            },
+        }
+        with self._install_httpx(handlers):
             report = await gather_report(ollama_host="http://localhost:11434")
 
         assert len(report.loaded_models) == 1
@@ -364,63 +376,31 @@ class TestGatherReport:
     async def test_unexpected_unloads_marshal_unreachable_returns_none(
         self, mock_psutil
     ):
-        async def fake_get(url, *args, **kwargs):
-            if "/api/marshal/status" in url:
-                raise httpx.HTTPError("marshal down")
-            resp = MagicMock()
-            resp.raise_for_status = MagicMock()
-            resp.json.return_value = {"models": []}
-            return resp
+        def _marshal_down(method, url, **kw):
+            return httpx.HTTPError("marshal down")
 
-        with (
-            patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
-            patch("ollama_marshal.doctor.httpx.AsyncClient") as mock_client_cls,
-        ):
-            mock_reg = MagicMock()
-            mock_reg._fetch_model_list = AsyncMock(return_value=[])
-            mock_reg_cls.return_value = mock_reg
-
-            mock_client = AsyncMock()
-            mock_client.get = AsyncMock(side_effect=fake_get)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
+        handlers = {
+            "/api/tags": lambda m, u, **kw: {"models": []},
+            "/api/ps": lambda m, u, **kw: {"models": []},
+            "/api/marshal/status": _marshal_down,
+        }
+        with self._install_httpx(handlers):
             report = await gather_report(
                 ollama_host="http://localhost:11434",
                 marshal_status_url="http://localhost:11435/api/marshal/status",
             )
 
-        # Marshal unreachable mid-probe → counter stays None, no crash.
         assert report.unexpected_unloads is None
 
     async def test_unexpected_unloads_handles_non_int_payload(self, mock_psutil):
-        async def fake_get(url, *args, **kwargs):
-            resp = MagicMock()
-            resp.raise_for_status = MagicMock()
-            if "/api/marshal/status" in url:
-                # Defensive: malformed payload shouldn't crash the report.
-                resp.json.return_value = {
-                    "metrics": {"unexpected_unloads": "not-an-int"}
-                }
-            else:
-                resp.json.return_value = {"models": []}
-            return resp
-
-        with (
-            patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
-            patch("ollama_marshal.doctor.httpx.AsyncClient") as mock_client_cls,
-        ):
-            mock_reg = MagicMock()
-            mock_reg._fetch_model_list = AsyncMock(return_value=[])
-            mock_reg_cls.return_value = mock_reg
-
-            mock_client = AsyncMock()
-            mock_client.get = AsyncMock(side_effect=fake_get)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
+        handlers = {
+            "/api/tags": lambda m, u, **kw: {"models": []},
+            "/api/ps": lambda m, u, **kw: {"models": []},
+            "/api/marshal/status": lambda m, u, **kw: {
+                "metrics": {"unexpected_unloads": "not-an-int"}
+            },
+        }
+        with self._install_httpx(handlers):
             report = await gather_report(
                 ollama_host="http://localhost:11434",
                 marshal_status_url="http://localhost:11435/api/marshal/status",
