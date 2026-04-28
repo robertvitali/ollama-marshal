@@ -27,18 +27,21 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.CLAUDE_API_KEY }}
-          # track_progress posts a live progress comment AND wires Claude into
-          # the action's built-in inline-comment-classifier pipeline. Without
-          # this, custom prompts complete silently — the action buffers inline
-          # comments expecting Claude to use the action's posting machinery,
-          # and a custom prompt that doesn't trigger it just produces "No
-          # buffered inline comments" at the end of the run.
+          # track_progress: forces "tag mode" with a sticky tracking comment,
+          # so something always posts (visible failure if review didn't run).
           track_progress: true
-          claude_args: --allowedTools mcp__github_inline_comment__create_inline_comment
-          # Project-specific review focus only. The action injects its own
-          # standard review boilerplate ("review the diff and post inline
-          # comments"); this prompt narrows what to look for.
+          # Allowlist: the inline-comment MCP tool + gh CLI for the summary.
+          # Without `Bash(gh pr comment:*)` Claude can't post the top-level
+          # summary, which is needed because the inline-comment buffer/
+          # classifier path drops comments when the run ends on TodoWrite
+          # (anthropics/claude-code-action#1087).
+          claude_args: >-
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+          show_full_output: true
           prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
             Review this PR against CLAUDE.md (the project's living rulebook).
             Focus your review on:
 
@@ -58,8 +61,22 @@ jobs:
             - "Versioning" — pre-1.0 SemVer rules. Don't bump version in
               feature PRs (add to [Unreleased] instead).
 
-            Beyond the rules, also flag:
-            - Real bugs, race conditions, edge cases the rules don't cover
-            - Security vulnerabilities (injection, secret exposure, trust
-              boundary violations)
-            - Test coverage gaps for new code
+            Beyond the rules, also flag real bugs, race conditions,
+            security issues, and test coverage gaps.
+
+            HOW TO POST FINDINGS (do not skip — silent reviews are wasted):
+
+            1. For each line-specific finding, call
+               `mcp__github_inline_comment__create_inline_comment` with
+               `confirmed: true` (REQUIRED — without confirmed=true the
+               comment is buffered and may be silently dropped, see
+               anthropics/claude-code-action#1087).
+            2. For the top-level summary, run
+               `gh pr comment <PR NUMBER> --body "<summary text>"` with a
+               short verdict (LGTM / changes requested / N findings).
+            3. Even if you find no issues, post the top-level summary
+               saying "Reviewed against CLAUDE.md. No findings."
+            4. End your turn with the gh pr comment call (or a normal text
+               message). Do NOT end with TodoWrite or any other no-op tool —
+               the SDK returns empty result and the post-step drops
+               everything.
