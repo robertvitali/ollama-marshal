@@ -28,36 +28,52 @@ class ModelLifecycle:
     def __init__(self, ollama_host: str = "http://localhost:11434") -> None:
         self._ollama_host = ollama_host
 
-    async def preload(self, model: str) -> bool:
+    async def preload(self, model: str, num_ctx: int | None = None) -> bool:
         """Preload a model into Ollama's VRAM.
 
         Sends an empty-prompt request which triggers model loading, then
         waits for the model to appear in /api/ps.
 
+        When `num_ctx` is provided, it's passed to Ollama's
+        `/api/generate` so the KV cache slot is allocated at that size.
+        This is the lever marshal uses to control per-model KV-cache
+        cost (Surface C1 Dim 4) — without it, Ollama would allocate at
+        its server-side default (typically the model's max), wasting
+        VRAM on small-prompt programs.
+
         Args:
             model: The model name to preload.
+            num_ctx: If set, allocate the KV slot at this context size.
 
         Returns:
             True if the model was successfully loaded.
         """
-        logger.info("lifecycle.preloading", model=model)
+        logger.info("lifecycle.preloading", model=model, num_ctx=num_ctx)
         try:
             async with httpx.AsyncClient() as client:
-                # Send empty-prompt request to trigger loading
+                payload: dict[str, Any] = {
+                    "model": model,
+                    "prompt": "",
+                    "keep_alive": "24h",
+                }
+                if num_ctx is not None:
+                    # Note: Ollama allocates KV slots at LOAD time using
+                    # the num_ctx of the first request. After that, slot
+                    # size is fixed until a reload — that's why
+                    # marshal's reload-on-need logic exists.
+                    payload["options"] = {"num_ctx": num_ctx}
                 await client.post(
                     f"{self._ollama_host}/api/generate",
-                    json={
-                        "model": model,
-                        "prompt": "",
-                        "keep_alive": "24h",
-                    },
+                    json=payload,
                     timeout=_LOAD_TIMEOUT,
                 )
 
                 # Wait for model to appear in /api/ps
                 loaded = await self._wait_for_model(client, model)
                 if loaded:
-                    logger.info("lifecycle.preloaded", model=model)
+                    logger.info(
+                        "lifecycle.preloaded", model=model, num_ctx=num_ctx
+                    )
                 else:
                     logger.warning("lifecycle.preload_timeout", model=model)
                 return loaded
@@ -138,19 +154,25 @@ class ModelLifecycle:
             elapsed += _PS_POLL_INTERVAL
         return False
 
-    async def ensure_loaded(self, model: str, loaded_models: set[str]) -> bool:
+    async def ensure_loaded(
+        self,
+        model: str,
+        loaded_models: set[str],
+        num_ctx: int | None = None,
+    ) -> bool:
         """Ensure a model is loaded, preloading if necessary.
 
         Args:
             model: The model name.
             loaded_models: Set of currently loaded model names.
+            num_ctx: If preloading, allocate the KV slot at this size.
 
         Returns:
             True if the model is (now) loaded.
         """
         if model in loaded_models:
             return True
-        return await self.preload(model)
+        return await self.preload(model, num_ctx=num_ctx)
 
     @staticmethod
     def override_keep_alive(request_body: dict[str, Any]) -> dict[str, Any]:

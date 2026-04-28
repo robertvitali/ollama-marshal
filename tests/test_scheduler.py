@@ -59,6 +59,13 @@ def _make_scheduler(
         memory.available_vram.return_value = 50 * 1024**3
         memory.get_eviction_candidates.return_value = []
         memory.refresh = AsyncMock()
+        # New v0.4.0 methods (Surface C1 Dim 4 + C2). Default to "no
+        # reload needed" / "no unexpected unloads" / "no allocation".
+        memory.needs_reload.return_value = False
+        memory.get_allocated_num_ctx.return_value = None
+        memory.take_unexpected_unload_count.return_value = 0
+        memory.mark_intended_unload = MagicMock()
+        memory.record_allocated_num_ctx = MagicMock()
     if registry is None:
         registry = MagicMock()
         registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
@@ -249,7 +256,8 @@ class TestHandleCriticalPreemption:
         ) as mock_eml:
             mock_eml.return_value = True
             await sched._handle_critical_preemption()
-            mock_eml.assert_called_once_with("critical-model")
+            # num_ctx is None because the envelope had no options.num_ctx.
+            mock_eml.assert_called_once_with("critical-model", num_ctx=None)
 
     async def test_skips_normal_priority(self):
         queues = ModelQueues()
@@ -343,7 +351,7 @@ class TestHandleUnskippableRequests:
         ) as mock_eml:
             mock_eml.return_value = True
             await sched._handle_unskippable_requests()
-            mock_eml.assert_called_once_with("llama3:latest")
+            mock_eml.assert_called_once_with("llama3:latest", num_ctx=None)
 
     async def test_skips_if_below_limit(self):
         queues = ModelQueues()
@@ -435,7 +443,7 @@ class TestBinPackModels:
 
         await sched._bin_pack_models()
 
-        lifecycle.preload.assert_called_once_with("small:latest")
+        lifecycle.preload.assert_called_once_with("small:latest", num_ctx=None)
         assert sched.metrics.model_swaps == 1
         memory.refresh.assert_called_once()
 
@@ -638,7 +646,7 @@ class TestEnsureModelLoaded:
 
         result = await sched._ensure_model_loaded("llama3:latest")
         assert result is True
-        lifecycle.preload.assert_called_once_with("llama3:latest")
+        lifecycle.preload.assert_called_once_with("llama3:latest", num_ctx=None)
         assert sched.metrics.model_swaps == 1
 
     async def test_evicts_when_needed(self):
@@ -1084,23 +1092,180 @@ class TestForwardSingleRetry:
         mock_retry.assert_not_called()
 
 
+class TestEnvelopeNumCtxHelpers:
+    """Helpers that read num_ctx out of envelopes for slot sizing."""
+
+    def test_envelope_num_ctx_none_when_no_options(self):
+        env = _make_envelope()
+        env.request_body = {"model": "x"}
+        assert Scheduler._envelope_num_ctx(env) is None
+
+    def test_envelope_num_ctx_none_when_options_not_dict(self):
+        env = _make_envelope()
+        env.request_body = {"options": "not a dict"}
+        assert Scheduler._envelope_num_ctx(env) is None
+
+    def test_envelope_num_ctx_extracted(self):
+        env = _make_envelope()
+        env.request_body = {"options": {"num_ctx": 16384}}
+        assert Scheduler._envelope_num_ctx(env) == 16384
+
+    def test_envelope_num_ctx_ignores_zero_or_negative(self):
+        env = _make_envelope()
+        env.request_body = {"options": {"num_ctx": 0}}
+        assert Scheduler._envelope_num_ctx(env) is None
+        env.request_body = {"options": {"num_ctx": -1}}
+        assert Scheduler._envelope_num_ctx(env) is None
+
+    async def test_max_num_ctx_for_pending_picks_largest(self):
+        queues = ModelQueues()
+        e1 = _make_envelope()
+        e1.request_body = {"options": {"num_ctx": 8192}}
+        e2 = _make_envelope()
+        e2.request_body = {"options": {"num_ctx": 32768}}
+        e3 = _make_envelope()  # no num_ctx
+        await queues.enqueue(e1)
+        await queues.enqueue(e2)
+        await queues.enqueue(e3)
+
+        sched = _make_scheduler(queues=queues)
+        assert await sched._max_num_ctx_for_pending("llama3:latest") == 32768
+
+    async def test_max_num_ctx_for_pending_returns_none_for_empty(self):
+        sched = _make_scheduler()
+        assert await sched._max_num_ctx_for_pending("nothing:queued") is None
+
+
+class TestEnsureModelLoadedReloadOnNeed:
+    """Reload-on-need: dispatch with a num_ctx > current allocation reloads."""
+
+    async def test_skips_reload_when_request_fits(self):
+        memory = MagicMock()
+        memory.is_loaded.return_value = True
+        memory.needs_reload.return_value = False
+        memory.refresh = AsyncMock()
+        memory.take_unexpected_unload_count.return_value = 0
+        memory.mark_intended_unload = MagicMock()
+        memory.record_allocated_num_ctx = MagicMock()
+
+        lifecycle = MagicMock()
+        lifecycle.preload = AsyncMock(return_value=True)
+        lifecycle.unload = AsyncMock(return_value=True)
+
+        sched = _make_scheduler(memory=memory, lifecycle=lifecycle)
+
+        result = await sched._ensure_model_loaded("llama3:latest", num_ctx=4096)
+
+        assert result is True
+        # No reload work — preload not called.
+        lifecycle.preload.assert_not_called()
+        lifecycle.unload.assert_not_called()
+        assert sched.metrics.reload_count == 0
+
+    async def test_reload_drains_unloads_preloads_and_records(self):
+        memory = MagicMock()
+        memory.is_loaded.return_value = True
+        memory.needs_reload.return_value = True
+        memory.get_allocated_num_ctx.return_value = 4096
+        memory.can_fit_model.return_value = True
+        memory.refresh = AsyncMock()
+        memory.take_unexpected_unload_count.return_value = 0
+        memory.mark_intended_unload = MagicMock()
+        memory.record_allocated_num_ctx = MagicMock()
+
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
+
+        lifecycle = MagicMock()
+        lifecycle.preload = AsyncMock(return_value=True)
+        lifecycle.unload = AsyncMock(return_value=True)
+
+        queues = ModelQueues()
+        # Add a pending request to verify drain runs.
+        env = _make_envelope()
+        env.request_body = {"options": {"num_ctx": 32768}}
+        await queues.enqueue(env)
+
+        sched = _make_scheduler(
+            queues=queues, memory=memory, registry=registry, lifecycle=lifecycle
+        )
+
+        with patch.object(
+            sched, "_process_batch", new_callable=AsyncMock
+        ) as mock_process:
+            result = await sched._ensure_model_loaded(
+                "llama3:latest", num_ctx=32768
+            )
+
+        assert result is True
+        # Drain ran.
+        mock_process.assert_called_once()
+        # Marshal told memory it's an intended unload.
+        memory.mark_intended_unload.assert_called_with("llama3:latest")
+        # Unload then preload at the bigger size.
+        lifecycle.unload.assert_called_once_with("llama3:latest")
+        lifecycle.preload.assert_called_once_with("llama3:latest", num_ctx=32768)
+        # Allocation recorded post-preload.
+        memory.record_allocated_num_ctx.assert_called_with("llama3:latest", 32768)
+        # Metric bumped.
+        assert sched.metrics.reload_count == 1
+
+
+class TestUnexpectedUnloadsRollup:
+    async def test_tick_drains_unexpected_unloads_into_metrics(self):
+        # Memory poll loop runs in the background and accumulates a
+        # count; the scheduler tick must drain it into SchedulerMetrics
+        # so the dashboard sees one authoritative number.
+        memory = MagicMock()
+        memory.get_loaded_models.return_value = {}
+        memory.is_loaded.return_value = False
+        memory.refresh = AsyncMock()
+        memory.take_unexpected_unload_count.return_value = 3
+        memory.mark_intended_unload = MagicMock()
+        memory.record_allocated_num_ctx = MagicMock()
+
+        sched = _make_scheduler(memory=memory)
+
+        with (
+            patch.object(
+                sched, "_forward_loaded_model_requests", new_callable=AsyncMock
+            ),
+            patch.object(
+                sched, "_handle_critical_preemption", new_callable=AsyncMock
+            ),
+            patch.object(
+                sched, "_handle_unskippable_requests", new_callable=AsyncMock
+            ),
+            patch.object(sched, "_bin_pack_models", new_callable=AsyncMock),
+            patch.object(
+                sched, "_idle_evict_unused_models", new_callable=AsyncMock
+            ),
+        ):
+            await sched._tick()
+
+        assert sched.metrics.unexpected_unloads == 3
+
+
 class TestSchedulerMetricsRetryFields:
     def test_default_zero(self):
         m = SchedulerMetrics()
         assert m.retries_attempted == 0
         assert m.retries_succeeded == 0
         assert m.unexpected_unloads == 0
+        assert m.reload_count == 0
 
     def test_serializes_new_fields(self):
         m = SchedulerMetrics(
             retries_attempted=5,
             retries_succeeded=4,
             unexpected_unloads=2,
+            reload_count=7,
         )
         d = m.to_json_dict()
         assert d["retries_attempted"] == 5
         assert d["retries_succeeded"] == 4
         assert d["unexpected_unloads"] == 2
+        assert d["reload_count"] == 7
 
     def test_loads_with_missing_new_fields_for_v0_3_x_snapshots(self):
         # A v0.3.x metrics file won't have the new fields — they should
@@ -1120,6 +1285,7 @@ class TestSchedulerMetricsRetryFields:
         assert m.retries_attempted == 0
         assert m.retries_succeeded == 0
         assert m.unexpected_unloads == 0
+        assert m.reload_count == 0
 
 
 class TestActiveProgramsAccessor:

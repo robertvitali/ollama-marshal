@@ -270,6 +270,9 @@ class SchedulerMetrics:
         unexpected_unloads: Times marshal observed Ollama drop a loaded
             model on its own (memory-pressure eviction). Persistent
             non-zero values signal Ollama-side memory tuning is needed.
+        reload_count: Times marshal reloaded a model at a larger num_ctx
+            because an incoming request needed more context than the
+            current slot allocation (Surface C1 Dim 4).
         started_at: Monotonic timestamp when the scheduler started.
     """
 
@@ -280,6 +283,7 @@ class SchedulerMetrics:
     retries_attempted: int = 0
     retries_succeeded: int = 0
     unexpected_unloads: int = 0
+    reload_count: int = 0
     started_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -306,6 +310,7 @@ class SchedulerMetrics:
             "retries_attempted": self.retries_attempted,
             "retries_succeeded": self.retries_succeeded,
             "unexpected_unloads": self.unexpected_unloads,
+            "reload_count": self.reload_count,
         }
 
     @classmethod
@@ -331,6 +336,7 @@ class SchedulerMetrics:
             retries_attempted=int(data.get("retries_attempted", 0)),
             retries_succeeded=int(data.get("retries_succeeded", 0)),
             unexpected_unloads=int(data.get("unexpected_unloads", 0)),
+            reload_count=int(data.get("reload_count", 0)),
             # started_at is intentionally fresh — current process clock.
         )
 
@@ -534,6 +540,14 @@ class Scheduler:
         # never-recurring program-model pair.
         self.burst_hints.prune_expired()
 
+        # Step 7: Roll memory's observed-unexpected-unloads counter up
+        # into the persisted SchedulerMetrics. The memory poll loop ran
+        # independently in the background; we drain the count here so
+        # the dashboard sees a single authoritative number.
+        unexpected = self.memory.take_unexpected_unload_count()
+        if unexpected > 0:
+            self.metrics.unexpected_unloads += unexpected
+
     def active_programs_by_model(self) -> dict[str, list[str]]:
         """Return programs that have recently dispatched against each loaded model.
 
@@ -584,6 +598,7 @@ class Scheduler:
                 idle_s=round(idle_s, 1),
                 threshold_s=threshold_s,
             )
+            self.memory.mark_intended_unload(model_name)
             success = await self.lifecycle.unload(model_name)
             if success:
                 self.metrics.evictions += 1
@@ -594,11 +609,31 @@ class Scheduler:
             break
 
     async def _forward_loaded_model_requests(self) -> None:
-        """Forward all pending requests whose model is already loaded."""
+        """Forward all pending requests whose model is already loaded.
+
+        Also handles reload-on-need (Surface C1 Dim 4): if any pending
+        envelope for a loaded model needs more num_ctx than the model
+        currently has allocated, trigger a reload first.
+        """
         loaded = self.memory.get_loaded_models()
         for model_name in loaded:
             pending = await self.queues.pending_count(model_name)
             if pending == 0:
+                continue
+
+            # Check whether any pending envelope needs more context
+            # than the model's current slot allocation. If so, reload
+            # at the larger size before dispatching anything.
+            requested = await self._max_num_ctx_for_pending(model_name)
+            if requested is not None and self.memory.needs_reload(
+                model_name, requested
+            ):
+                # _ensure_model_loaded handles drain-before-reload +
+                # unload + reload + record_allocated_num_ctx + metric.
+                await self._ensure_model_loaded(model_name, num_ctx=requested)
+                # Skip dispatch this tick; the next tick will pick up
+                # whatever's now ready (the drain-before-reload may
+                # have already served some envelopes).
                 continue
 
             batch = await self.queues.dequeue_batch(model_name)
@@ -620,7 +655,8 @@ class Scheduler:
                 model=envelope.model,
                 program=envelope.program_id,
             )
-            await self._ensure_model_loaded(envelope.model)
+            num_ctx = await self._max_num_ctx_for_pending(envelope.model)
+            await self._ensure_model_loaded(envelope.model, num_ctx=num_ctx)
             break  # Handle one preemption per tick
 
     async def _handle_unskippable_requests(self) -> None:
@@ -638,7 +674,8 @@ class Scheduler:
                 skip_count=envelope.skip_count,
                 max_skips=max_skips,
             )
-            await self._ensure_model_loaded(envelope.model)
+            num_ctx = await self._max_num_ctx_for_pending(envelope.model)
+            await self._ensure_model_loaded(envelope.model, num_ctx=num_ctx)
             break  # Load one forced model per tick to avoid thrashing
 
     async def _bin_pack_models(self) -> None:
@@ -657,15 +694,19 @@ class Scheduler:
         for model in models_to_try:
             model_size = await self.registry.get_or_estimate_size(model)
             if self.memory.can_fit_model(model_size):
+                num_ctx = await self._max_num_ctx_for_pending(model)
                 logger.info(
                     "scheduler.bin_pack_load",
                     model=model,
                     size_gb=round(model_size / (1024**3), 2),
                     available_gb=round(self.memory.available_vram() / (1024**3), 2),
+                    num_ctx=num_ctx,
                 )
-                success = await self.lifecycle.preload(model)
+                success = await self.lifecycle.preload(model, num_ctx=num_ctx)
                 if success:
                     self.metrics.model_swaps += 1
+                    if num_ctx is not None:
+                        self.memory.record_allocated_num_ctx(model, num_ctx)
                     await self.memory.refresh()
             else:
                 skipped_models.append(model)
@@ -675,17 +716,85 @@ class Scheduler:
         for model in skipped_models:
             await self.queues.increment_skips_for_model(model)
 
-    async def _ensure_model_loaded(self, model: str) -> bool:
-        """Ensure a model is loaded, evicting others if needed.
+    @staticmethod
+    def _envelope_num_ctx(envelope: RequestEnvelope) -> int | None:
+        """Read the injected `options.num_ctx` from an envelope's request body.
+
+        Returns None when the body has no options or the value isn't an
+        int. Used to decide what slot size to preload at, and whether
+        a reload is needed before dispatch.
+        """
+        options = envelope.request_body.get("options")
+        if not isinstance(options, dict):
+            return None
+        value = options.get("num_ctx")
+        if isinstance(value, int) and value > 0:
+            return value
+        return None
+
+    async def _max_num_ctx_for_pending(self, model: str) -> int | None:
+        """Maximum injected `num_ctx` across all pending envelopes for `model`.
+
+        Used to size the initial preload so that small first-arrival
+        prompts don't get a tiny slot that gets immediately reloaded
+        when a later (larger) request dispatches.
+        """
+        pending = await self.queues.pending_for_model(model)
+        max_ctx: int | None = None
+        for env in pending:
+            n = self._envelope_num_ctx(env)
+            if n is None:
+                continue
+            if max_ctx is None or n > max_ctx:
+                max_ctx = n
+        return max_ctx
+
+    async def _ensure_model_loaded(
+        self, model: str, num_ctx: int | None = None
+    ) -> bool:
+        """Ensure a model is loaded with at least `num_ctx` slot allocation.
+
+        When `num_ctx` is set and the model is already loaded but at a
+        smaller allocated slot size, this triggers a reload-on-need:
+        drain pending requests for that model, unload it, then preload
+        at the larger size. Reload count is tracked in
+        `metrics.reload_count`.
 
         Args:
             model: The model to load.
+            num_ctx: Required minimum slot allocation; None means "any
+                allocation will do".
 
         Returns:
-            True if the model is now loaded.
+            True if the model is now loaded at the requested size.
         """
         if self.memory.is_loaded(model):
-            return True
+            if num_ctx is None or not self.memory.needs_reload(model, num_ctx):
+                return True
+            # Reload-on-need: existing slot is too small for an
+            # incoming request. Drain first so we don't unload mid-batch.
+            current = self.memory.get_allocated_num_ctx(model)
+            logger.info(
+                "scheduler.reload_for_num_ctx",
+                model=model,
+                current_num_ctx=current,
+                requested_num_ctx=num_ctx,
+            )
+            pending = await self.queues.pending_count(model)
+            if pending > 0:
+                batch = await self.queues.dequeue_batch(model)
+                if batch:
+                    logger.info(
+                        "scheduler.drain_before_reload",
+                        model=model,
+                        request_count=len(batch),
+                    )
+                    await self._process_batch(batch)
+            self.memory.mark_intended_unload(model)
+            await self.lifecycle.unload(model)
+            await self.memory.refresh()
+            self.metrics.reload_count += 1
+            # Fall through to the preload path below.
 
         model_size = await self.registry.get_or_estimate_size(model)
 
@@ -701,9 +810,11 @@ class Scheduler:
                 )
                 return False
 
-        success = await self.lifecycle.preload(model)
+        success = await self.lifecycle.preload(model, num_ctx=num_ctx)
         if success:
             self.metrics.model_swaps += 1
+            if num_ctx is not None:
+                self.memory.record_allocated_num_ctx(model, num_ctx)
             await self.memory.refresh()
         return success
 
@@ -777,6 +888,7 @@ class Scheduler:
                 )
                 await self._process_batch(batch)
 
+        self.memory.mark_intended_unload(target)
         success = await self.lifecycle.unload(target)
         if success:
             self.metrics.evictions += 1

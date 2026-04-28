@@ -164,6 +164,23 @@ class ModelQueues:
             queue = self._queues.get(model)
             return len(queue) if queue else 0
 
+    async def pending_for_model(self, model: str) -> list[RequestEnvelope]:
+        """Snapshot of pending envelopes for a single model.
+
+        Does NOT remove from the queue — used by the scheduler to peek
+        at envelope contents (e.g. compute the max num_ctx across all
+        pending requests for a model before preload).
+
+        Args:
+            model: The model name.
+
+        Returns:
+            List of pending envelopes, oldest first.
+        """
+        async with self._lock:
+            queue = self._queues.get(model)
+            return list(queue) if queue else []
+
     async def total_pending(self) -> int:
         """Get the total number of pending requests across all models.
 

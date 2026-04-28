@@ -41,6 +41,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool-calling program declare "round 1's allocation must already
   fit round 5's growth" without exposing every program to the
   pessimal max-context allocation.
+- **Load-time slot management + reload-on-need** (Surface C1 Dim 4).
+  `lifecycle.preload(model, num_ctx=N)` now passes `options.num_ctx`
+  to Ollama at load time so KV cache slots are allocated at the
+  right size. The scheduler tracks `_allocated_num_ctx_per_model`
+  and, before dispatching any envelope whose computed `num_ctx`
+  exceeds the current allocation, drains pending requests for that
+  model, unloads, and preloads at the larger size. New
+  `reload_count` metric on `SchedulerMetrics` (persisted) lets the
+  dashboard surface frequent-reload warnings.
+- **Detection of Ollama-side memory-pressure evictions** (Surface
+  C2). When marshal observes a model leave `/api/ps` without having
+  called `lifecycle.unload()` itself, it logs
+  `memory.unexpected_unload` (warning) and increments the
+  `unexpected_unloads` counter on `SchedulerMetrics`. Persistent
+  non-zero values indicate Ollama-side memory tuning is needed
+  (e.g. lower `OLLAMA_NUM_PARALLEL`, set
+  `OLLAMA_KV_CACHE_TYPE=q8_0`). The `marshal doctor` CLI (next
+  commit) surfaces specific recommendations.
 
 ### Changed
 
