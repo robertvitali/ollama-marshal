@@ -270,6 +270,55 @@ def dashboard(
 
 
 @app.command()
+def doctor(
+    ollama_host: Annotated[
+        str,
+        typer.Option("--ollama-host", help="Ollama API base URL."),
+    ] = "http://localhost:11434",
+    marshal_host: Annotated[
+        str | None,
+        typer.Option(
+            "--marshal-host",
+            help=(
+                "Optional marshal proxy URL. When set, the report includes "
+                "marshal's unexpected_unloads counter (a non-zero value "
+                "signals Ollama-side memory tuning is needed)."
+            ),
+        ),
+    ] = "http://localhost:11435",
+) -> None:
+    """Diagnose Ollama memory thrashing and recommend tuning env vars.
+
+    Reads /api/tags + /api/show + /api/ps to compute KV cache demand
+    for each installed model, compares against system RAM, and prints
+    specific OLLAMA_* environment variables to set in your launchd
+    plist or systemd unit. Runs offline — no marshal proxy required
+    (though if marshal is up, the report includes its observed
+    unexpected_unloads counter).
+    """
+    import asyncio
+
+    from ollama_marshal.doctor import gather_report, render_report
+
+    async def _run() -> str:
+        marshal_status_url = (
+            f"{marshal_host}/api/marshal/status" if marshal_host else None
+        )
+        report = await gather_report(
+            ollama_host=ollama_host,
+            marshal_status_url=marshal_status_url,
+        )
+        return render_report(report)
+
+    try:
+        rendered = asyncio.run(_run())
+    except (httpx.HTTPError, OSError) as exc:
+        typer.echo(f"Error: doctor probe failed: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(rendered)
+
+
+@app.command()
 def stop(
     host: Annotated[
         str,

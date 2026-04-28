@@ -57,8 +57,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unexpected_unloads` counter on `SchedulerMetrics`. Persistent
   non-zero values indicate Ollama-side memory tuning is needed
   (e.g. lower `OLLAMA_NUM_PARALLEL`, set
-  `OLLAMA_KV_CACHE_TYPE=q8_0`). The `marshal doctor` CLI (next
-  commit) surfaces specific recommendations.
+  `OLLAMA_KV_CACHE_TYPE=q8_0`). The `marshal doctor` CLI (next)
+  surfaces specific recommendations.
+- **`marshal doctor` CLI subcommand** (Surface C3). Diagnostic
+  command that reads `/api/tags`, `/api/show`, and `/api/ps`,
+  computes per-model KV cache demand, and recommends specific
+  `OLLAMA_*` env vars to set in the launchd plist or systemd unit:
+  `OLLAMA_KV_CACHE_TYPE=q8_0` (halves KV cache size),
+  `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_NUM_PARALLEL` (computed from
+  worst-case KV demand vs system RAM, capped at 4),
+  `OLLAMA_MAX_LOADED_MODELS` (computed from mean KV demand). When
+  marshal is reachable, the report includes the live
+  `unexpected_unloads` counter so the user can confirm tuning
+  worked: a non-zero value drops to 0 after applying the
+  recommendations.
 
 ### Changed
 
