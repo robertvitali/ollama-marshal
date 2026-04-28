@@ -1012,7 +1012,8 @@ class TestIdleEvictUnusedModels:
         sched.memory.get_loaded_models.return_value = {"foo": object()}
         # Mark "foo" as idle for 16 minutes (threshold is 15).
         sched._last_activity["foo"] = time.monotonic() - (16 * 60)
-        sched.queues.pending_count = AsyncMock(return_value=0)
+        # Real empty ModelQueues — pending_count returns 0 naturally,
+        # so the scheduler's "no pending requests" guard is satisfied.
 
         await sched._idle_evict_unused_models()
 
@@ -1026,8 +1027,11 @@ class TestIdleEvictUnusedModels:
         sched = _make_scheduler(config=cfg)
         sched.memory.get_loaded_models.return_value = {"foo": object()}
         sched._last_activity["foo"] = time.monotonic() - (16 * 60)
-        # Pending > 0 — never time-evict.
-        sched.queues.pending_count = AsyncMock(return_value=2)
+        # Real ModelQueues with 2 envelopes for "foo" — pending_count
+        # naturally returns 2, exercising the "skip if pending > 0" path
+        # without mocking an internal method.
+        await sched.queues.enqueue(_make_envelope(model="foo"))
+        await sched.queues.enqueue(_make_envelope(model="foo"))
 
         await sched._idle_evict_unused_models()
 
@@ -1062,7 +1066,7 @@ class TestIdleEvictUnusedModels:
         old_ts = time.monotonic() - (20 * 60)
         sched._last_activity["foo"] = old_ts
         sched._last_activity["bar"] = old_ts
-        sched.queues.pending_count = AsyncMock(return_value=0)
+        # Real empty ModelQueues — pending_count returns 0 for both models.
 
         await sched._idle_evict_unused_models()
 

@@ -42,6 +42,12 @@ DEFAULT_REFRESH_HZ = 2.0  # render rate, clamped to [0.5, 10.0]
 _MAX_POLL_HZ = 5.0
 _MIN_REFRESH_HZ = 0.5
 _MAX_REFRESH_HZ = 10.0
+# Status-poll request timeout. Distinct from `proxy.request_timeout_s`
+# (inference timeout) — this is a UI-side budget for "is marshal alive
+# right now?" snapshot fetches. 2s is generous for a localhost JSON GET;
+# beyond that we'd rather show a stale snapshot than block the render
+# loop.
+_STATUS_POLL_TIMEOUT_S = 2.0
 
 # Match the lifecycle and scheduling events worth showing.
 # Superset of the legacy `tail | grep "scheduler\.|request_(enqueued|served|
@@ -118,7 +124,7 @@ def fetch_status(url: str) -> StatusSnapshot:
     don't need a try/except — the renderer handles error display).
     """
     try:
-        r = httpx.get(f"{url}/api/marshal/status", timeout=2)
+        r = httpx.get(f"{url}/api/marshal/status", timeout=_STATUS_POLL_TIMEOUT_S)
         r.raise_for_status()
         d = r.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -140,7 +146,9 @@ async def fetch_status_async(client: httpx.AsyncClient, url: str) -> StatusSnaps
     waiting on marshal.
     """
     try:
-        r = await client.get(f"{url}/api/marshal/status", timeout=2)
+        r = await client.get(
+            f"{url}/api/marshal/status", timeout=_STATUS_POLL_TIMEOUT_S
+        )
         r.raise_for_status()
         d = r.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -265,49 +273,6 @@ def render_memory(status: StatusSnapshot) -> Panel:
             border_style="cyan",
         )
 
-    grid = Table.grid(padding=(0, 1), expand=True)
-    grid.add_column(ratio=3)
-    grid.add_column(ratio=1, justify="right")
-
-    # Row 1: System RAM (actual host) — most important
-    if status.sys_total > 0:
-        sys_pct = status.sys_percent
-        sys_total_gb = status.sys_total / (1024**3)
-        sys_used_gb = status.sys_used / (1024**3)
-        grid.add_row(
-            Text.assemble(
-                ("System ", "dim"),
-                (
-                    str(
-                        ProgressBar(
-                            total=100,
-                            completed=sys_pct,
-                            complete_style=_bar_color(sys_pct),
-                        )
-                    ),
-                    "",
-                ),
-            ),
-            Text.assemble(
-                (f"{sys_used_gb:.1f}", "bold"),
-                (" / ", "dim"),
-                (f"{sys_total_gb:.1f} GB", "bold"),
-                (f"  ({sys_pct:.1f}%)", "dim"),
-            ),
-        )
-        # The above str(ProgressBar) trick doesn't render bars properly; use a sub-grid.
-        sub = Table.grid(padding=(0, 1), expand=True)
-        sub.add_column(no_wrap=True)
-        sub.add_column(ratio=1)
-        sub.add_row(
-            Text("System", style="dim"),
-            ProgressBar(
-                total=100, completed=sys_pct, complete_style=_bar_color(sys_pct)
-            ),
-        )
-        # Replace the malformed row above by re-doing it properly.
-
-    # Rebuild grid cleanly (the above experiment was confused).
     grid = Table.grid(padding=(0, 1), expand=True)
     grid.add_column(ratio=3)
     grid.add_column(ratio=1, justify="right")
@@ -595,16 +560,21 @@ async def log_follower(state: dict[str, Any], log_path: Path) -> None:
     if state.get("stopped"):
         return
 
+    # File I/O on this path is normally fast (local disk, line-buffered
+    # marshal log), but on a slow filesystem (NFS, throttled SSD) seek/
+    # readline can block the event loop. Wrap them in asyncio.to_thread
+    # so the render loop and status poller stay responsive. Avoids adding
+    # aiofiles as a new dependency.
     try:
-        f = log_path.open("r")
+        f = await asyncio.to_thread(log_path.open, "r")
     except OSError as exc:
         state["log_error"] = f"cannot read {log_path}: {exc}"
         return
 
     try:
-        f.seek(0, 2)  # start at end
+        await asyncio.to_thread(f.seek, 0, 2)  # start at end
         while not state.get("stopped"):
-            line = f.readline()
+            line = await asyncio.to_thread(f.readline)
             if line:
                 event = parse_log_line(line)
                 if event is not None:
@@ -615,7 +585,7 @@ async def log_follower(state: dict[str, Any], log_path: Path) -> None:
                 except asyncio.CancelledError:
                     return
     finally:
-        f.close()
+        await asyncio.to_thread(f.close)
 
 
 async def render_loop(

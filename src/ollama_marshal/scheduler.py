@@ -127,10 +127,12 @@ class Scheduler:
     async def _tick(self) -> None:
         """One iteration of the scheduler loop.
 
-        1. Forward requests for loaded models (immediate)
-        2. Handle unskippable requests (fairness enforcement)
-        3. Bin-pack fitting models into remaining VRAM
-        4. Increment skip counters for remaining requests
+        1. Forward requests for already-loaded models (immediate)
+        2. Handle critical-priority preemption (load critical model now)
+        3. Handle unskippable requests (fairness enforcement)
+        4. Bin-pack fitting models into remaining VRAM
+        5. Idle eviction — unload models that have been quiet longer than
+           `scheduler.idle_eviction_minutes` (0 disables)
         """
         # Step 1: Forward requests for models already loaded
         await self._forward_loaded_model_requests()
