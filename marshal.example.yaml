@@ -40,6 +40,20 @@ scheduler:
                                     # 2. Raise this value to match.
                                     # Marshal scales actual concurrency with queue depth (a
                                     # 1-envelope queue still serves 1 at a time).
+  burst_hint_ttl_s: 30.0           # MARSHAL_SCHEDULER_BURST_HINT_TTL_S — seconds an
+                                    # X-Burst-Size hint stays active without renewal. Programs
+                                    # that pace tool-calling slower than this need to raise it.
+  burst_hint_cap_multiplier: 4     # Per-pair burst cap = max_skips × this (default 12).
+  burst_hint_aggregate_multiplier: 8  # Per-model summed cap = max_skips × this (default 24).
+                                       # Defends against program_id-flooding attacks.
+  burst_hint_max_live: 256         # Max live (program, model) hints stored. New pairs are
+                                    # dropped when full; existing pair refreshes always succeed.
+  metrics_path: "~/.ollama-marshal/metrics.json"   # MARSHAL_SCHEDULER_METRICS_PATH —
+                                                    # where lifetime counters persist across
+                                                    # restarts.
+  metrics_persist_interval_s: 60.0 # MARSHAL_SCHEDULER_METRICS_PERSIST_INTERVAL_S — seconds
+                                    # between background metrics snapshots. Lower = tighter
+                                    # crash recovery, higher = less disk wear.
 
 # Per-program configuration
 # Programs identify themselves via the X-Program-ID header.

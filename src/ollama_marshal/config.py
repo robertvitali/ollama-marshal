@@ -114,6 +114,61 @@ class SchedulerConfig(BaseModel):
             "with queue depth (a 1-envelope queue still serves 1 at a time)."
         ),
     )
+    burst_hint_ttl_s: float = Field(
+        default=30.0,
+        description=(
+            "Seconds an X-Burst-Size hint stays active without renewal. "
+            "Each request from the same program-model pair refreshes the "
+            "timer; after this many seconds of silence the hint expires "
+            "and falls back to actual queue depth. Programs that pace "
+            "their tool-calling loops slower than this default will need "
+            "to raise the value."
+        ),
+    )
+    burst_hint_cap_multiplier: int = Field(
+        default=4,
+        description=(
+            "Per-pair X-Burst-Size cap = max_skips * this. With defaults "
+            "(max_skips=3, multiplier=4) a single program can claim up to "
+            "12 boost on its model. Caps adversarial header values."
+        ),
+    )
+    burst_hint_aggregate_multiplier: int = Field(
+        default=8,
+        description=(
+            "Per-model aggregate burst-boost cap = max_skips * this. "
+            "Even if many distinct program_ids each register hints at "
+            "the per-pair cap, the per-model summed boost is clamped at "
+            "this value. Defends against program_id-flooding attacks."
+        ),
+    )
+    burst_hint_max_live: int = Field(
+        default=256,
+        description=(
+            "Max number of live (program_id, model) burst-hint entries "
+            "stored at any time. New pairs are dropped (record returns 0) "
+            "when the dict is at capacity. Refreshing an existing pair "
+            "always succeeds. Prevents memory exhaustion from flooded "
+            "distinct pairs within the TTL window."
+        ),
+    )
+    metrics_path: str = Field(
+        default="~/.ollama-marshal/metrics.json",
+        description=(
+            "Path to the persisted-metrics JSON file. Lifetime counters "
+            "(requests_served, model_swaps, evictions, total_wait_ms) "
+            "are restored from this file on startup and saved on shutdown "
+            "+ every metrics_persist_interval_s seconds during runtime."
+        ),
+    )
+    metrics_persist_interval_s: float = Field(
+        default=60.0,
+        description=(
+            "Seconds between background metrics-snapshot writes. Trades "
+            "off disk wear vs. data-loss window on hard crash. Lower = "
+            "tighter recovery, higher disk I/O; higher = vice versa."
+        ),
+    )
 
 
 class ProgramConfig(BaseModel):
@@ -266,10 +321,18 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 "request_timeout_s",
                 "idle_eviction_minutes",
                 "parallel_per_model",
+                "burst_hint_cap_multiplier",
+                "burst_hint_aggregate_multiplier",
+                "burst_hint_max_live",
                 "retention_days",
                 "max_size_mb",
             ):
                 data[section][field] = int(value)
+            elif field in (
+                "burst_hint_ttl_s",
+                "metrics_persist_interval_s",
+            ):
+                data[section][field] = float(value)
             elif field in ("unload_models", "enabled"):
                 data[section][field] = value.lower() in ("true", "1", "yes")
             else:

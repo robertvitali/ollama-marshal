@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -339,6 +338,3 @@ class _NullAuditLogger:
 
 # Singleton — safe to reuse since it has no state.
 NULL_AUDIT = _NullAuditLogger()
-# Reference `time` so ruff doesn't flag the import as unused; we may use
-# it in future flush-loop tracing.
-_ = time

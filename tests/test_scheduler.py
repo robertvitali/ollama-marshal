@@ -1380,21 +1380,27 @@ class TestProcessBatchParallelism:
 
     async def test_default_serializes(self):
         # parallel_per_model=1 (default) → at most 1 in flight at a time.
+        # Patches `forward_request` (the Ollama HTTP boundary imported
+        # into scheduler.py), NOT `_forward_single` — per CLAUDE.md
+        # bright-line #1, tests must not patch internal ollama_marshal
+        # methods. `forward_request` is the legitimate mock target.
         sched = _make_scheduler()
-        # Five envelopes all for the same model.
         batch = [_make_envelope(model="m") for _ in range(5)]
 
         in_flight = 0
         peak = 0
 
-        async def fake_forward(env):
+        async def fake_request(*_args, **_kwargs):
             nonlocal in_flight, peak
             in_flight += 1
             peak = max(peak, in_flight)
             await asyncio.sleep(0.005)
             in_flight -= 1
+            return MagicMock()
 
-        with patch.object(sched, "_forward_single", side_effect=fake_forward):
+        with patch(
+            "ollama_marshal.scheduler.forward_request", side_effect=fake_request
+        ):
             await sched._process_batch(batch)
 
         assert peak == 1  # current behavior: serial
@@ -1407,14 +1413,17 @@ class TestProcessBatchParallelism:
         in_flight = 0
         peak = 0
 
-        async def fake_forward(env):
+        async def fake_request(*_args, **_kwargs):
             nonlocal in_flight, peak
             in_flight += 1
             peak = max(peak, in_flight)
             await asyncio.sleep(0.005)
             in_flight -= 1
+            return MagicMock()
 
-        with patch.object(sched, "_forward_single", side_effect=fake_forward):
+        with patch(
+            "ollama_marshal.scheduler.forward_request", side_effect=fake_request
+        ):
             await sched._process_batch(batch)
 
         # Cap at parallel_per_model. (Could be < 4 if scheduling jitter
@@ -1434,30 +1443,34 @@ class TestProcessBatchParallelism:
         in_flight = 0
         peak = 0
 
-        async def fake_forward(env):
+        async def fake_request(*_args, **_kwargs):
             nonlocal in_flight, peak
             in_flight += 1
             peak = max(peak, in_flight)
             await asyncio.sleep(0.005)
             in_flight -= 1
+            return MagicMock()
 
-        with patch.object(sched, "_forward_single", side_effect=fake_forward):
+        with patch(
+            "ollama_marshal.scheduler.forward_request", side_effect=fake_request
+        ):
             await sched._process_batch(batch)
 
         assert peak == 5  # all 5 embeddings ran concurrently
 
     async def test_semaphore_releases_on_exception(self):
-        # If _forward_single raises, the semaphore must still release;
+        # If forward_request raises, the semaphore must still release;
         # otherwise a single failure permanently shrinks the cap.
         cfg = _make_config(**{"scheduler.parallel_per_model": 2})
         sched = _make_scheduler(config=cfg)
         batch = [_make_envelope(model="m") for _ in range(4)]
 
-        async def bad_forward(env):
+        async def bad_request(*_args, **_kwargs):
             raise RuntimeError("boom")
 
-        with patch.object(sched, "_forward_single", side_effect=bad_forward):
-            # asyncio.gather(return_exceptions=True) swallows them.
+        with patch("ollama_marshal.scheduler.forward_request", side_effect=bad_request):
+            # _forward_single catches and logs; gather(return_exceptions)
+            # swallows what's left.
             await sched._process_batch(batch)
 
         # All 4 should have been attempted (semaphore released after each).

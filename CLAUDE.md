@@ -20,8 +20,13 @@ src/ollama_marshal/    — package source (12 modules)
 tests/                 — pytest unit + integration tests
 ```
 
-Modules in dependency order: config → queue → registry → memory → lifecycle
-→ audit → scheduler → stream → openai_compat → server → dashboard → cli
+Modules in dependency order: config → audit → queue → registry → memory →
+lifecycle → scheduler → stream → openai_compat → server → dashboard → cli
+
+(`audit.py` only depends on `config.py` — listed near the top to reflect
+the actual import graph. The scheduler intentionally avoids importing
+audit directly; it gets a duck-typed audit instance via `Scheduler.audit`
+attribute injection from the server lifespan.)
 
 ## Development Commands
 

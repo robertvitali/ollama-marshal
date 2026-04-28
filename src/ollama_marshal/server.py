@@ -32,15 +32,6 @@ from ollama_marshal.registry import ModelRegistry
 from ollama_marshal.scheduler import Scheduler, SchedulerMetrics
 from ollama_marshal.stream import forward_passthrough
 
-# Where lifetime metrics survive across restarts. Same dir pattern as
-# `model_sizes.json`. Override via `app.state.metrics_path` for tests.
-_DEFAULT_METRICS_PATH = Path.home() / ".ollama-marshal" / "metrics.json"
-
-# How often the background task rewrites the metrics snapshot. Trades
-# off freshness against disk wear; 60s loses at most a minute of
-# counters on a hard crash, which is acceptable for lifetime metrics.
-_METRICS_PERSIST_INTERVAL_S = 60.0
-
 logger = structlog.get_logger()
 
 # Module-level state (initialized in lifespan)
@@ -81,8 +72,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Restore lifetime metrics from disk so counters (requests_served,
     # model_swaps, evictions, total_wait_ms) survive restarts. Falls
-    # back to fresh on any failure (logs a warning).
-    metrics_path = getattr(app.state, "metrics_path", _DEFAULT_METRICS_PATH)
+    # back to fresh on any failure (logs a warning). Path comes from
+    # config (overridable per-test via app.state.metrics_path).
+    metrics_path = Path(
+        getattr(app.state, "metrics_path", _config.scheduler.metrics_path)
+    ).expanduser()
     restored = SchedulerMetrics.load_from(metrics_path)
     # Preserve the freshly-set started_at; only seed the persisted counters.
     _scheduler.metrics.requests_served = restored.requests_served
@@ -108,12 +102,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Start background tasks
     await _memory.start_polling()
     await _registry.initialize()
-    asyncio.create_task(_registry.benchmark_unknown())
+    # Store the task reference per CLAUDE.md async correctness rule —
+    # without this, Python may garbage-collect the task before it runs
+    # to completion (and emit a warning on 3.12+).
+    benchmark_task = asyncio.create_task(_registry.benchmark_unknown())
     await _scheduler.start()
 
     # Periodically snapshot metrics to disk so a hard crash loses at
-    # most _METRICS_PERSIST_INTERVAL_S of counter data.
-    metrics_persister = asyncio.create_task(_persist_metrics_loop(metrics_path))
+    # most metrics_persist_interval_s of counter data.
+    metrics_persister = asyncio.create_task(
+        _persist_metrics_loop(
+            metrics_path, _config.scheduler.metrics_persist_interval_s
+        )
+    )
 
     logger.info(
         "server.started",
@@ -129,6 +130,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await metrics_persister
     except asyncio.CancelledError:
         pass
+    # Cancel the benchmark task too — if it's still running on shutdown,
+    # we don't want to wait for it to finish probing every model.
+    if not benchmark_task.done():
+        benchmark_task.cancel()
+        try:
+            await benchmark_task
+        except asyncio.CancelledError:
+            pass
 
     # Shutdown — drain BEFORE stopping the scheduler so requests
     # can still be processed during the drain phase
@@ -163,8 +172,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("server.stopped")
 
 
-async def _persist_metrics_loop(path: Path) -> None:
-    """Background task: rewrite metrics snapshot every N seconds.
+async def _persist_metrics_loop(path: Path, interval_s: float) -> None:
+    """Background task: rewrite metrics snapshot every `interval_s` seconds.
 
     Disk write is hoisted to a thread (asyncio.to_thread) so a slow disk
     can't briefly stall the event loop and starve request dispatch.
@@ -172,7 +181,7 @@ async def _persist_metrics_loop(path: Path) -> None:
     """
     while True:
         try:
-            await asyncio.sleep(_METRICS_PERSIST_INTERVAL_S)
+            await asyncio.sleep(interval_s)
         except asyncio.CancelledError:
             return
         sched = globals().get("_scheduler")
@@ -512,6 +521,10 @@ async def _enqueue_inference(
         stream=stream,
     )
 
+    # Defensive: a client sending `options: null` (the JSON literal, not
+    # an absent key) returns None from .get("options", {}) — chaining
+    # .get on None would crash. Coerce to dict before reading num_ctx.
+    options = body.get("options") or {}
     logger.info(
         "server.request_enqueued",
         model=model,
@@ -519,7 +532,7 @@ async def _enqueue_inference(
         endpoint=endpoint,
         stream=stream,
         timeout_s=timeout_s,
-        num_ctx=body.get("options", {}).get("num_ctx"),
+        num_ctx=options.get("num_ctx") if isinstance(options, dict) else None,
     )
 
     await _queues.enqueue(envelope)

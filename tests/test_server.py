@@ -971,6 +971,85 @@ class TestLifespan:
         # Final shutdown save creates the file.
         assert (tmp_path / "fresh.json").exists()
 
+    async def test_lifespan_cancels_running_benchmark_on_shutdown(self, tmp_path):
+        """If benchmark_unknown is still running at shutdown, it must be cancelled."""
+        config = MarshalConfig()
+        config.scheduler.metrics_path = str(tmp_path / "metrics.json")
+        app = create_app(config)
+
+        memory, registry, lifecycle, scheduler, queues = _make_mock_components()
+        from ollama_marshal.scheduler import SchedulerMetrics as RealMetrics
+
+        scheduler.metrics = RealMetrics()
+
+        # Long-running benchmark — would never complete on its own.
+        async def slow_benchmark():
+            await asyncio.sleep(60)
+
+        registry.benchmark_unknown = slow_benchmark
+
+        with (
+            patch("ollama_marshal.server.MemoryManager", return_value=memory),
+            patch("ollama_marshal.server.ModelRegistry", return_value=registry),
+            patch(
+                "ollama_marshal.server.ModelLifecycle",
+                return_value=lifecycle,
+            ),
+            patch("ollama_marshal.server.Scheduler", return_value=scheduler),
+            patch("ollama_marshal.server.ModelQueues", return_value=queues),
+        ):
+            async with server_mod.lifespan(app):
+                pass
+        # If the cancel branch didn't execute, the lifespan would hang
+        # for 60s; the fact this test returned in milliseconds proves
+        # the task was cancelled cleanly.
+
+    async def test_lifespan_starts_audit_logger_when_enabled(self, tmp_path):
+        """audit.enabled=True wires a real AuditLogger into the scheduler."""
+        from ollama_marshal.audit import AuditLogger
+        from ollama_marshal.config import AuditConfig
+
+        config = MarshalConfig()
+        config.scheduler.metrics_path = str(tmp_path / "metrics.json")
+        config.audit = AuditConfig(
+            enabled=True,
+            path=str(tmp_path / "audit.jsonl"),
+            retention_days=0,
+            max_size_mb=0,
+        )
+        app = create_app(config)
+
+        memory, registry, lifecycle, scheduler, queues = _make_mock_components()
+        from ollama_marshal.scheduler import SchedulerMetrics as RealMetrics
+
+        scheduler.metrics = RealMetrics()
+        # Capture what gets installed on scheduler.audit.
+        installed_audit = []
+
+        def capture_audit(value):
+            installed_audit.append(value)
+
+        type(scheduler).audit = property(
+            lambda self: installed_audit[-1] if installed_audit else None,
+            lambda self, v: capture_audit(v),
+        )
+
+        with (
+            patch("ollama_marshal.server.MemoryManager", return_value=memory),
+            patch("ollama_marshal.server.ModelRegistry", return_value=registry),
+            patch(
+                "ollama_marshal.server.ModelLifecycle",
+                return_value=lifecycle,
+            ),
+            patch("ollama_marshal.server.Scheduler", return_value=scheduler),
+            patch("ollama_marshal.server.ModelQueues", return_value=queues),
+        ):
+            async with server_mod.lifespan(app):
+                # A real AuditLogger must have been installed on scheduler.
+                assert installed_audit, "no audit installed on scheduler"
+                assert isinstance(installed_audit[-1], AuditLogger)
+                assert installed_audit[-1].enabled is True
+
 
 # ---------------------------------------------------------------------------
 # Route handler bodies via direct invocation

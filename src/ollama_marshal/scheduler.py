@@ -434,8 +434,14 @@ class Scheduler:
         # X-Burst-Size hints (sequential-submission programs declaring
         # "I have more requests coming for this model"). Used by the
         # eviction scorer to keep loaded models alive across silent gaps
-        # between same-program calls.
-        self.burst_hints = BurstHints()
+        # between same-program calls. Tunables come from SchedulerConfig
+        # so operators can override TTL/caps without recompiling.
+        self.burst_hints = BurstHints(
+            ttl_s=config.scheduler.burst_hint_ttl_s,
+            cap_multiplier=config.scheduler.burst_hint_cap_multiplier,
+            max_live=config.scheduler.burst_hint_max_live,
+            aggregate_multiplier=config.scheduler.burst_hint_aggregate_multiplier,
+        )
         # Per-model concurrent-dispatch gate. parallel_per_model defaults
         # to 1 (current sequential behavior). When raised, _process_batch
         # fans out same-model envelopes through this semaphore.
