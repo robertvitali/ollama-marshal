@@ -788,16 +788,12 @@ class TestUnexpectedUnloadDetection:
         # Marking intended-unload should consume the marker so a later
         # unexpected unload of the same name still triggers.
         manager = _make_manager()
-        manager._loaded_models = {
-            "x:1": LoadedModel(name="x:1", size_vram=1)
-        }
+        manager._loaded_models = {"x:1": LoadedModel(name="x:1", size_vram=1)}
         manager.mark_intended_unload("x:1")
         manager._update_from_ps({"models": []})  # intended — no count
         assert manager.unexpected_unloads_observed == 0
 
         # Now load + unexpected-unload again; should count.
-        manager._update_from_ps(
-            {"models": [{"name": "x:1", "size_vram": 1}]}
-        )
+        manager._update_from_ps({"models": [{"name": "x:1", "size_vram": 1}]})
         manager._update_from_ps({"models": []})
         assert manager.unexpected_unloads_observed == 1

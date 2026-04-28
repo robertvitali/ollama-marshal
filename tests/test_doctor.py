@@ -224,9 +224,7 @@ class TestGatherReport:
             yield m
 
     async def test_returns_empty_when_tags_unreachable(self, mock_psutil):
-        with patch(
-            "ollama_marshal.doctor.ModelRegistry"
-        ) as mock_reg_cls:
+        with patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls:
             mock_reg = MagicMock()
             mock_reg._fetch_model_list = AsyncMock(
                 side_effect=httpx.HTTPError("ollama down")
@@ -264,9 +262,7 @@ class TestGatherReport:
 
         with (
             patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
-            patch(
-                "ollama_marshal.doctor.httpx.AsyncClient"
-            ) as mock_client_cls,
+            patch("ollama_marshal.doctor.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_reg = MagicMock()
             mock_reg._fetch_model_list = AsyncMock(return_value=["x"])
@@ -301,9 +297,7 @@ class TestGatherReport:
 
         with (
             patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
-            patch(
-                "ollama_marshal.doctor.httpx.AsyncClient"
-            ) as mock_client_cls,
+            patch("ollama_marshal.doctor.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_reg = MagicMock()
             mock_reg._fetch_model_list = AsyncMock(return_value=["unprobeable:x"])
@@ -349,9 +343,7 @@ class TestGatherReport:
 
         with (
             patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
-            patch(
-                "ollama_marshal.doctor.httpx.AsyncClient"
-            ) as mock_client_cls,
+            patch("ollama_marshal.doctor.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_reg = MagicMock()
             mock_reg._fetch_model_list = AsyncMock(return_value=["x"])
@@ -382,9 +374,7 @@ class TestGatherReport:
 
         with (
             patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
-            patch(
-                "ollama_marshal.doctor.httpx.AsyncClient"
-            ) as mock_client_cls,
+            patch("ollama_marshal.doctor.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_reg = MagicMock()
             mock_reg._fetch_model_list = AsyncMock(return_value=[])
@@ -404,9 +394,7 @@ class TestGatherReport:
         # Marshal unreachable mid-probe → counter stays None, no crash.
         assert report.unexpected_unloads is None
 
-    async def test_unexpected_unloads_handles_non_int_payload(
-        self, mock_psutil
-    ):
+    async def test_unexpected_unloads_handles_non_int_payload(self, mock_psutil):
         async def fake_get(url, *args, **kwargs):
             resp = MagicMock()
             resp.raise_for_status = MagicMock()
@@ -421,9 +409,7 @@ class TestGatherReport:
 
         with (
             patch("ollama_marshal.doctor.ModelRegistry") as mock_reg_cls,
-            patch(
-                "ollama_marshal.doctor.httpx.AsyncClient"
-            ) as mock_client_cls,
+            patch("ollama_marshal.doctor.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_reg = MagicMock()
             mock_reg._fetch_model_list = AsyncMock(return_value=[])

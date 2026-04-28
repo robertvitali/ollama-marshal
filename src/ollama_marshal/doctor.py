@@ -104,9 +104,7 @@ async def gather_report(
         all_names = await registry._fetch_model_list()
     except httpx.HTTPError:
         logger.warning("doctor.tags_unreachable")
-        return DoctorReport(
-            total_ram_bytes=total_ram, loaded_models=[], all_models=[]
-        )
+        return DoctorReport(total_ram_bytes=total_ram, loaded_models=[], all_models=[])
 
     loaded_names_with_size = await _fetch_loaded(ollama_host)
 
@@ -147,9 +145,7 @@ async def gather_report(
     _populate_recommendations(report)
 
     if marshal_status_url is not None:
-        report.unexpected_unloads = await _fetch_unexpected_unloads(
-            marshal_status_url
-        )
+        report.unexpected_unloads = await _fetch_unexpected_unloads(marshal_status_url)
 
     return report
 
@@ -217,8 +213,7 @@ def _populate_recommendations(report: DoctorReport) -> None:
     largest = _largest_kv_cost_model(report.all_models)
     if largest is None:
         report.notes.append(
-            "No probed model metadata available; skipping NUM_PARALLEL "
-            "recommendation."
+            "No probed model metadata available; skipping NUM_PARALLEL recommendation."
         )
         return
 

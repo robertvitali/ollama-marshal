@@ -1169,7 +1169,7 @@ class TestEstimatePromptTokens:
     def test_counts_chat_messages(self):
         body = {
             "messages": [
-                {"role": "user", "content": "abc"},      # 3
+                {"role": "user", "content": "abc"},  # 3
                 {"role": "assistant", "content": "defg"},  # 4
             ],
         }
@@ -1193,10 +1193,7 @@ class TestEstimatePromptTokens:
 
     def test_handles_non_dict_messages(self):
         # Defensive: malformed input shouldn't crash the estimator.
-        assert (
-            server_mod._estimate_prompt_tokens({"messages": "not a list"})
-            == 0
-        )
+        assert server_mod._estimate_prompt_tokens({"messages": "not a list"}) == 0
 
     def test_handles_messages_with_non_dict_entries(self):
         body = {"messages": ["not a dict", None, 42]}

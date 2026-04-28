@@ -988,8 +988,7 @@ class Scheduler:
                 # ReadTimeout. Tool-calling chats are not.
                 allow_read_retry = (
                     retry_cfg.retry_read_timeouts
-                    or envelope.endpoint
-                    in ("/api/embeddings", "/v1/embeddings")
+                    or envelope.endpoint in ("/api/embeddings", "/v1/embeddings")
                 )
                 # request_id correlates retries in logs; envelope object
                 # id is unique within the process and cheap.

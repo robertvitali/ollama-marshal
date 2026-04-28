@@ -1193,9 +1193,7 @@ class TestEnsureModelLoadedReloadOnNeed:
         with patch.object(
             sched, "_process_batch", new_callable=AsyncMock
         ) as mock_process:
-            result = await sched._ensure_model_loaded(
-                "llama3:latest", num_ctx=32768
-            )
+            result = await sched._ensure_model_loaded("llama3:latest", num_ctx=32768)
 
         assert result is True
         # Drain ran.
@@ -1230,16 +1228,10 @@ class TestUnexpectedUnloadsRollup:
             patch.object(
                 sched, "_forward_loaded_model_requests", new_callable=AsyncMock
             ),
-            patch.object(
-                sched, "_handle_critical_preemption", new_callable=AsyncMock
-            ),
-            patch.object(
-                sched, "_handle_unskippable_requests", new_callable=AsyncMock
-            ),
+            patch.object(sched, "_handle_critical_preemption", new_callable=AsyncMock),
+            patch.object(sched, "_handle_unskippable_requests", new_callable=AsyncMock),
             patch.object(sched, "_bin_pack_models", new_callable=AsyncMock),
-            patch.object(
-                sched, "_idle_evict_unused_models", new_callable=AsyncMock
-            ),
+            patch.object(sched, "_idle_evict_unused_models", new_callable=AsyncMock),
         ):
             await sched._tick()
 

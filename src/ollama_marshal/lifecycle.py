@@ -71,9 +71,7 @@ class ModelLifecycle:
                 # Wait for model to appear in /api/ps
                 loaded = await self._wait_for_model(client, model)
                 if loaded:
-                    logger.info(
-                        "lifecycle.preloaded", model=model, num_ctx=num_ctx
-                    )
+                    logger.info("lifecycle.preloaded", model=model, num_ctx=num_ctx)
                 else:
                     logger.warning("lifecycle.preload_timeout", model=model)
                 return loaded
