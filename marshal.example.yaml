@@ -64,3 +64,17 @@ shutdown:
 logging:
   level: INFO                      # MARSHAL_LOGGING_LEVEL — DEBUG | INFO | WARNING | ERROR
   format: console                  # MARSHAL_LOGGING_FORMAT — console (colored) | json
+
+# Audit log (optional, off by default).
+# When enabled, marshal appends one JSON record per request lifecycle event
+# to a JSONL file. Records contain METADATA ONLY — never prompt text or
+# response content — so the audit file is safe to share with compliance
+# teams or store long-term.
+audit:
+  enabled: false                   # MARSHAL_AUDIT_ENABLED — opt-in feature flag
+  path: "~/.ollama-marshal/audit.jsonl"   # MARSHAL_AUDIT_PATH — JSONL output file
+  retention_days: 30               # MARSHAL_AUDIT_RETENTION_DAYS — auto-delete entries
+                                    # older than N days. 0 disables retention.
+  max_size_mb: 100                 # MARSHAL_AUDIT_MAX_SIZE_MB — rotate the audit file
+                                    # (.1, .2, ... up to 5 generations) when it exceeds
+                                    # this size. 0 disables rotation.

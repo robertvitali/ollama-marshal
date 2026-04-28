@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-28
+
+### Added
+
+- **`X-Burst-Size` header** — programs that submit work sequentially
+  (e.g. tool-calling loops where each call blocks on the previous
+  one's response) can now declare expected total demand via
+  `X-Burst-Size: N` on each request. Marshal's eviction scorer treats
+  the program-model pair as if it had `actual_pending + N` queued
+  requests, protecting the model from being evicted mid-burst even
+  when only one envelope is currently visible. Hint expires 30s after
+  the last refresh; capped server-side at `max_skips × 4` so an
+  adversarial header can't starve other programs.
+- **Per-model `parallel_per_model` dispatch limit** — new
+  `scheduler.parallel_per_model` config field (default 1, preserves
+  v0.2.x behavior). When raised — and Ollama is started with
+  `OLLAMA_NUM_PARALLEL >= N` — same-model envelopes fan out through
+  an `asyncio.Semaphore` and Ollama's pre-allocated KV cache slots
+  serve them in parallel. Adapts naturally to queue depth: a 1-deep
+  queue still serves 1 at a time.
+- **Per-model architecture metadata probe** — on first sight of a
+  model, marshal calls `/api/show` to extract `context_length`,
+  `block_count`, `embedding_length`, `attention.head_count`,
+  `attention.head_count_kv`. Cached at
+  `~/.ollama-marshal/model_metadata.json`. Provides the foundation
+  for context-window enforcement and parallelism math.
+- **Context window enforcement** — marshal now injects
+  `options.num_ctx = model_max_context` on every proxied inference
+  request that doesn't already set one. Stops Ollama from silently
+  truncating context to fit its slot allocation, which previously
+  caused a model that supports 32K to quietly run with 4K with no
+  error or warning. Client-set `num_ctx` is preserved.
+- **Persisted scheduler metrics** — `requests_served`, `model_swaps`,
+  `evictions`, `total_wait_ms` now survive marshal restarts via
+  `~/.ollama-marshal/metrics.json`. Loaded on startup, saved on
+  shutdown + every 60s. Schema-version-aware (refuses to load
+  mismatched versions, falls back to fresh).
+- **Audit log feature flag** — new `audit.enabled` config (off by
+  default). When enabled, marshal appends one JSON record per
+  request lifecycle event to a configurable JSONL file. Records
+  contain metadata only — never prompt text or response content.
+  Configurable retention (`retention_days`, default 30) and
+  size-based rotation (`max_size_mb`, default 100). Suitable for
+  compliance / forensics / per-program usage analytics.
+
+### Changed
+
+- `_process_batch` no longer serializes non-embedding requests through
+  `_forward_single`. Same-model envelopes are now gated through
+  `InflightTracker.semaphore_for(model)` whose size matches
+  `scheduler.parallel_per_model`. With the default `parallel_per_model:
+  1` this is observationally identical to v0.2.x behavior.
+- `scheduler._tick` adds a sixth step: prune expired X-Burst-Size hints.
+
+### Fixed
+
+- `model_metadata.json` cache now drops entries when the source model
+  is deleted from Ollama, matching the existing `model_sizes.json`
+  cleanup behavior.
+
 ## [0.2.0] - 2026-04-27
 
 ### Added
@@ -122,6 +182,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Structured logging via structlog (console + JSON modes)
 - 95%+ unit test coverage
 
-[Unreleased]: https://github.com/robertvitali/ollama-marshal/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/robertvitali/ollama-marshal/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/robertvitali/ollama-marshal/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/robertvitali/ollama-marshal/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/robertvitali/ollama-marshal/releases/tag/v0.1.0
