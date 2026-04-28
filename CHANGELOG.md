@@ -7,14 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- Average wait time renders adaptively in `ollama-marshal status` and
-  the dashboard metrics panel. Sub-second waits show as `123ms`, 1-60s
-  as `5.2s`, and longer waits as `1m 30s`. Previously always rendered
-  as `50493 ms`. The `/api/marshal/status` JSON payload still returns
-  raw `average_wait_ms` (unchanged) so consumers aren't broken.
-
 ## [0.2.0] - 2026-04-27
 
 ### Added
@@ -66,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `scheduler.evicting` log entry used an f-string for the `reason` field
+  (`reason=f"making room for {needed_for}"`), violating CLAUDE.md
+  bright-line #9 ("no f-strings in log messages"). Replaced with a
+  structured `needed_for=needed_for` key. Pre-existing on main.
+- `_apply_env_overrides` int-coercion list was missing the two v0.2.0
+  config fields (`request_timeout_s`, `idle_eviction_minutes`). Pydantic
+  coerced them at validation time, so no runtime bug — but the dict
+  shape was inconsistent with `port` / `poll_interval` / etc.
 - `ollama-marshal start` crashed on launch with `AttributeError: module
   structlog has no attribute get_level_from_name`. The function never
   existed in any structlog version. Replaced with `getattr(logging,
@@ -87,6 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Average wait time renders adaptively in `ollama-marshal status` and
+  the dashboard metrics panel. Sub-second waits show as `123ms`, 1-60s
+  as `5.2s`, and longer waits as `1m 30s`. Previously always rendered
+  as `50493 ms`. The `/api/marshal/status` JSON payload still returns
+  raw `average_wait_ms` (unchanged) so consumers aren't broken.
 - Dashboard's `status_poller` now uses `httpx.AsyncClient` instead of
   blocking `httpx.get` so the event loop stays responsive (previously
   the render loop and log follower could freeze for up to the 2s status

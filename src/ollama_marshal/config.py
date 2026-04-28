@@ -217,6 +217,8 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 "max_skips",
                 "model_detect_interval",
                 "drain_timeout",
+                "request_timeout_s",
+                "idle_eviction_minutes",
             ):
                 data[section][field] = int(value)
             elif field == "unload_models":

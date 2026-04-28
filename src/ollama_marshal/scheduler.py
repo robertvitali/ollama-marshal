@@ -366,7 +366,7 @@ class Scheduler:
             "scheduler.evicting",
             model=target,
             pending=pending_counts.get(target, 0),
-            reason=f"making room for {needed_for}",
+            needed_for=needed_for,
         )
 
         # Drain pending requests for the eviction target first (drain-before-evict)

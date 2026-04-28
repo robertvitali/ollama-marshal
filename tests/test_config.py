@@ -219,6 +219,23 @@ class TestApplyEnvOverrides:
         assert result["scheduler"]["max_skips"] == 10
         assert isinstance(result["scheduler"]["max_skips"], int)
 
+    def test_request_timeout_s_is_int_typed(self, monkeypatch):
+        # Added to the int-coercion list in v0.2.0 alongside the field's
+        # introduction. Pydantic would coerce anyway, but this keeps the
+        # dict consistent with port/poll_interval/etc.
+        monkeypatch.setenv("MARSHAL_PROXY_REQUEST_TIMEOUT_S", "1800")
+        data: dict[str, Any] = {}
+        result = _apply_env_overrides(data)
+        assert result["proxy"]["request_timeout_s"] == 1800
+        assert isinstance(result["proxy"]["request_timeout_s"], int)
+
+    def test_idle_eviction_minutes_is_int_typed(self, monkeypatch):
+        monkeypatch.setenv("MARSHAL_SCHEDULER_IDLE_EVICTION_MINUTES", "30")
+        data: dict[str, Any] = {}
+        result = _apply_env_overrides(data)
+        assert result["scheduler"]["idle_eviction_minutes"] == 30
+        assert isinstance(result["scheduler"]["idle_eviction_minutes"], int)
+
     def test_boolean_field_true(self, monkeypatch):
         monkeypatch.setenv("MARSHAL_SHUTDOWN_UNLOAD_MODELS", "true")
         data: dict[str, Any] = {}
