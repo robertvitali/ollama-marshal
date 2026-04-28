@@ -510,6 +510,93 @@ class TestEnqueueAndWait:
 
 
 # ---------------------------------------------------------------------------
+# X-Marshal-Retry-Max header parsing (Surface A)
+# ---------------------------------------------------------------------------
+
+
+class TestParseRetryMaxHeader:
+    def _req(self, headers=None):
+        r = MagicMock()
+        r.headers = headers or {}
+        return r
+
+    def test_returns_none_when_header_absent(self):
+        assert server_mod._parse_retry_max_header(self._req()) is None
+
+    def test_parses_explicit_int(self):
+        r = self._req({"x-marshal-retry-max": "5"})
+        assert server_mod._parse_retry_max_header(r) == 5
+
+    def test_zero_disables_retry(self):
+        # `0` means "no retries" — must not be coerced to None (which
+        # would defer to config default).
+        r = self._req({"x-marshal-retry-max": "0"})
+        assert server_mod._parse_retry_max_header(r) == 0
+
+    def test_negative_clamps_to_zero(self):
+        r = self._req({"x-marshal-retry-max": "-3"})
+        assert server_mod._parse_retry_max_header(r) == 0
+
+    def test_caps_at_ten(self):
+        # An adversarial client can't request 1000 retries.
+        r = self._req({"x-marshal-retry-max": "1000"})
+        assert server_mod._parse_retry_max_header(r) == 10
+
+    def test_malformed_returns_none(self):
+        r = self._req({"x-marshal-retry-max": "abc"})
+        assert server_mod._parse_retry_max_header(r) is None
+
+    async def test_envelope_carries_override_through_enqueue(self):
+        # End-to-end: header → envelope.retry_max_override.
+        original_registry = getattr(server_mod, "_registry", None)
+        original_queues = getattr(server_mod, "_queues", None)
+        from ollama_marshal.registry import ModelRegistry
+
+        reg = MagicMock(spec=ModelRegistry)
+        reg.is_known_model = AsyncMock(return_value=True)
+        reg.probe_metadata = AsyncMock(return_value=None)
+        reg.get_metadata = MagicMock(return_value=None)
+        reg.get_max_context = MagicMock(return_value=None)
+        server_mod._registry = reg
+        queues = ModelQueues()
+        server_mod._queues = queues
+
+        request = MagicMock()
+        request.headers = {"x-marshal-retry-max": "0"}
+        body = {"model": "llama3:latest", "stream": False}
+
+        captured_override = []
+
+        async def complete_after_enqueue():
+            for _ in range(50):
+                if await queues.total_pending() > 0:
+                    break
+                await asyncio.sleep(0.01)
+            envs = await queues.get_all_sorted_by_arrival()
+            if envs:
+                captured_override.append(envs[0].retry_max_override)
+                envs[0].complete({"ok": True})
+
+        task = asyncio.create_task(complete_after_enqueue())
+        try:
+            await server_mod._enqueue_inference(request, body, "/api/chat")
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            if original_registry is not None:
+                server_mod._registry = original_registry
+            else:
+                del server_mod._registry
+            if original_queues is not None:
+                server_mod._queues = original_queues
+
+        assert captured_override == [0]
+
+
+# ---------------------------------------------------------------------------
 # Fail-fast on unknown models (Surface B)
 # ---------------------------------------------------------------------------
 

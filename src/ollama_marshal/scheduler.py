@@ -17,6 +17,7 @@ from ollama_marshal.lifecycle import ModelLifecycle
 from ollama_marshal.memory import MemoryManager
 from ollama_marshal.queue import ModelQueues, RequestEnvelope
 from ollama_marshal.registry import ModelRegistry
+from ollama_marshal.retry import call_with_retry
 from ollama_marshal.stream import forward_request
 
 logger = structlog.get_logger()
@@ -262,6 +263,13 @@ class SchedulerMetrics:
         model_swaps: Number of model load/unload cycles.
         evictions: Number of forced model evictions.
         total_wait_ms: Cumulative wait time across all requests.
+        retries_attempted: Times marshal retried a forward_request after
+            a transient failure. Lifetime counter.
+        retries_succeeded: Times a retried request ultimately succeeded
+            (subset of `retries_attempted`).
+        unexpected_unloads: Times marshal observed Ollama drop a loaded
+            model on its own (memory-pressure eviction). Persistent
+            non-zero values signal Ollama-side memory tuning is needed.
         started_at: Monotonic timestamp when the scheduler started.
     """
 
@@ -269,6 +277,9 @@ class SchedulerMetrics:
     model_swaps: int = 0
     evictions: int = 0
     total_wait_ms: float = 0.0
+    retries_attempted: int = 0
+    retries_succeeded: int = 0
+    unexpected_unloads: int = 0
     started_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -292,6 +303,9 @@ class SchedulerMetrics:
             "model_swaps": self.model_swaps,
             "evictions": self.evictions,
             "total_wait_ms": float(self.total_wait_ms),
+            "retries_attempted": self.retries_attempted,
+            "retries_succeeded": self.retries_succeeded,
+            "unexpected_unloads": self.unexpected_unloads,
         }
 
     @classmethod
@@ -313,6 +327,10 @@ class SchedulerMetrics:
             model_swaps=int(data.get("model_swaps", 0)),
             evictions=int(data.get("evictions", 0)),
             total_wait_ms=float(data.get("total_wait_ms", 0.0)),
+            # New v0.4.0 fields default to 0 if loading a v0.3.x snapshot.
+            retries_attempted=int(data.get("retries_attempted", 0)),
+            retries_succeeded=int(data.get("retries_succeeded", 0)),
+            unexpected_unloads=int(data.get("unexpected_unloads", 0)),
             # started_at is intentionally fresh — current process clock.
         )
 
@@ -807,19 +825,83 @@ class Scheduler:
             tasks = [self._forward_single(e) for e in embeddings]
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def _resolve_retry_attempts(self, envelope: RequestEnvelope) -> int:
+        """Resolve the effective retry budget for one envelope.
+
+        Precedence (highest first):
+        1. `envelope.retry_max_override` (from `X-Marshal-Retry-Max`
+           header) — explicit per-request opt-in/out.
+        2. `config.retry.max_attempts` if `retry.enabled`.
+        3. 1 (no retry) when retry is globally disabled.
+
+        Streaming requests always resolve to 1 attempt (the retry
+        helper also short-circuits, but resolving here makes the
+        no-retry fast path explicit at the call site).
+        """
+        if envelope.stream:
+            return 1
+        if envelope.retry_max_override is not None:
+            # Clamp to >= 1 — `0` from the header means "no retries"
+            # which is still a single attempt.
+            return max(1, envelope.retry_max_override)
+        retry_cfg = self.config.retry
+        if not retry_cfg.enabled:
+            return 1
+        return retry_cfg.max_attempts
+
     async def _forward_single(self, envelope: RequestEnvelope) -> None:
         """Forward a single request to Ollama and complete the envelope.
+
+        Wraps `forward_request` in `call_with_retry` for non-streaming
+        non-idempotent calls. Streaming requests are NEVER retried (the
+        retry helper short-circuits), and `retry_max_override` on the
+        envelope can disable or extend retry per-request.
 
         Args:
             envelope: The request to forward.
         """
+        max_attempts = self._resolve_retry_attempts(envelope)
+        retry_cfg = self.config.retry
         try:
-            result = await forward_request(
-                ollama_host=self.config.ollama.host,
-                endpoint=envelope.endpoint,
-                request_body=envelope.request_body,
-                stream=envelope.stream,
-            )
+            if max_attempts <= 1:
+                # No-retry fast path: single attempt, no helper overhead.
+                result = await forward_request(
+                    ollama_host=self.config.ollama.host,
+                    endpoint=envelope.endpoint,
+                    request_body=envelope.request_body,
+                    stream=envelope.stream,
+                )
+            else:
+                # Embeddings are idempotent — safe to retry on
+                # ReadTimeout. Tool-calling chats are not.
+                allow_read_retry = (
+                    retry_cfg.retry_read_timeouts
+                    or envelope.endpoint
+                    in ("/api/embeddings", "/v1/embeddings")
+                )
+                # request_id correlates retries in logs; envelope object
+                # id is unique within the process and cheap.
+                request_id = f"{envelope.model}:{id(envelope):x}"
+                result, attempts_used = await call_with_retry(
+                    forward_request,
+                    ollama_host=self.config.ollama.host,
+                    endpoint=envelope.endpoint,
+                    request_body=envelope.request_body,
+                    stream=envelope.stream,
+                    max_attempts=max_attempts,
+                    base_delay_s=retry_cfg.base_delay_s,
+                    max_delay_s=retry_cfg.max_delay_s,
+                    retry_read_timeouts=allow_read_retry,
+                    request_id=request_id,
+                )
+                if attempts_used > 1:
+                    # The helper used at least one retry that ultimately
+                    # succeeded. Both counters bump: attempted (the user
+                    # cares about retry frequency) and succeeded (the
+                    # subset that worked, vs. the ones that exhausted
+                    # and reraised — those are caught below).
+                    self.metrics.retries_attempted += attempts_used - 1
+                    self.metrics.retries_succeeded += 1
             envelope.complete(result)
             # Stamp this model as recently active so idle-eviction doesn't
             # touch it. Done on dispatch (not on completion) so a long
@@ -849,6 +931,11 @@ class Scheduler:
                 stream=envelope.stream,
             )
         except Exception as exc:
+            # When retry was active and exhausted, the helper raised the
+            # last exception — count those attempts here so the metric
+            # captures both successful-retry and exhausted-retry paths.
+            if max_attempts > 1:
+                self.metrics.retries_attempted += max_attempts - 1
             # Some httpx exception subclasses have empty str(); always include
             # the type name so the log entry is useful.
             logger.error(

@@ -473,6 +473,29 @@ async def _inject_num_ctx(model: str, body: dict[str, Any]) -> None:
     options["num_ctx"] = meta.max_context_length
 
 
+def _parse_retry_max_header(request: Request) -> int | None:
+    """Parse `X-Marshal-Retry-Max` header into a per-request retry budget.
+
+    Returns None when the header is absent or malformed (use config
+    default). Returns 0 when the client explicitly disables retry. Caps
+    at 10 to keep an adversarial header from arbitrarily extending the
+    retry budget.
+
+    Returns:
+        None to defer to config.retry, or an int >= 0 (clamped to 10).
+    """
+    hdr = request.headers.get("x-marshal-retry-max")
+    if hdr is None:
+        return None
+    try:
+        v = int(hdr)
+    except ValueError:
+        return None
+    if v < 0:
+        return 0
+    return min(v, 10)
+
+
 def _resolve_timeout(request: Request) -> int:
     """Resolve the wait-for-scheduler timeout for this request.
 
@@ -556,6 +579,7 @@ async def _enqueue_inference(
         request_body=body,
         endpoint=endpoint,
         stream=stream,
+        retry_max_override=_parse_retry_max_header(request),
     )
 
     # Defensive: a client sending `options: null` (the JSON literal, not
@@ -682,6 +706,7 @@ async def _enqueue_and_wait(
         request_body=ollama_body,
         endpoint=endpoint,
         stream=stream,
+        retry_max_override=_parse_retry_max_header(request),
     )
 
     await _queues.enqueue(envelope)

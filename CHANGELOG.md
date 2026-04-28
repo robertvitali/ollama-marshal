@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Fail-fast 404 on unknown models** — `/api/chat`, `/api/generate`,
+  `/api/embeddings`, and the OpenAI-compat paths now return 404 in
+  milliseconds when the requested model isn't installed in Ollama,
+  instead of letting the request sit in the queue for up to
+  `proxy.request_timeout_s` (1h default) while marshal repeatedly
+  tries to preload a non-existent model. Response includes a
+  `Run \`ollama pull <model>\`` hint. The check is cached and
+  refreshed opportunistically (rate-limited at 5s) so a freshly-pulled
+  model is recognized within a few seconds.
+- **Marshal-side retry on transient Ollama failures** — new
+  `retry` config section (default ON, max 3 attempts). When Ollama
+  briefly flaps (daemon recycling, transient 502/503), marshal
+  absorbs the blip via in-process retry with exponential backoff +
+  full jitter, so the client never sees the failure. Conservative by
+  default: streaming requests are never retried, ReadTimeout is not
+  retried (risk of re-executing partial generation), and only
+  `ConnectError`/`ConnectTimeout` + HTTP 502/503/504 trigger retry.
+  Embeddings endpoints opt into ReadTimeout retry automatically since
+  they're idempotent.
+- **`X-Marshal-Retry-Max` header** — per-request retry override.
+  `0` disables retry on a single call (e.g. tool-calling agents that
+  want fail-fast); higher values opt into more aggressive retry for
+  known-idempotent burst workloads. Capped server-side at 10.
+- **`retries_attempted`, `retries_succeeded`, `unexpected_unloads`
+  counters** on `SchedulerMetrics`. Persisted across restarts in
+  `metrics.json`. `unexpected_unloads` is wired by Surface C2 later
+  in this release.
+
 ## [0.3.0] - 2026-04-28
 
 ### Added

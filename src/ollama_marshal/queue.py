@@ -36,6 +36,12 @@ class RequestEnvelope:
     done_event: asyncio.Event = field(default_factory=asyncio.Event)
     response: Any = None
     error: Exception | None = None
+    # Per-request retry override from `X-Marshal-Retry-Max` header.
+    # None means "use config default"; an explicit int (including 0)
+    # overrides the config. Lets a client disable retry on a single
+    # call (e.g. tool-calling agent that wants fail-fast) or extend
+    # it for an idempotent embedding burst.
+    retry_max_override: int | None = None
 
     def increment_skip(self) -> None:
         """Increment the skip counter for this request."""

@@ -241,6 +241,62 @@ class AuditConfig(BaseModel):
     )
 
 
+class RetryConfig(BaseModel):
+    """Marshal-side retry tuning for transient Ollama failures.
+
+    When Ollama briefly flaps (daemon recycling, transient 502/503),
+    marshal absorbs the blip via in-process retry so the client never
+    sees the failure. Retries are conservative by default:
+
+    - **Streaming requests are NEVER retried.** Once chunks have shipped,
+      we can't safely re-issue.
+    - **ReadTimeout is NOT retried** unless `retry_read_timeouts` is
+      enabled — Ollama may have already started generating, so retrying
+      could double-bill or re-execute a tool call.
+    - Only `ConnectError`/`ConnectTimeout` and HTTP 502/503/504 retry
+      by default.
+
+    Per-request override: clients can send `X-Marshal-Retry-Max: 0` to
+    disable retry on a single request, or a higher number to opt into
+    more aggressive retry for known-idempotent calls.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable marshal-side retry on transient failures",
+    )
+    max_attempts: int = Field(
+        default=3,
+        description=(
+            "Total attempts including the first try. 1 = no retry, "
+            "3 = up to 2 retries. Bounded by total wall-clock cost: "
+            "with default backoff, 3 attempts take ~3-5s worst case."
+        ),
+    )
+    base_delay_s: float = Field(
+        default=0.5,
+        description=(
+            "First-retry backoff before doubling. Full-jitter random "
+            "in [0, base_delay_s] for first retry."
+        ),
+    )
+    max_delay_s: float = Field(
+        default=10.0,
+        description=(
+            "Cap on a single backoff sleep. Prevents pathological "
+            "geometric growth on long retry budgets."
+        ),
+    )
+    retry_read_timeouts: bool = Field(
+        default=False,
+        description=(
+            "When True, retry on ReadTimeout (Ollama may have already "
+            "started generating — risk of re-execution). Default False. "
+            "Safe to enable for idempotent endpoints (embeddings)."
+        ),
+    )
+
+
 class MarshalConfig(BaseModel):
     """Root configuration for ollama-marshal."""
 
@@ -254,6 +310,7 @@ class MarshalConfig(BaseModel):
     shutdown: ShutdownConfig = Field(default_factory=ShutdownConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
+    retry: RetryConfig = Field(default_factory=RetryConfig)
 
     def get_program_config(self, program_id: str) -> ProgramConfig:
         """Get config for a program, falling back to 'default'."""

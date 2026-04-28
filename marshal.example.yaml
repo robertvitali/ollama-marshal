@@ -92,3 +92,28 @@ audit:
   max_size_mb: 100                 # MARSHAL_AUDIT_MAX_SIZE_MB — rotate the audit file
                                     # (.1, .2, ... up to 5 generations) when it exceeds
                                     # this size. 0 disables rotation.
+
+# Marshal-side retry on transient Ollama failures (default ON).
+# When Ollama briefly flaps (daemon recycling, transient 502/503), marshal
+# absorbs the blip via in-process retry so the client never sees the failure.
+#
+# Conservative by default:
+#   • Streaming requests are NEVER retried (would corrupt the byte stream).
+#   • ReadTimeout is NOT retried (Ollama may have started generating —
+#     retrying could double-bill or re-execute a tool call).
+#   • Only ConnectError/ConnectTimeout and HTTP 502/503/504 retry.
+#
+# Per-request override: clients can send `X-Marshal-Retry-Max: 0` to
+# disable retry on a single call (e.g. tool-calling agents that prefer
+# fail-fast), or a higher number for known-idempotent calls.
+retry:
+  enabled: true                    # MARSHAL_RETRY_ENABLED
+  max_attempts: 3                  # MARSHAL_RETRY_MAX_ATTEMPTS — total attempts incl. first.
+                                    # 1 = no retry, 3 = up to 2 retries. With default
+                                    # backoff, 3 attempts take ~3-5 s worst-case.
+  base_delay_s: 0.5                # MARSHAL_RETRY_BASE_DELAY_S — first-retry backoff
+                                    # before doubling. Full-jitter random in [0, base_delay_s].
+  max_delay_s: 10.0                # MARSHAL_RETRY_MAX_DELAY_S — cap on a single backoff sleep.
+  retry_read_timeouts: false       # MARSHAL_RETRY_READ_TIMEOUTS — when true, also retry
+                                    # ReadTimeout (risk of re-execution). Embeddings
+                                    # endpoints opt in automatically regardless of this flag.

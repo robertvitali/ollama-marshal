@@ -950,6 +950,178 @@ class TestForwardSingle:
         assert sched.active_programs_by_model() == {}
 
 
+class TestResolveRetryAttempts:
+    """Resolution precedence for the per-envelope retry budget."""
+
+    def test_streaming_always_returns_one(self):
+        sched = _make_scheduler()
+        env = _make_envelope(stream=True, retry_max_override=99)
+        assert sched._resolve_retry_attempts(env) == 1
+
+    def test_envelope_override_wins_over_config(self):
+        cfg = _make_config(**{"retry.max_attempts": 5})
+        sched = _make_scheduler(config=cfg)
+        env = _make_envelope(retry_max_override=2)
+        assert sched._resolve_retry_attempts(env) == 2
+
+    def test_envelope_override_zero_clamps_to_one(self):
+        # `X-Marshal-Retry-Max: 0` means "don't retry" — that's still
+        # one attempt, not zero.
+        sched = _make_scheduler()
+        env = _make_envelope(retry_max_override=0)
+        assert sched._resolve_retry_attempts(env) == 1
+
+    def test_uses_config_when_no_override(self):
+        cfg = _make_config(**{"retry.max_attempts": 4})
+        sched = _make_scheduler(config=cfg)
+        env = _make_envelope()
+        assert sched._resolve_retry_attempts(env) == 4
+
+    def test_disabled_config_returns_one(self):
+        cfg = _make_config(**{"retry.enabled": False, "retry.max_attempts": 5})
+        sched = _make_scheduler(config=cfg)
+        env = _make_envelope()
+        assert sched._resolve_retry_attempts(env) == 1
+
+
+class TestForwardSingleRetry:
+    """Integration: _forward_single + call_with_retry counter wiring."""
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    @patch("ollama_marshal.scheduler.forward_request", new_callable=AsyncMock)
+    async def test_no_retry_path_skips_helper(self, mock_forward, mock_retry):
+        # max_attempts=1 → don't even call call_with_retry (clearer fast path).
+        mock_forward.return_value = MagicMock()
+        cfg = _make_config(**{"retry.max_attempts": 1, "retry.enabled": True})
+        sched = _make_scheduler(config=cfg)
+
+        await sched._forward_single(_make_envelope())
+
+        mock_forward.assert_called_once()
+        mock_retry.assert_not_called()
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_retry_path_records_metrics_on_success(self, mock_retry):
+        # Helper succeeded on attempt 3 → 2 retries attempted, 1 succeeded.
+        sentinel = MagicMock()
+        mock_retry.return_value = (sentinel, 3)
+        sched = _make_scheduler()
+
+        env = _make_envelope()
+        await sched._forward_single(env)
+
+        assert sched.metrics.retries_attempted == 2
+        assert sched.metrics.retries_succeeded == 1
+        assert env.response is sentinel
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_retry_path_no_metrics_on_first_attempt(self, mock_retry):
+        # attempts_used=1 → no retry happened, no counters move.
+        mock_retry.return_value = (MagicMock(), 1)
+        sched = _make_scheduler()
+
+        await sched._forward_single(_make_envelope())
+
+        assert sched.metrics.retries_attempted == 0
+        assert sched.metrics.retries_succeeded == 0
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_retry_exhaustion_records_attempted_only(self, mock_retry):
+        # Helper exhausted retries and reraised → retries_attempted bumps,
+        # retries_succeeded does NOT.
+        import httpx
+
+        mock_retry.side_effect = httpx.ConnectError("permanent")
+        cfg = _make_config(**{"retry.max_attempts": 3})
+        sched = _make_scheduler(config=cfg)
+
+        env = _make_envelope()
+        await sched._forward_single(env)
+
+        assert env.error is not None
+        assert sched.metrics.retries_attempted == 2  # max_attempts - 1
+        assert sched.metrics.retries_succeeded == 0
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_embeddings_endpoint_enables_read_timeout_retry(self, mock_retry):
+        # /api/embeddings is idempotent — the helper is invoked with
+        # retry_read_timeouts=True even when the global config is False.
+        mock_retry.return_value = (MagicMock(), 1)
+        cfg = _make_config(**{"retry.retry_read_timeouts": False})
+        sched = _make_scheduler(config=cfg)
+
+        await sched._forward_single(_make_envelope(endpoint="/api/embeddings"))
+
+        kwargs = mock_retry.call_args.kwargs
+        assert kwargs["retry_read_timeouts"] is True
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_chat_endpoint_does_not_force_read_timeout_retry(self, mock_retry):
+        mock_retry.return_value = (MagicMock(), 1)
+        cfg = _make_config(**{"retry.retry_read_timeouts": False})
+        sched = _make_scheduler(config=cfg)
+
+        await sched._forward_single(_make_envelope(endpoint="/api/chat"))
+
+        kwargs = mock_retry.call_args.kwargs
+        assert kwargs["retry_read_timeouts"] is False
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    @patch("ollama_marshal.scheduler.forward_request", new_callable=AsyncMock)
+    async def test_streaming_envelope_skips_retry_helper(
+        self, mock_forward, mock_retry
+    ):
+        # Streaming requests must NEVER go through the retry helper —
+        # _resolve_retry_attempts returns 1 for stream=True, taking the
+        # fast path.
+        mock_forward.return_value = MagicMock()
+        cfg = _make_config(**{"retry.max_attempts": 5})
+        sched = _make_scheduler(config=cfg)
+
+        await sched._forward_single(_make_envelope(stream=True))
+
+        mock_forward.assert_called_once()
+        mock_retry.assert_not_called()
+
+
+class TestSchedulerMetricsRetryFields:
+    def test_default_zero(self):
+        m = SchedulerMetrics()
+        assert m.retries_attempted == 0
+        assert m.retries_succeeded == 0
+        assert m.unexpected_unloads == 0
+
+    def test_serializes_new_fields(self):
+        m = SchedulerMetrics(
+            retries_attempted=5,
+            retries_succeeded=4,
+            unexpected_unloads=2,
+        )
+        d = m.to_json_dict()
+        assert d["retries_attempted"] == 5
+        assert d["retries_succeeded"] == 4
+        assert d["unexpected_unloads"] == 2
+
+    def test_loads_with_missing_new_fields_for_v0_3_x_snapshots(self):
+        # A v0.3.x metrics file won't have the new fields — they should
+        # default to 0 instead of raising.
+        from ollama_marshal.scheduler import _METRICS_SCHEMA_VERSION
+
+        m = SchedulerMetrics.from_json_dict(
+            {
+                "schema_version": _METRICS_SCHEMA_VERSION,
+                "requests_served": 10,
+                "model_swaps": 1,
+                "evictions": 0,
+                "total_wait_ms": 1234.0,
+            }
+        )
+        assert m.requests_served == 10
+        assert m.retries_attempted == 0
+        assert m.retries_succeeded == 0
+        assert m.unexpected_unloads == 0
+
+
 class TestActiveProgramsAccessor:
     async def test_returns_empty_when_nothing_loaded(self):
         sched = _make_scheduler()
