@@ -103,6 +103,72 @@ class SchedulerConfig(BaseModel):
             "Models with pending requests are never time-evicted."
         ),
     )
+    parallel_per_model: int = Field(
+        default=1,
+        description=(
+            "Max concurrent inference dispatches per loaded model. Default 1 "
+            "matches v0.2.x sequential behavior. To benefit from parallel "
+            "execution: (1) set OLLAMA_NUM_PARALLEL >= this value at Ollama "
+            "server startup so Ollama allocates enough KV cache slots, "
+            "(2) raise this value to match. Marshal scales actual concurrency "
+            "with queue depth (a 1-envelope queue still serves 1 at a time)."
+        ),
+    )
+    burst_hint_ttl_s: float = Field(
+        default=30.0,
+        description=(
+            "Seconds an X-Burst-Size hint stays active without renewal. "
+            "Each request from the same program-model pair refreshes the "
+            "timer; after this many seconds of silence the hint expires "
+            "and falls back to actual queue depth. Programs that pace "
+            "their tool-calling loops slower than this default will need "
+            "to raise the value."
+        ),
+    )
+    burst_hint_cap_multiplier: int = Field(
+        default=4,
+        description=(
+            "Per-pair X-Burst-Size cap = max_skips * this. With defaults "
+            "(max_skips=3, multiplier=4) a single program can claim up to "
+            "12 boost on its model. Caps adversarial header values."
+        ),
+    )
+    burst_hint_aggregate_multiplier: int = Field(
+        default=8,
+        description=(
+            "Per-model aggregate burst-boost cap = max_skips * this. "
+            "Even if many distinct program_ids each register hints at "
+            "the per-pair cap, the per-model summed boost is clamped at "
+            "this value. Defends against program_id-flooding attacks."
+        ),
+    )
+    burst_hint_max_live: int = Field(
+        default=256,
+        description=(
+            "Max number of live (program_id, model) burst-hint entries "
+            "stored at any time. New pairs are dropped (record returns 0) "
+            "when the dict is at capacity. Refreshing an existing pair "
+            "always succeeds. Prevents memory exhaustion from flooded "
+            "distinct pairs within the TTL window."
+        ),
+    )
+    metrics_path: str = Field(
+        default="~/.ollama-marshal/metrics.json",
+        description=(
+            "Path to the persisted-metrics JSON file. Lifetime counters "
+            "(requests_served, model_swaps, evictions, total_wait_ms) "
+            "are restored from this file on startup and saved on shutdown "
+            "+ every metrics_persist_interval_s seconds during runtime."
+        ),
+    )
+    metrics_persist_interval_s: float = Field(
+        default=60.0,
+        description=(
+            "Seconds between background metrics-snapshot writes. Trades "
+            "off disk wear vs. data-loss window on hard crash. Lower = "
+            "tighter recovery, higher disk I/O; higher = vice versa."
+        ),
+    )
 
 
 class ProgramConfig(BaseModel):
@@ -141,6 +207,40 @@ class LoggingConfig(BaseModel):
     )
 
 
+class AuditConfig(BaseModel):
+    """Audit-log feature flag and tuning.
+
+    OFF by default. When enabled, marshal appends one JSON record per
+    request lifecycle event (enqueued, served, failed, evicted) to
+    `audit.jsonl`. Records contain ONLY metadata — never prompt text or
+    response content. Designed for compliance / forensics / per-program
+    usage analytics, not perf debugging.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable audit-log writes (default off — opt-in)",
+    )
+    path: str = Field(
+        default="~/.ollama-marshal/audit.jsonl",
+        description="Path to the JSONL audit file",
+    )
+    retention_days: int = Field(
+        default=30,
+        description=(
+            "Auto-delete audit entries older than this many days. "
+            "0 disables retention (file grows unbounded)."
+        ),
+    )
+    max_size_mb: int = Field(
+        default=100,
+        description=(
+            "Rotate the audit file (.1, .2, ...) when it exceeds this "
+            "size in megabytes. 0 disables size-based rotation."
+        ),
+    )
+
+
 class MarshalConfig(BaseModel):
     """Root configuration for ollama-marshal."""
 
@@ -153,6 +253,7 @@ class MarshalConfig(BaseModel):
     )
     shutdown: ShutdownConfig = Field(default_factory=ShutdownConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    audit: AuditConfig = Field(default_factory=AuditConfig)
 
     def get_program_config(self, program_id: str) -> ProgramConfig:
         """Get config for a program, falling back to 'default'."""
@@ -219,9 +320,20 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 "drain_timeout",
                 "request_timeout_s",
                 "idle_eviction_minutes",
+                "parallel_per_model",
+                "burst_hint_cap_multiplier",
+                "burst_hint_aggregate_multiplier",
+                "burst_hint_max_live",
+                "retention_days",
+                "max_size_mb",
             ):
                 data[section][field] = int(value)
-            elif field == "unload_models":
+            elif field in (
+                "burst_hint_ttl_s",
+                "metrics_persist_interval_s",
+            ):
+                data[section][field] = float(value)
+            elif field in ("unload_models", "enabled"):
                 data[section][field] = value.lower() in ("true", "1", "yes")
             else:
                 data[section][field] = value

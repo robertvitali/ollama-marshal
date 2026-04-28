@@ -1,8 +1,22 @@
-"""Model size registry with background benchmarking and caching."""
+"""Model size registry with background benchmarking and caching.
+
+Tracks two pieces of per-model state:
+
+1. **Loaded VRAM size** (`model_sizes.json`) — measured by loading the
+   model and reading `/api/ps`. Used by the scheduler to decide if a
+   model fits in remaining VRAM.
+2. **Architecture metadata** (`model_metadata.json`) — extracted from
+   `/api/show`. Captures `max_context_length`, `num_layers`,
+   `kv_per_slot_at_max_ctx`. Used to (a) inject `options.num_ctx` so
+   Ollama doesn't silently truncate context, and (b) compute how many
+   concurrent inference slots fit per loaded model.
+"""
 
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +26,111 @@ import structlog
 logger = structlog.get_logger()
 
 _DEFAULT_REGISTRY_PATH = Path.home() / ".ollama-marshal" / "model_sizes.json"
+_DEFAULT_METADATA_PATH = Path.home() / ".ollama-marshal" / "model_metadata.json"
+
+# KV cache dtype defaults to fp16 = 2 bytes per element. Newer Ollama
+# supports KV cache quantization (q8_0 = 1 byte) but we conservatively
+# assume the heaviest case so we don't over-allocate parallel slots.
+_DEFAULT_KV_DTYPE_BYTES = 2
+
+# Conservative fallback when /api/show doesn't expose architecture info
+# (e.g. older Ollama, custom modelfile). Both values are intentionally
+# small so the math stays safe — under-estimating context means we'd
+# inject a small num_ctx (no harm, model still works), and under-
+# estimating layers/dim means we'd compute a larger kv_per_slot than
+# real (so we'd allow fewer parallel slots than actually fit — also
+# safe, just less performant).
+_FALLBACK_MAX_CONTEXT = 4096
+_FALLBACK_NUM_LAYERS = 32
+_FALLBACK_KV_DIM = 4096
+
+
+@dataclass
+class ModelMetadata:
+    """Architecture-derived metadata used for context + parallelism math.
+
+    Fields are extracted from `/api/show`'s `model_info` block. The
+    architecture prefix (e.g. `llama`, `qwen3`, `gemma3`) is read from
+    `general.architecture` and used to find the right keys.
+
+    The `kv_per_slot_at_max_ctx` field is computed once at probe time
+    so consumers don't have to know the math:
+
+        kv_per_slot = max_ctx * num_layers * kv_dim * dtype_bytes * 2
+                                                                   ^^^
+                                                  factor 2 for K and V
+
+    where `kv_dim = (embedding_length / head_count) * head_count_kv`
+    (head_dim multiplied by number of KV heads, accounting for grouped-
+    query attention).
+    """
+
+    name: str
+    architecture: str
+    max_context_length: int
+    num_layers: int
+    embedding_length: int
+    head_count: int
+    head_count_kv: int
+    kv_dtype_bytes: int = _DEFAULT_KV_DTYPE_BYTES
+    probed_at: str = ""
+
+    @property
+    def head_dim(self) -> int:
+        """Per-head dimension = embedding_length // head_count."""
+        if self.head_count == 0:
+            return 0
+        return self.embedding_length // self.head_count
+
+    @property
+    def kv_dim(self) -> int:
+        """Effective KV dimension = head_dim * head_count_kv (GQA-aware)."""
+        return self.head_dim * self.head_count_kv
+
+    @property
+    def kv_per_slot_at_max_ctx(self) -> int:
+        """Bytes of KV cache one inference slot needs at full context."""
+        return self.kv_per_slot_at_ctx(self.max_context_length)
+
+    def kv_per_slot_at_ctx(self, ctx: int) -> int:
+        """Bytes of KV cache one inference slot needs at the given ctx length."""
+        return ctx * self.num_layers * self.kv_dim * self.kv_dtype_bytes * 2
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """Serializable dict for the on-disk cache."""
+        d = asdict(self)
+        # Include computed fields so external readers don't have to recompute.
+        d["kv_per_slot_at_max_ctx"] = self.kv_per_slot_at_max_ctx
+        return d
+
+    @classmethod
+    def from_json_dict(cls, data: dict[str, Any]) -> ModelMetadata:
+        """Reconstruct from on-disk cache. Ignores computed fields."""
+        return cls(
+            name=data["name"],
+            architecture=data["architecture"],
+            max_context_length=int(data["max_context_length"]),
+            num_layers=int(data["num_layers"]),
+            embedding_length=int(data["embedding_length"]),
+            head_count=int(data["head_count"]),
+            head_count_kv=int(data["head_count_kv"]),
+            kv_dtype_bytes=int(data.get("kv_dtype_bytes", _DEFAULT_KV_DTYPE_BYTES)),
+            probed_at=str(data.get("probed_at", "")),
+        )
+
+
+@dataclass
+class _ProbeResult:
+    """Internal struct returned by `_probe_show`.
+
+    Reports whether all fields were extracted cleanly or if any had to
+    fall back to defaults. Callers use this to log appropriate warnings
+    so silent fallback decisions are visible in the audit trail.
+    """
+
+    metadata: ModelMetadata
+    used_fallback: bool = False
+    missing_fields: list[str] = field(default_factory=list)
 
 
 class ModelRegistry:
@@ -30,15 +149,19 @@ class ModelRegistry:
         self,
         ollama_host: str = "http://localhost:11434",
         registry_path: Path | None = None,
+        metadata_path: Path | None = None,
     ) -> None:
         self.ollama_host = ollama_host
         self.registry_path = registry_path or _DEFAULT_REGISTRY_PATH
+        self.metadata_path = metadata_path or _DEFAULT_METADATA_PATH
         self._sizes: dict[str, int] = {}
+        self._metadata: dict[str, ModelMetadata] = {}
         self._benchmarking: set[str] = set()
 
     async def initialize(self) -> None:
         """Load cached registry and sync with current Ollama models."""
         self._load_cache()
+        self._load_metadata_cache()
         await self._sync_with_ollama()
 
     def _load_cache(self) -> None:
@@ -63,6 +186,51 @@ class ModelRegistry:
         self.registry_path.write_text(json.dumps(self._sizes, indent=2) + "\n")
         logger.debug("model_registry.cache_saved", model_count=len(self._sizes))
 
+    def _load_metadata_cache(self) -> None:
+        """Load architecture metadata from `model_metadata.json`.
+
+        Mirrors `_load_cache`. On parse failure, log a warning and start
+        with an empty metadata map — probes will repopulate on demand.
+        """
+        if not self.metadata_path.exists():
+            return
+        try:
+            data = json.loads(self.metadata_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            logger.warning(
+                "model_registry.metadata_cache_corrupt",
+                path=str(self.metadata_path),
+            )
+            self._metadata = {}
+            return
+        if not isinstance(data, dict):
+            self._metadata = {}
+            return
+        loaded: dict[str, ModelMetadata] = {}
+        for name, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                loaded[name] = ModelMetadata.from_json_dict(entry)
+            except (KeyError, ValueError, TypeError) as exc:
+                logger.warning(
+                    "model_registry.metadata_entry_skipped",
+                    model=name,
+                    error=str(exc),
+                )
+        self._metadata = loaded
+        if loaded:
+            logger.info("model_registry.metadata_cache_loaded", model_count=len(loaded))
+
+    def _save_metadata_cache(self) -> None:
+        """Write the metadata cache to disk."""
+        self.metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        serialized = {name: m.to_json_dict() for name, m in self._metadata.items()}
+        self.metadata_path.write_text(json.dumps(serialized, indent=2) + "\n")
+        logger.debug(
+            "model_registry.metadata_cache_saved", model_count=len(self._metadata)
+        )
+
     async def _sync_with_ollama(self) -> None:
         """Sync the registry against models currently downloaded in Ollama.
 
@@ -75,14 +243,19 @@ class ModelRegistry:
             logger.warning("model_registry.sync_failed", reason="cannot reach Ollama")
             return
 
-        # Remove models no longer downloaded
+        # Remove models no longer downloaded (from both caches).
         stale = set(self._sizes.keys()) - set(current_models)
+        meta_stale = set(self._metadata.keys()) - set(current_models)
         for model in stale:
             del self._sizes[model]
             logger.info("model_registry.removed_stale", model=model)
+        for model in meta_stale:
+            del self._metadata[model]
 
         if stale:
             self._save_cache()
+        if meta_stale:
+            self._save_metadata_cache()
 
         unknown = set(current_models) - set(self._sizes.keys())
         if unknown:
@@ -158,22 +331,35 @@ class ModelRegistry:
             self._benchmarking.discard(model)
 
     async def benchmark_unknown(self) -> None:
-        """Benchmark all models not yet in the registry.
+        """Benchmark sizes + probe metadata for all models not yet cached.
 
         Loads each unknown model one at a time to avoid VRAM conflicts.
+        Metadata probing is much cheaper (just `/api/show`, no actual
+        model load) so we do it for all models that need it, not just
+        the size-unknown set.
         """
         try:
             current_models = await self._fetch_model_list()
         except httpx.HTTPError:
             return
 
-        unknown = [m for m in current_models if m not in self._sizes]
-        if not unknown:
+        # Metadata probe is cheap — fan out for any model missing metadata,
+        # whether or not its size is also unknown.
+        meta_unknown = [m for m in current_models if m not in self._metadata]
+        if meta_unknown:
+            logger.info(
+                "model_registry.metadata_probe_starting", count=len(meta_unknown)
+            )
+            for model in meta_unknown:
+                await self.probe_metadata(model)
+
+        size_unknown = [m for m in current_models if m not in self._sizes]
+        if not size_unknown:
             logger.info("model_registry.all_benchmarked")
             return
 
-        logger.info("model_registry.benchmark_starting", count=len(unknown))
-        for model in unknown:
+        logger.info("model_registry.benchmark_starting", count=len(size_unknown))
+        for model in size_unknown:
             await self.benchmark_model(model)
 
     def get_model_size(self, model: str) -> int | None:
@@ -207,14 +393,169 @@ class ModelRegistry:
         return dict(self._sizes)
 
     def remove_model(self, model: str) -> None:
-        """Remove a model from the registry.
+        """Remove a model from the registry (both size and metadata caches).
 
         Args:
             model: The model name to remove.
         """
-        if model in self._sizes:
+        size_changed = model in self._sizes
+        meta_changed = model in self._metadata
+        if size_changed:
             del self._sizes[model]
+        if meta_changed:
+            del self._metadata[model]
+        if size_changed:
             self._save_cache()
+        if meta_changed:
+            self._save_metadata_cache()
+
+    async def probe_metadata(self, model: str) -> ModelMetadata | None:
+        """Fetch architecture metadata from `/api/show` and cache it.
+
+        Idempotent — if `model` is already in the metadata cache, returns
+        the cached entry without re-probing.
+
+        Returns:
+            ModelMetadata for the model, or None if Ollama was unreachable.
+            On partial / unknown architecture, returns metadata with
+            fallback fields filled in (logs a warning).
+        """
+        cached = self._metadata.get(model)
+        if cached is not None:
+            return cached
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{self.ollama_host}/api/show",
+                    json={"name": model},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data: dict[str, Any] = resp.json()
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "model_registry.metadata_probe_failed",
+                model=model,
+                error=str(exc) or repr(exc),
+                error_type=type(exc).__name__,
+            )
+            return None
+
+        result = self._parse_show_response(model, data)
+        self._metadata[model] = result.metadata
+        self._save_metadata_cache()
+        if result.used_fallback:
+            logger.warning(
+                "model_registry.metadata_fallback_used",
+                model=model,
+                missing_fields=result.missing_fields,
+            )
+        else:
+            logger.info(
+                "model_registry.metadata_probed",
+                model=model,
+                architecture=result.metadata.architecture,
+                max_ctx=result.metadata.max_context_length,
+                kv_per_slot_mb=round(
+                    result.metadata.kv_per_slot_at_max_ctx / (1024**2), 1
+                ),
+            )
+        return result.metadata
+
+    @staticmethod
+    def _parse_show_response(model: str, data: dict[str, Any]) -> _ProbeResult:
+        """Extract architecture metadata from a parsed `/api/show` response.
+
+        Ollama stores architecture-specific keys under `model_info` with a
+        prefix derived from `general.architecture` (e.g. `llama.context_
+        length`, `qwen3.context_length`). We read the architecture name
+        first, then look up the per-arch keys.
+
+        Returns a `_ProbeResult` with `used_fallback=True` when one or
+        more fields had to be filled with a conservative default.
+        """
+        info = data.get("model_info", {}) or {}
+        arch = str(info.get("general.architecture", "") or "unknown")
+
+        def _get(key: str, default: int) -> tuple[int, bool]:
+            """Return (value, used_fallback). Looks up `<arch>.<key>` from info."""
+            full = f"{arch}.{key}"
+            raw = info.get(full)
+            if raw is None:
+                return default, True
+            try:
+                return int(raw), False
+            except (TypeError, ValueError):
+                return default, True
+
+        max_ctx, fb1 = _get("context_length", _FALLBACK_MAX_CONTEXT)
+        n_layers, fb2 = _get("block_count", _FALLBACK_NUM_LAYERS)
+        embed_len, fb3 = _get("embedding_length", _FALLBACK_KV_DIM)
+        head_count, fb4 = _get("attention.head_count", 32)
+        # head_count_kv defaults to head_count when not specified (no GQA).
+        hck_raw = info.get(f"{arch}.attention.head_count_kv")
+        if hck_raw is None:
+            head_count_kv, fb5 = head_count, False
+        else:
+            try:
+                head_count_kv, fb5 = int(hck_raw), False
+            except (TypeError, ValueError):
+                head_count_kv, fb5 = head_count, True
+
+        used_fallback = any([fb1, fb2, fb3, fb4, fb5])
+        missing = [
+            k
+            for k, fb in [
+                ("context_length", fb1),
+                ("block_count", fb2),
+                ("embedding_length", fb3),
+                ("attention.head_count", fb4),
+                ("attention.head_count_kv", fb5),
+            ]
+            if fb
+        ]
+
+        meta = ModelMetadata(
+            name=model,
+            architecture=arch,
+            max_context_length=max_ctx,
+            num_layers=n_layers,
+            embedding_length=embed_len,
+            head_count=head_count,
+            head_count_kv=head_count_kv,
+            kv_dtype_bytes=_DEFAULT_KV_DTYPE_BYTES,
+            probed_at=datetime.now(UTC).isoformat(),
+        )
+        return _ProbeResult(
+            metadata=meta, used_fallback=used_fallback, missing_fields=missing
+        )
+
+    def get_metadata(self, model: str) -> ModelMetadata | None:
+        """Return cached metadata for a model (None if not yet probed)."""
+        return self._metadata.get(model)
+
+    def get_max_context(self, model: str) -> int | None:
+        """Convenience: max context length from cached metadata."""
+        meta = self._metadata.get(model)
+        return meta.max_context_length if meta is not None else None
+
+    def get_kv_per_slot(self, model: str, ctx: int | None = None) -> int | None:
+        """KV cache bytes per inference slot for a model at the given ctx.
+
+        Args:
+            model: Model name (must already have been probed).
+            ctx: Context length to compute for. Defaults to the model's
+                max context length.
+
+        Returns:
+            Bytes per slot, or None if metadata not yet cached.
+        """
+        meta = self._metadata.get(model)
+        if meta is None:
+            return None
+        return meta.kv_per_slot_at_ctx(
+            ctx if ctx is not None else meta.max_context_length
+        )
 
     async def get_or_estimate_size(self, model: str) -> int:
         """Get model size from cache, or estimate from /api/show.

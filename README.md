@@ -207,8 +207,52 @@ three categories — choose the right path for what you're doing.
 | POST | `/v1/embeddings` | OpenAI-compatible embeddings | Same |
 
 These requests **always** go through the scheduler. Streaming (`stream: true`)
-is passed through transparently. Set `X-Program-ID: <your-app>` to identify
-your program for per-program priority and metrics.
+is passed through transparently.
+
+### Request headers (optional)
+
+| Header | Purpose |
+|---|---|
+| `X-Program-ID` | Identifies your program for per-program priority, metrics, and the `loaded_models[*].programs` field |
+| `X-Request-Timeout` | Override the scheduler-wait timeout in seconds for this request (defaults to `proxy.request_timeout_s`) |
+| `X-Burst-Size` | **v0.3.0+**: declare expected total demand for sequential-submission programs. Marshal protects this program-model pair from eviction by treating its queue depth as `actual_pending + N` for the next 30s |
+
+#### When to use `X-Burst-Size`
+
+If your program submits requests **sequentially** (each call blocks on the
+previous one's response), marshal only ever sees one envelope in the queue
+at a time. When other programs fire competing models, marshal's eviction
+scorer might pick yours — even if you're about to send 50 more calls.
+
+Set `X-Burst-Size: 50` (or whatever your expected total is) on each request
+in the burst. Marshal treats your program-model pair as if it had 50 queued
+requests when scoring eviction, keeping the model loaded across the whole
+batch. The hint expires 30s after the last refresh, so steady streams stay
+protected and one-off calls don't carry over.
+
+This is **only** needed if you can't submit concurrently. Programs that use
+`asyncio.gather` (or any other concurrent submission pattern) get the
+benefit automatically — marshal sees the actual queue depth.
+
+### Context window guarantee (v0.3.0+)
+
+Ollama's slot-allocation logic can silently truncate `num_ctx` to fit its
+KV cache budget. A model that supports 32K context might quietly run with
+4K because Ollama prefers shrinking context over reducing parallelism.
+
+Marshal now intercepts every proxied inference request and injects
+`options.num_ctx = model_max_context_length` (read from `/api/show` and
+cached at `~/.ollama-marshal/model_metadata.json`) **unless the client
+explicitly set `options.num_ctx`**. So your full context window is
+guaranteed unless you opt out.
+
+### Per-model concurrent dispatch (v0.3.0+)
+
+Set `scheduler.parallel_per_model: N` in `marshal.yaml` and start Ollama
+with `OLLAMA_NUM_PARALLEL >= N`. Marshal will dispatch up to N
+same-model requests in parallel, scaling naturally with queue depth (a
+1-deep queue still serves 1 at a time). Default is 1 (matches v0.2.x
+sequential behavior).
 
 ### Pass-through (read-only; no scheduling)
 

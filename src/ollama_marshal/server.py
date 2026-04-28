@@ -6,6 +6,7 @@ import asyncio
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import psutil
@@ -14,6 +15,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ollama_marshal import __version__
+from ollama_marshal.audit import NULL_AUDIT, AuditLogger
 from ollama_marshal.config import MarshalConfig, ShutdownMode, load_config
 from ollama_marshal.lifecycle import ModelLifecycle
 from ollama_marshal.memory import MemoryManager
@@ -27,7 +29,7 @@ from ollama_marshal.openai_compat import (
 )
 from ollama_marshal.queue import ModelQueues, RequestEnvelope
 from ollama_marshal.registry import ModelRegistry
-from ollama_marshal.scheduler import Scheduler
+from ollama_marshal.scheduler import Scheduler, SchedulerMetrics
 from ollama_marshal.stream import forward_passthrough
 
 logger = structlog.get_logger()
@@ -39,13 +41,15 @@ _memory: MemoryManager
 _registry: ModelRegistry
 _lifecycle: ModelLifecycle
 _scheduler: Scheduler
+_audit: AuditLogger | Any = NULL_AUDIT
 _started_at: float
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan managing startup and shutdown of all components."""
-    global _config, _queues, _memory, _registry, _lifecycle, _scheduler, _started_at
+    global _config, _queues, _memory, _registry, _lifecycle, _scheduler
+    global _audit, _started_at
 
     # Load config from app state (set by create_app)
     _config = app.state.config
@@ -66,11 +70,51 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         config=_config,
     )
 
+    # Restore lifetime metrics from disk so counters (requests_served,
+    # model_swaps, evictions, total_wait_ms) survive restarts. Falls
+    # back to fresh on any failure (logs a warning). Path comes from
+    # config (overridable per-test via app.state.metrics_path).
+    metrics_path = Path(
+        getattr(app.state, "metrics_path", _config.scheduler.metrics_path)
+    ).expanduser()
+    restored = SchedulerMetrics.load_from(metrics_path)
+    # Preserve the freshly-set started_at; only seed the persisted counters.
+    _scheduler.metrics.requests_served = restored.requests_served
+    _scheduler.metrics.model_swaps = restored.model_swaps
+    _scheduler.metrics.evictions = restored.evictions
+    _scheduler.metrics.total_wait_ms = restored.total_wait_ms
+    if restored.requests_served or restored.model_swaps or restored.evictions:
+        logger.info(
+            "server.metrics_restored",
+            path=str(metrics_path),
+            requests_served=restored.requests_served,
+            model_swaps=restored.model_swaps,
+            evictions=restored.evictions,
+        )
+
+    # Audit logger — opt-in feature flag. Off by default.
+    _audit = AuditLogger(_config.audit) if _config.audit.enabled else NULL_AUDIT
+    await _audit.start()
+    # Hand to the scheduler so request lifecycle calls can record events
+    # without taking a server-module dependency.
+    _scheduler.audit = _audit
+
     # Start background tasks
     await _memory.start_polling()
     await _registry.initialize()
-    asyncio.create_task(_registry.benchmark_unknown())
+    # Store the task reference per CLAUDE.md async correctness rule —
+    # without this, Python may garbage-collect the task before it runs
+    # to completion (and emit a warning on 3.12+).
+    benchmark_task = asyncio.create_task(_registry.benchmark_unknown())
     await _scheduler.start()
+
+    # Periodically snapshot metrics to disk so a hard crash loses at
+    # most metrics_persist_interval_s of counter data.
+    metrics_persister = asyncio.create_task(
+        _persist_metrics_loop(
+            metrics_path, _config.scheduler.metrics_persist_interval_s
+        )
+    )
 
     logger.info(
         "server.started",
@@ -79,6 +123,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     yield
+
+    # Stop the background persister cleanly before final save below.
+    metrics_persister.cancel()
+    try:
+        await metrics_persister
+    except asyncio.CancelledError:
+        pass
+    # Cancel the benchmark task too — if it's still running on shutdown,
+    # we don't want to wait for it to finish probing every model.
+    if not benchmark_task.done():
+        benchmark_task.cancel()
+        try:
+            await benchmark_task
+        except asyncio.CancelledError:
+            pass
 
     # Shutdown — drain BEFORE stopping the scheduler so requests
     # can still be processed during the drain phase
@@ -101,7 +160,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info("server.unloading_models", models=loaded)
             await _lifecycle.unload_all(loaded)
 
+    # Final metrics snapshot — captures any counter changes from drain
+    # phase plus any work that happened after the last periodic write.
+    # Hoist sync I/O to a thread per CLAUDE.md async correctness rules.
+    await asyncio.to_thread(_scheduler.metrics.save_to, metrics_path)
+    logger.info("server.metrics_persisted", path=str(metrics_path))
+
+    # Flush audit buffer + close (no-op when disabled).
+    await _audit.stop()
+
     logger.info("server.stopped")
+
+
+async def _persist_metrics_loop(path: Path, interval_s: float) -> None:
+    """Background task: rewrite metrics snapshot every `interval_s` seconds.
+
+    Disk write is hoisted to a thread (asyncio.to_thread) so a slow disk
+    can't briefly stall the event loop and starve request dispatch.
+    Matches the pattern used by the audit module's _flush_now.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_s)
+        except asyncio.CancelledError:
+            return
+        sched = globals().get("_scheduler")
+        if sched is not None and hasattr(sched, "metrics"):
+            await asyncio.to_thread(sched.metrics.save_to, path)
 
 
 def create_app(config: MarshalConfig | None = None) -> FastAPI:
@@ -310,6 +395,69 @@ def _register_routes(app: FastAPI) -> None:
         )
 
 
+def _record_burst_hint(request: Request, program_id: str, model: str) -> None:
+    """Read the optional X-Burst-Size header and forward to scheduler.
+
+    Programs that submit work sequentially (e.g. tool-calling loops)
+    can declare expected total demand via this header so marshal's
+    eviction scorer treats their model as "expecting N more calls"
+    even when only 1 is currently queued. Header is parsed defensively
+    — non-numeric or non-positive values are silently ignored.
+    """
+    raw = request.headers.get("x-burst-size")
+    if not raw:
+        return
+    try:
+        n = int(raw)
+    except ValueError:
+        return
+    if n <= 0:
+        return
+    sched = globals().get("_scheduler")
+    cfg = globals().get("_config")
+    if sched is None or not hasattr(sched, "burst_hints"):
+        return
+    max_skips = cfg.scheduler.max_skips if cfg is not None else 3
+    sched.burst_hints.record(program_id, model, n, max_skips)
+
+
+async def _inject_num_ctx(model: str, body: dict[str, Any]) -> None:
+    """Inject `options.num_ctx = model_max_context` if the client didn't set one.
+
+    Without this, Ollama uses its server-side default (2048) and may
+    *silently truncate* a model's effective context window down from its
+    architectural max. That's a correctness bug for any client that
+    expects the model's full context to be available — analyses get
+    quietly worse with no error or warning.
+
+    Behavior:
+    - Probes registry metadata if not yet cached (one-shot `/api/show`,
+      ~10ms locally on first sight; cached forever after).
+    - If the client already set `options.num_ctx`, we don't override it.
+    - If metadata can't be resolved (model unknown, Ollama down), we
+      skip injection and fall back to current behavior.
+    """
+    if not model:
+        return
+    options = body.setdefault("options", {})
+    if not isinstance(options, dict):
+        # Client sent something weird as `options`; don't touch it.
+        return
+    if "num_ctx" in options:
+        # Client knows what it wants. Respect it.
+        return
+    # Registry may not yet be initialized (e.g. in unit tests that don't
+    # exercise the full lifespan). Bail silently in that case.
+    registry = globals().get("_registry")
+    if registry is None:
+        return
+    # probe_metadata is idempotent — returns the cached entry if present.
+    meta = await registry.probe_metadata(model)
+    if meta is None:
+        return
+    options["num_ctx"] = meta.max_context_length
+
+
 def _resolve_timeout(request: Request) -> int:
     """Resolve the wait-for-scheduler timeout for this request.
 
@@ -352,6 +500,19 @@ async def _enqueue_inference(
     program_id = request.headers.get("x-program-id", "default")
     timeout_s = _resolve_timeout(request)
 
+    # Capture optional X-Burst-Size hint so the eviction scorer protects
+    # this model across the rest of the burst even if the client submits
+    # the remaining calls sequentially.
+    _record_burst_hint(request, program_id, model)
+
+    # Stop Ollama from silently shrinking num_ctx to fit its slot budget.
+    # Skip embeddings — they use input_length not generation context, so
+    # forcing model_max_context wastes KV cache without preventing
+    # truncation (embedding workloads aren't bitten by the bug this fix
+    # addresses).
+    if endpoint not in ("/api/embeddings", "/v1/embeddings"):
+        await _inject_num_ctx(model, body)
+
     envelope = RequestEnvelope(
         model=model,
         program_id=program_id,
@@ -360,6 +521,10 @@ async def _enqueue_inference(
         stream=stream,
     )
 
+    # Defensive: a client sending `options: null` (the JSON literal, not
+    # an absent key) returns None from .get("options", {}) — chaining
+    # .get on None would crash. Coerce to dict before reading num_ctx.
+    options = body.get("options") or {}
     logger.info(
         "server.request_enqueued",
         model=model,
@@ -367,6 +532,7 @@ async def _enqueue_inference(
         endpoint=endpoint,
         stream=stream,
         timeout_s=timeout_s,
+        num_ctx=options.get("num_ctx") if isinstance(options, dict) else None,
     )
 
     await _queues.enqueue(envelope)
@@ -437,6 +603,16 @@ async def _enqueue_and_wait(
     """
     program_id = request.headers.get("x-program-id", "default")
     timeout_s = _resolve_timeout(request)
+
+    # Capture optional burst-size hint (same semantics as the Ollama-
+    # native path).
+    _record_burst_hint(request, program_id, model)
+
+    # Same num_ctx injection as the Ollama-native path; OpenAI clients
+    # rarely set num_ctx explicitly so they're the most likely to be
+    # bitten by Ollama's silent context truncation. Skip embeddings.
+    if endpoint not in ("/api/embeddings", "/v1/embeddings"):
+        await _inject_num_ctx(model, ollama_body)
 
     envelope = RequestEnvelope(
         model=model,

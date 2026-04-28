@@ -16,12 +16,17 @@ scheduling that maximizes VRAM utilization.
 ## Project Layout
 
 ```
-src/ollama_marshal/    — package source (11 modules)
+src/ollama_marshal/    — package source (12 modules)
 tests/                 — pytest unit + integration tests
 ```
 
-Modules in dependency order: config → queue → registry → memory → lifecycle
-→ scheduler → stream → openai_compat → server → dashboard → cli
+Modules in dependency order: config → audit → queue → registry → memory →
+lifecycle → scheduler → stream → openai_compat → server → dashboard → cli
+
+(`audit.py` only depends on `config.py` — listed near the top to reflect
+the actual import graph. The scheduler intentionally avoids importing
+audit directly; it gets a duck-typed audit instance via `Scheduler.audit`
+attribute injection from the server lifespan.)
 
 ## Development Commands
 
@@ -148,6 +153,32 @@ removed, update or delete the reference in the same PR.
 - Override keep_alive on EVERY proxied request (prevents Ollama auto-eviction)
 - Drain-before-evict for normal priority (no mid-batch model unloading)
 - Graceful shutdown must respect the configured mode (drain vs immediate)
+
+## Workflow File Discipline
+
+**Never include changes to `.github/workflows/claude-review.yml` or
+`.github/workflows/claude-security.yml` in a feature branch.**
+
+The `anthropics/claude-code-action@v1` token exchange rejects any PR
+where those workflow files differ from `main` — it's an anti-tamper
+safety check that prevents an attacker from opening a PR with a
+modified workflow that would exfiltrate `secrets.CLAUDE_API_KEY`.
+The error: *"Workflow validation failed. The workflow file must exist
+and have identical content to the version on the repository's default
+branch."* Every feature PR that bundles a workflow tweak with
+substantive code silently fails its review check.
+
+**The discipline:**
+
+1. Workflow edits ride on a dedicated `chore/ci-*` branch straight
+   to `main`. One file, one commit, no other changes.
+2. After that lands, feature branches inherit the new workflow via
+   `git fetch origin main && git rebase origin/main`.
+3. The `guard-workflow-changes` CI job blocks PRs from non-`chore/ci-*`
+   branches that modify these files.
+
+This rule applies ONLY to the Claude workflows. Editing `ci.yml` on a
+feature branch is fine — there's no token-exchange validator on it.
 
 ## Versioning
 

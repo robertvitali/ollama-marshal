@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from ollama_marshal.config import MarshalConfig, Priority, ProgramConfig
 from ollama_marshal.queue import ModelQueues, RequestEnvelope
-from ollama_marshal.scheduler import Scheduler, SchedulerMetrics
+from ollama_marshal.scheduler import (
+    BurstHints,
+    InflightTracker,
+    Scheduler,
+    SchedulerMetrics,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,6 +104,72 @@ class TestSchedulerMetrics:
         m = SchedulerMetrics()
         after = time.monotonic()
         assert before <= m.started_at <= after
+
+
+# ---------------------------------------------------------------------------
+# SchedulerMetrics persistence
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerMetricsPersistence:
+    def test_save_and_load_roundtrip(self, tmp_path):
+        path = tmp_path / "metrics.json"
+        m = SchedulerMetrics(
+            requests_served=42, model_swaps=7, evictions=3, total_wait_ms=12345.6
+        )
+        m.save_to(path)
+        loaded = SchedulerMetrics.load_from(path)
+        assert loaded.requests_served == 42
+        assert loaded.model_swaps == 7
+        assert loaded.evictions == 3
+        assert loaded.total_wait_ms == 12345.6
+
+    def test_load_missing_file_returns_fresh(self, tmp_path):
+        loaded = SchedulerMetrics.load_from(tmp_path / "nonexistent.json")
+        assert loaded.requests_served == 0
+        assert loaded.model_swaps == 0
+
+    def test_load_corrupt_json_returns_fresh(self, tmp_path):
+        path = tmp_path / "metrics.json"
+        path.write_text("not valid json {{{")
+        loaded = SchedulerMetrics.load_from(path)
+        assert loaded.requests_served == 0
+
+    def test_load_wrong_shape_returns_fresh(self, tmp_path):
+        path = tmp_path / "metrics.json"
+        path.write_text(json.dumps([1, 2, 3]))  # list, not dict
+        loaded = SchedulerMetrics.load_from(path)
+        assert loaded.requests_served == 0
+
+    def test_load_schema_version_mismatch_returns_fresh(self, tmp_path):
+        # Old or future schema version — refuse to load and start fresh.
+        path = tmp_path / "metrics.json"
+        path.write_text(json.dumps({"schema_version": 999, "requests_served": 99}))
+        loaded = SchedulerMetrics.load_from(path)
+        assert loaded.requests_served == 0  # fresh, didn't trust the data
+
+    def test_save_creates_parent_dirs(self, tmp_path):
+        path = tmp_path / "deep" / "nested" / "metrics.json"
+        SchedulerMetrics(requests_served=5).save_to(path)
+        assert path.exists()
+        assert json.loads(path.read_text())["requests_served"] == 5
+
+    def test_save_io_error_logs_not_raises(self, tmp_path, monkeypatch):
+        # Simulate a disk-full or permission-denied scenario.
+        path = tmp_path / "metrics.json"
+
+        def boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "write_text", boom)
+        # Must not raise — best-effort persistence.
+        SchedulerMetrics(requests_served=1).save_to(path)
+
+    def test_to_json_dict_omits_started_at(self):
+        # started_at is process-local, never persisted.
+        d = SchedulerMetrics(started_at=999.0).to_json_dict()
+        assert "started_at" not in d
+        assert "schema_version" in d
 
 
 # ---------------------------------------------------------------------------
@@ -1072,3 +1146,336 @@ class TestIdleEvictUnusedModels:
 
         # Loop breaks after first eviction. Next tick handles the rest.
         assert sched.lifecycle.unload.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# BurstHints — X-Burst-Size header storage with TTL-based expiry
+# ---------------------------------------------------------------------------
+
+
+class TestBurstHintsRecord:
+    def test_records_hint_under_cap(self):
+        hints = BurstHints()
+        result = hints.record("ai-portfolio", "qwen3.5:9b", 10, max_skips=3, now=100.0)
+        # Cap = 3 * 4 = 12, so 10 fits and is stored verbatim.
+        assert result == 10
+
+    def test_caps_at_max_skips_times_multiplier(self):
+        hints = BurstHints()
+        # max_skips=3 → cap = 3*4 = 12. Asking for 999 gets clamped.
+        result = hints.record("attacker", "model", 999, max_skips=3)
+        assert result == 12
+
+    def test_zero_or_negative_ignored(self):
+        hints = BurstHints()
+        assert hints.record("p", "m", 0, max_skips=3) == 0
+        assert hints.record("p", "m", -5, max_skips=3) == 0
+        # Nothing stored.
+        assert hints.boost_for_model("m") == 0
+
+    def test_empty_program_or_model_ignored(self):
+        hints = BurstHints()
+        assert hints.record("", "m", 5, max_skips=3) == 0
+        assert hints.record("p", "", 5, max_skips=3) == 0
+        assert hints.boost_for_model("m") == 0
+
+    def test_refresh_replaces_previous(self):
+        hints = BurstHints()
+        hints.record("p", "m", 5, max_skips=3, now=100.0)
+        # Recording again with a different value replaces, not adds.
+        hints.record("p", "m", 8, max_skips=3, now=110.0)
+        assert hints.boost_for_model("m", now=110.0) == 8
+
+
+class TestBurstHintsBoostQueries:
+    def test_boost_for_model_sums_across_programs(self):
+        hints = BurstHints()
+        hints.record("ai-email", "qwen3.5:9b", 5, max_skips=3, now=100.0)
+        hints.record("ai-portfolio", "qwen3.5:9b", 7, max_skips=3, now=100.0)
+        # Two programs targeting the same model — boosts add.
+        assert hints.boost_for_model("qwen3.5:9b", now=101.0) == 12
+
+    def test_boost_for_model_ignores_other_models(self):
+        hints = BurstHints()
+        hints.record("p", "model-a", 5, max_skips=3, now=100.0)
+        hints.record("p", "model-b", 9, max_skips=3, now=100.0)
+        assert hints.boost_for_model("model-a", now=101.0) == 5
+        assert hints.boost_for_model("model-b", now=101.0) == 9
+
+    def test_boost_returns_zero_after_expiry(self):
+        # TTL is 30s by default. now=200 is well past 100+30=130.
+        hints = BurstHints()
+        hints.record("p", "m", 5, max_skips=3, now=100.0)
+        assert hints.boost_for_model("m", now=200.0) == 0
+
+    def test_aggregate_cap_clamps_per_model_sum(self):
+        """Per-model summed boost is clamped at max_skips * aggregate_multiplier.
+
+        Even if 100 distinct (attacker-controlled) program_ids each
+        register a hint at the per-pair cap, the eviction scorer reads
+        only the aggregate cap value — not 100 * per_pair_cap.
+        """
+        hints = BurstHints()
+        # Default aggregate_multiplier=8, max_skips=3 → cap = 24.
+        # Record 10 distinct programs each with per-pair cap=12 → raw
+        # sum would be 120 without the aggregate cap.
+        for i in range(10):
+            hints.record(f"p{i}", "target", 12, max_skips=3, now=100.0)
+        # Without max_skips passed: returns the raw sum.
+        assert hints.boost_for_model("target", now=101.0) == 120
+        # With max_skips=3 passed: clamped at 3 * 8 = 24.
+        assert hints.boost_for_model("target", max_skips=3, now=101.0) == 24
+
+    def test_all_boosts_by_model_aggregate_cap(self):
+        hints = BurstHints()
+        for i in range(10):
+            hints.record(f"p{i}", "target", 12, max_skips=3, now=100.0)
+        result = hints.all_boosts_by_model(max_skips=3, now=101.0)
+        assert result["target"] == 24
+
+
+class TestBurstHintsCapacity:
+    """Total-dict cap prevents unbounded growth from flooded distinct pairs."""
+
+    def test_drops_new_pair_when_at_capacity(self):
+        hints = BurstHints(max_live=3)
+        assert hints.record("p1", "m1", 5, max_skips=3) == 5
+        assert hints.record("p2", "m2", 5, max_skips=3) == 5
+        assert hints.record("p3", "m3", 5, max_skips=3) == 5
+        # 4th distinct pair is dropped.
+        assert hints.record("p4", "m4", 5, max_skips=3) == 0
+
+    def test_refresh_at_capacity_still_works(self):
+        # Refreshing an EXISTING pair works even when dict is full —
+        # otherwise legitimate burst-refresh traffic would be lost.
+        hints = BurstHints(max_live=2)
+        hints.record("p1", "m1", 5, max_skips=3, now=100.0)
+        hints.record("p2", "m2", 5, max_skips=3, now=100.0)
+        # At capacity. Refresh of an existing pair should succeed.
+        assert hints.record("p1", "m1", 8, max_skips=3, now=110.0) == 8
+
+    def test_all_boosts_by_model(self):
+        hints = BurstHints()
+        hints.record("p1", "model-a", 3, max_skips=3, now=100.0)
+        hints.record("p2", "model-a", 4, max_skips=3, now=100.0)
+        hints.record("p1", "model-b", 5, max_skips=3, now=100.0)
+        result = hints.all_boosts_by_model(now=101.0)
+        assert result == {"model-a": 7, "model-b": 5}
+
+
+class TestBurstHintsExpiry:
+    def test_prune_removes_expired_keeps_live(self):
+        hints = BurstHints()
+        hints.record("p", "old", 5, max_skips=3, now=10.0)  # expires at 40
+        hints.record("p", "fresh", 7, max_skips=3, now=100.0)  # expires at 130
+        removed = hints.prune_expired(now=110.0)
+        assert removed == 1
+        assert hints.boost_for_model("old", now=110.0) == 0
+        assert hints.boost_for_model("fresh", now=110.0) == 7
+
+    def test_prune_no_op_when_all_live(self):
+        hints = BurstHints()
+        hints.record("p", "m", 5, max_skips=3, now=100.0)
+        assert hints.prune_expired(now=120.0) == 0  # within TTL
+
+    def test_prune_empty_safe(self):
+        hints = BurstHints()
+        assert hints.prune_expired(now=100.0) == 0
+
+    def test_custom_ttl(self):
+        hints = BurstHints(ttl_s=5.0)
+        hints.record("p", "m", 5, max_skips=3, now=100.0)  # expires at 105
+        # 4s later: still live.
+        assert hints.boost_for_model("m", now=104.0) == 5
+        # 6s later: expired.
+        assert hints.boost_for_model("m", now=106.0) == 0
+
+
+class TestBurstHintsIntegration:
+    """End-to-end: scheduler eviction scoring picks up burst boosts."""
+
+    async def test_burst_protects_from_eviction(self):
+        sched = _make_scheduler()
+        # No actual envelopes for "burst-protected", so pending=0 normally.
+        # But a burst hint of 50 should make it the LEAST evictable model.
+        # Default scheduler config: max_skips=3, aggregate_multiplier=8 →
+        # per-model aggregate cap = 24. Even though the per-pair record
+        # accepts 50 (max_skips=15 → per-pair cap=60), the eviction-time
+        # call clamps the per-model sum to scheduler.max_skips * 8 = 24.
+        sched.burst_hints.record("ai-portfolio", "burst-protected", 50, max_skips=15)
+
+        memory = sched.memory
+        memory.get_loaded_models.return_value = {
+            "burst-protected": object(),
+            "low-priority": object(),
+        }
+
+        # The pending_by_model + burst_boosts dict that _evict_one builds
+        # should make low-priority the eviction target. Mock this by
+        # capturing what gets passed to memory.get_eviction_candidates.
+        captured: dict = {}
+
+        def capture(pending_counts, program_priorities):
+            captured["pending"] = dict(pending_counts)
+            return ["low-priority", "burst-protected"]
+
+        memory.get_eviction_candidates.side_effect = capture
+        sched.queues.pending_by_model = AsyncMock(return_value={})
+
+        await sched._evict_one(needed_for="other-model")
+
+        # Boost is added then capped at aggregate_multiplier * max_skips
+        # = 8 * 3 = 24 (using SchedulerConfig.max_skips default of 3).
+        assert captured["pending"]["burst-protected"] == 24
+        # The chosen target is low-priority — burst-protected stays loaded.
+        sched.lifecycle.unload.assert_awaited_with("low-priority")
+
+
+# ---------------------------------------------------------------------------
+# InflightTracker — per-model dispatch concurrency gate
+# ---------------------------------------------------------------------------
+
+
+class TestInflightTracker:
+    def test_default_at_least_one(self):
+        # 0 or negative would deadlock all dispatch — clamp to 1.
+        assert InflightTracker(0).parallel_per_model == 1
+        assert InflightTracker(-5).parallel_per_model == 1
+
+    def test_creates_semaphore_lazily(self):
+        tracker = InflightTracker(4)
+        sem_a = tracker.semaphore_for("model-a")
+        sem_b = tracker.semaphore_for("model-b")
+        # Same model returns the same semaphore — that is the whole point.
+        assert tracker.semaphore_for("model-a") is sem_a
+        assert sem_a is not sem_b
+
+    async def test_semaphore_caps_concurrency(self):
+        tracker = InflightTracker(2)
+        sem = tracker.semaphore_for("model")
+
+        in_flight = 0
+        peak = 0
+
+        async def worker():
+            nonlocal in_flight, peak
+            async with sem:
+                in_flight += 1
+                peak = max(peak, in_flight)
+                await asyncio.sleep(0.01)
+                in_flight -= 1
+
+        # 5 workers but cap is 2 — peak should never exceed 2.
+        await asyncio.gather(*(worker() for _ in range(5)))
+        assert peak == 2
+
+
+# ---------------------------------------------------------------------------
+# _process_batch with parallel_per_model
+# ---------------------------------------------------------------------------
+
+
+class TestProcessBatchParallelism:
+    """Verify dispatch concurrency matches scheduler.parallel_per_model."""
+
+    async def test_default_serializes(self):
+        # parallel_per_model=1 (default) → at most 1 in flight at a time.
+        # Patches `forward_request` (the Ollama HTTP boundary imported
+        # into scheduler.py), NOT `_forward_single` — per CLAUDE.md
+        # bright-line #1, tests must not patch internal ollama_marshal
+        # methods. `forward_request` is the legitimate mock target.
+        sched = _make_scheduler()
+        batch = [_make_envelope(model="m") for _ in range(5)]
+
+        in_flight = 0
+        peak = 0
+
+        async def fake_request(*_args, **_kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.005)
+            in_flight -= 1
+            return MagicMock()
+
+        with patch(
+            "ollama_marshal.scheduler.forward_request", side_effect=fake_request
+        ):
+            await sched._process_batch(batch)
+
+        assert peak == 1  # current behavior: serial
+
+    async def test_parallel_4_runs_4_concurrent(self):
+        cfg = _make_config(**{"scheduler.parallel_per_model": 4})
+        sched = _make_scheduler(config=cfg)
+        batch = [_make_envelope(model="m") for _ in range(10)]
+
+        in_flight = 0
+        peak = 0
+
+        async def fake_request(*_args, **_kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.005)
+            in_flight -= 1
+            return MagicMock()
+
+        with patch(
+            "ollama_marshal.scheduler.forward_request", side_effect=fake_request
+        ):
+            await sched._process_batch(batch)
+
+        # Cap at parallel_per_model. (Could be < 4 if scheduling jitter
+        # never lined up 4-at-a-time, but with 10 envelopes and a real
+        # event loop they should overlap.)
+        assert peak <= 4
+        assert peak >= 2  # at least some parallelism observed
+
+    async def test_embeddings_always_concurrent(self):
+        # Embeddings ignore the gate — they should fan out in parallel
+        # regardless of parallel_per_model setting.
+        sched = _make_scheduler()  # default parallel_per_model=1
+        batch = [
+            _make_envelope(model="m", endpoint="/api/embeddings") for _ in range(5)
+        ]
+
+        in_flight = 0
+        peak = 0
+
+        async def fake_request(*_args, **_kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.005)
+            in_flight -= 1
+            return MagicMock()
+
+        with patch(
+            "ollama_marshal.scheduler.forward_request", side_effect=fake_request
+        ):
+            await sched._process_batch(batch)
+
+        assert peak == 5  # all 5 embeddings ran concurrently
+
+    async def test_semaphore_releases_on_exception(self):
+        # If forward_request raises, the semaphore must still release;
+        # otherwise a single failure permanently shrinks the cap.
+        cfg = _make_config(**{"scheduler.parallel_per_model": 2})
+        sched = _make_scheduler(config=cfg)
+        batch = [_make_envelope(model="m") for _ in range(4)]
+
+        async def bad_request(*_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        with patch("ollama_marshal.scheduler.forward_request", side_effect=bad_request):
+            # _forward_single catches and logs; gather(return_exceptions)
+            # swallows what's left.
+            await sched._process_batch(batch)
+
+        # All 4 should have been attempted (semaphore released after each).
+        # Verify the semaphore is back to fully available (2/2 free).
+        sem = sched.inflight.semaphore_for("m")
+        # Both slots free → can acquire twice without blocking.
+        async with sem, sem:
+            pass

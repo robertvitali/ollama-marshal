@@ -10,6 +10,39 @@ permissions:
   contents: read
 
 jobs:
+  # Block feature branches from modifying the Claude review/security
+  # workflow files. The `anthropics/claude-code-action@v1` token-exchange
+  # rejects PRs where these workflow files differ from main (anti-tamper
+  # safety check), causing every PR that bundles a workflow tweak with
+  # substantive code to silently fail its review check. Workflow changes
+  # to these files must ride on a dedicated `chore/ci-*` branch straight
+  # to main, then feature branches inherit them via rebase.
+  guard-workflow-changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Block claude-* workflow edits on non-chore branches
+        run: |
+          BRANCH="${GITHUB_HEAD_REF}"
+          if [[ "$BRANCH" == chore/ci-* ]]; then
+            echo "Branch '$BRANCH' is a CI chore branch — workflow edits allowed."
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only origin/main..HEAD -- \
+            .github/workflows/claude-review.yml \
+            .github/workflows/claude-security.yml)
+          if [[ -n "$CHANGED" ]]; then
+            echo "::error::Feature branches must not modify Claude workflow files."
+            echo "::error::Changed: $CHANGED"
+            echo "::error::Open a separate PR from a chore/ci-* branch first; rebase."
+            echo "::error::See CLAUDE.md → 'Workflow file discipline'."
+            exit 1
+          fi
+          echo "No claude-* workflow file changes — safe to merge."
+
   lint:
     runs-on: ubuntu-latest
     steps:

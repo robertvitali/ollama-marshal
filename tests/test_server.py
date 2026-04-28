@@ -58,6 +58,22 @@ def _mock_scheduler():
     return sched
 
 
+def _mock_registry():
+    """Stub registry whose probe_metadata is an awaitable that returns None.
+
+    Prevents the num_ctx injection helper from blowing up in tests that
+    set module globals directly without going through lifespan. Returning
+    None means injection is a no-op (current Ollama default behavior).
+    """
+    from ollama_marshal.registry import ModelRegistry
+
+    reg = MagicMock(spec=ModelRegistry)
+    reg.probe_metadata = AsyncMock(return_value=None)
+    reg.get_metadata = MagicMock(return_value=None)
+    reg.get_max_context = MagicMock(return_value=None)
+    return reg
+
+
 # ---------------------------------------------------------------------------
 # create_app
 # ---------------------------------------------------------------------------
@@ -541,6 +557,211 @@ class TestMarshalStatus:
 
 
 # ---------------------------------------------------------------------------
+# _record_burst_hint — X-Burst-Size header extraction
+# ---------------------------------------------------------------------------
+
+
+class TestRecordBurstHint:
+    def _request(self, headers: dict) -> MagicMock:
+        req = MagicMock()
+        req.headers = headers
+        return req
+
+    def test_records_when_header_present(self):
+        sched = MagicMock()
+        sched.burst_hints = MagicMock()
+        sched.burst_hints.record = MagicMock(return_value=10)
+        cfg = MagicMock()
+        cfg.scheduler.max_skips = 5
+        original_sched = getattr(server_mod, "_scheduler", None)
+        original_cfg = getattr(server_mod, "_config", None)
+        server_mod._scheduler = sched
+        server_mod._config = cfg
+        try:
+            server_mod._record_burst_hint(
+                self._request({"x-burst-size": "10"}), "ai-portfolio", "qwen3"
+            )
+        finally:
+            if original_sched is not None:
+                server_mod._scheduler = original_sched
+            if original_cfg is not None:
+                server_mod._config = original_cfg
+        sched.burst_hints.record.assert_called_once_with("ai-portfolio", "qwen3", 10, 5)
+
+    def test_skips_when_header_absent(self):
+        sched = MagicMock()
+        sched.burst_hints = MagicMock()
+        original_sched = getattr(server_mod, "_scheduler", None)
+        server_mod._scheduler = sched
+        try:
+            server_mod._record_burst_hint(self._request({}), "ai-portfolio", "qwen3")
+        finally:
+            if original_sched is not None:
+                server_mod._scheduler = original_sched
+        sched.burst_hints.record.assert_not_called()
+
+    def test_skips_non_numeric_header(self):
+        sched = MagicMock()
+        sched.burst_hints = MagicMock()
+        original_sched = getattr(server_mod, "_scheduler", None)
+        server_mod._scheduler = sched
+        try:
+            server_mod._record_burst_hint(
+                self._request({"x-burst-size": "not-a-number"}), "p", "m"
+            )
+        finally:
+            if original_sched is not None:
+                server_mod._scheduler = original_sched
+        sched.burst_hints.record.assert_not_called()
+
+    def test_skips_zero_or_negative(self):
+        sched = MagicMock()
+        sched.burst_hints = MagicMock()
+        original_sched = getattr(server_mod, "_scheduler", None)
+        server_mod._scheduler = sched
+        try:
+            server_mod._record_burst_hint(
+                self._request({"x-burst-size": "0"}), "p", "m"
+            )
+            server_mod._record_burst_hint(
+                self._request({"x-burst-size": "-5"}), "p", "m"
+            )
+        finally:
+            if original_sched is not None:
+                server_mod._scheduler = original_sched
+        sched.burst_hints.record.assert_not_called()
+
+    def test_skips_when_scheduler_unset(self):
+        # No scheduler in module globals (e.g., tests bypassing lifespan).
+        original_sched = getattr(server_mod, "_scheduler", None)
+        if hasattr(server_mod, "_scheduler"):
+            del server_mod._scheduler
+        try:
+            # Should not raise.
+            server_mod._record_burst_hint(
+                self._request({"x-burst-size": "10"}), "p", "m"
+            )
+        finally:
+            if original_sched is not None:
+                server_mod._scheduler = original_sched
+
+
+# ---------------------------------------------------------------------------
+# _inject_num_ctx
+# ---------------------------------------------------------------------------
+
+
+class TestInjectNumCtx:
+    """Verify the num_ctx-injection helper.
+
+    Stops Ollama from silently truncating context when KV cache slots
+    don't fit at the model's full architectural context length.
+    """
+
+    async def test_injects_when_options_missing(self):
+        """No options block at all → registry max gets injected."""
+        from ollama_marshal.registry import ModelMetadata
+
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(
+            return_value=ModelMetadata(
+                name="qwen3.5:9b-bf16",
+                architecture="qwen3",
+                max_context_length=32768,
+                num_layers=28,
+                embedding_length=3584,
+                head_count=28,
+                head_count_kv=4,
+            )
+        )
+        original_registry = getattr(server_mod, "_registry", None)
+        server_mod._registry = registry
+
+        body: dict = {"model": "qwen3.5:9b-bf16"}
+        try:
+            await server_mod._inject_num_ctx("qwen3.5:9b-bf16", body)
+        finally:
+            if original_registry is not None:
+                server_mod._registry = original_registry
+            else:
+                del server_mod._registry
+
+        assert body["options"]["num_ctx"] == 32768
+
+    async def test_preserves_existing_num_ctx(self):
+        """Client-set num_ctx wins."""
+        from ollama_marshal.registry import ModelMetadata
+
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(
+            return_value=ModelMetadata(
+                name="m",
+                architecture="x",
+                max_context_length=99999,
+                num_layers=1,
+                embedding_length=1,
+                head_count=1,
+                head_count_kv=1,
+            )
+        )
+        original_registry = getattr(server_mod, "_registry", None)
+        server_mod._registry = registry
+        body: dict = {"model": "m", "options": {"num_ctx": 4096}}
+        try:
+            await server_mod._inject_num_ctx("m", body)
+        finally:
+            if original_registry is not None:
+                server_mod._registry = original_registry
+            else:
+                del server_mod._registry
+        # Client value preserved.
+        assert body["options"]["num_ctx"] == 4096
+
+    async def test_skips_when_metadata_missing(self):
+        """No metadata for the model → no injection (don't break unknown models)."""
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(return_value=None)
+        original_registry = getattr(server_mod, "_registry", None)
+        server_mod._registry = registry
+        body: dict = {"model": "unknown:xyz"}
+        try:
+            await server_mod._inject_num_ctx("unknown:xyz", body)
+        finally:
+            if original_registry is not None:
+                server_mod._registry = original_registry
+            else:
+                del server_mod._registry
+        # No options block created when there's nothing to set.
+        assert body.get("options", {}).get("num_ctx") is None
+
+    async def test_skips_when_model_empty(self):
+        body: dict = {}
+        await server_mod._inject_num_ctx("", body)
+        assert "options" not in body or "num_ctx" not in body["options"]
+
+    async def test_skips_when_options_not_dict(self):
+        """Defensive: client sent something weird as options. Don't touch it."""
+        body: dict = {"model": "m", "options": "not a dict"}
+        await server_mod._inject_num_ctx("m", body)
+        assert body["options"] == "not a dict"
+
+    async def test_skips_when_registry_unset(self):
+        """Tests that bypass lifespan don't crash the helper."""
+        # Capture and remove _registry entirely.
+        original_registry = getattr(server_mod, "_registry", None)
+        if hasattr(server_mod, "_registry"):
+            del server_mod._registry
+        body: dict = {"model": "m"}
+        try:
+            await server_mod._inject_num_ctx("m", body)
+        finally:
+            if original_registry is not None:
+                server_mod._registry = original_registry
+        # No injection happened.
+        assert "num_ctx" not in body.get("options", {})
+
+
+# ---------------------------------------------------------------------------
 # lifespan
 # ---------------------------------------------------------------------------
 
@@ -673,6 +894,162 @@ class TestLifespan:
 
             lifecycle.unload_all.assert_not_called()
 
+    async def test_lifespan_restores_metrics_from_disk(self, tmp_path):
+        """Lifespan reads metrics.json on startup and seeds counters."""
+        import json
+
+        metrics_path = tmp_path / "metrics.json"
+        metrics_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "saved_at": "2026-04-28T03:00:00+00:00",
+                    "requests_served": 100,
+                    "model_swaps": 5,
+                    "evictions": 2,
+                    "total_wait_ms": 12345.6,
+                }
+            )
+        )
+
+        config = MarshalConfig()
+        app = create_app(config)
+        app.state.metrics_path = metrics_path  # override for this test
+
+        memory, registry, lifecycle, scheduler, queues = _make_mock_components()
+        # Real-shape metrics object so the lifespan can mutate fields.
+        from ollama_marshal.scheduler import SchedulerMetrics as RealMetrics
+
+        scheduler.metrics = RealMetrics()
+
+        with (
+            patch("ollama_marshal.server.MemoryManager", return_value=memory),
+            patch("ollama_marshal.server.ModelRegistry", return_value=registry),
+            patch(
+                "ollama_marshal.server.ModelLifecycle",
+                return_value=lifecycle,
+            ),
+            patch("ollama_marshal.server.Scheduler", return_value=scheduler),
+            patch("ollama_marshal.server.ModelQueues", return_value=queues),
+        ):
+            async with server_mod.lifespan(app):
+                # Counters seeded from disk.
+                assert scheduler.metrics.requests_served == 100
+                assert scheduler.metrics.model_swaps == 5
+                assert scheduler.metrics.evictions == 2
+                assert scheduler.metrics.total_wait_ms == 12345.6
+
+        # Final snapshot was rewritten at shutdown.
+        on_disk = json.loads(metrics_path.read_text())
+        assert on_disk["requests_served"] == 100
+        assert on_disk["schema_version"] == 1
+
+    async def test_lifespan_starts_with_fresh_metrics_when_no_file(self, tmp_path):
+        """No metrics.json on disk → counters start at zero, no error."""
+        config = MarshalConfig()
+        app = create_app(config)
+        app.state.metrics_path = tmp_path / "fresh.json"
+
+        memory, registry, lifecycle, scheduler, queues = _make_mock_components()
+        from ollama_marshal.scheduler import SchedulerMetrics as RealMetrics
+
+        scheduler.metrics = RealMetrics()
+
+        with (
+            patch("ollama_marshal.server.MemoryManager", return_value=memory),
+            patch("ollama_marshal.server.ModelRegistry", return_value=registry),
+            patch(
+                "ollama_marshal.server.ModelLifecycle",
+                return_value=lifecycle,
+            ),
+            patch("ollama_marshal.server.Scheduler", return_value=scheduler),
+            patch("ollama_marshal.server.ModelQueues", return_value=queues),
+        ):
+            async with server_mod.lifespan(app):
+                assert scheduler.metrics.requests_served == 0
+
+        # Final shutdown save creates the file.
+        assert (tmp_path / "fresh.json").exists()
+
+    async def test_lifespan_cancels_running_benchmark_on_shutdown(self, tmp_path):
+        """If benchmark_unknown is still running at shutdown, it must be cancelled."""
+        config = MarshalConfig()
+        config.scheduler.metrics_path = str(tmp_path / "metrics.json")
+        app = create_app(config)
+
+        memory, registry, lifecycle, scheduler, queues = _make_mock_components()
+        from ollama_marshal.scheduler import SchedulerMetrics as RealMetrics
+
+        scheduler.metrics = RealMetrics()
+
+        # Long-running benchmark — would never complete on its own.
+        async def slow_benchmark():
+            await asyncio.sleep(60)
+
+        registry.benchmark_unknown = slow_benchmark
+
+        with (
+            patch("ollama_marshal.server.MemoryManager", return_value=memory),
+            patch("ollama_marshal.server.ModelRegistry", return_value=registry),
+            patch(
+                "ollama_marshal.server.ModelLifecycle",
+                return_value=lifecycle,
+            ),
+            patch("ollama_marshal.server.Scheduler", return_value=scheduler),
+            patch("ollama_marshal.server.ModelQueues", return_value=queues),
+        ):
+            async with server_mod.lifespan(app):
+                pass
+        # If the cancel branch didn't execute, the lifespan would hang
+        # for 60s; the fact this test returned in milliseconds proves
+        # the task was cancelled cleanly.
+
+    async def test_lifespan_starts_audit_logger_when_enabled(self, tmp_path):
+        """audit.enabled=True wires a real AuditLogger into the scheduler."""
+        from ollama_marshal.audit import AuditLogger
+        from ollama_marshal.config import AuditConfig
+
+        config = MarshalConfig()
+        config.scheduler.metrics_path = str(tmp_path / "metrics.json")
+        config.audit = AuditConfig(
+            enabled=True,
+            path=str(tmp_path / "audit.jsonl"),
+            retention_days=0,
+            max_size_mb=0,
+        )
+        app = create_app(config)
+
+        memory, registry, lifecycle, scheduler, queues = _make_mock_components()
+        from ollama_marshal.scheduler import SchedulerMetrics as RealMetrics
+
+        scheduler.metrics = RealMetrics()
+        # Capture what gets installed on scheduler.audit.
+        installed_audit = []
+
+        def capture_audit(value):
+            installed_audit.append(value)
+
+        type(scheduler).audit = property(
+            lambda self: installed_audit[-1] if installed_audit else None,
+            lambda self, v: capture_audit(v),
+        )
+
+        with (
+            patch("ollama_marshal.server.MemoryManager", return_value=memory),
+            patch("ollama_marshal.server.ModelRegistry", return_value=registry),
+            patch(
+                "ollama_marshal.server.ModelLifecycle",
+                return_value=lifecycle,
+            ),
+            patch("ollama_marshal.server.Scheduler", return_value=scheduler),
+            patch("ollama_marshal.server.ModelQueues", return_value=queues),
+        ):
+            async with server_mod.lifespan(app):
+                # A real AuditLogger must have been installed on scheduler.
+                assert installed_audit, "no audit installed on scheduler"
+                assert isinstance(installed_audit[-1], AuditLogger)
+                assert installed_audit[-1].enabled is True
+
 
 # ---------------------------------------------------------------------------
 # Route handler bodies via direct invocation
@@ -692,6 +1069,10 @@ class TestRouteHandlers:
         server_mod._config = MarshalConfig()
         server_mod._memory = _mock_memory()
         server_mod._scheduler = _mock_scheduler()
+        # _registry must be set explicitly — TestLifespan patches the
+        # ModelRegistry class and leaves a MagicMock as the module global,
+        # which would crash the num_ctx-injection helper if not reset.
+        server_mod._registry = _mock_registry()
         server_mod._started_at = time.monotonic()
 
     async def test_api_chat_handler(self):
