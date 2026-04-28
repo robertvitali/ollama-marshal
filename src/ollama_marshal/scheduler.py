@@ -127,6 +127,53 @@ class BurstHints:
         return before - len(self._hints)
 
 
+class InflightTracker:
+    """Per-model concurrent-dispatch gate.
+
+    Issues an `asyncio.Semaphore` per model name, sized by
+    `scheduler.parallel_per_model`. Marshal's `_process_batch` acquires
+    a slot before forwarding a non-embedding request, so for any given
+    loaded model at most N requests are in flight at once.
+
+    This complements (rather than replaces) Ollama's own NUM_PARALLEL:
+
+    - Ollama allocates KV cache slots when a model loads, sized by its
+      OLLAMA_NUM_PARALLEL env var. That fixes Ollama's hard ceiling.
+    - Marshal's tracker gates dispatch beneath that ceiling. With
+      OLLAMA_NUM_PARALLEL=8 and parallel_per_model=4, at most 4 requests
+      are in flight; the other 4 of Ollama's slots stay idle.
+
+    Concurrency naturally adapts to demand: if only 1 envelope is queued,
+    only 1 is dispatched (semaphore stays at 0/N). If 5 same-model
+    envelopes arrive concurrently with N=4, 4 dispatch in parallel and
+    the 5th waits on the semaphore (in-process — Ollama doesn't see it
+    yet).
+    """
+
+    def __init__(self, parallel_per_model: int) -> None:
+        self._parallel = max(1, int(parallel_per_model))
+        self._sems: dict[str, asyncio.Semaphore] = {}
+
+    @property
+    def parallel_per_model(self) -> int:
+        """Configured per-model concurrency limit."""
+        return self._parallel
+
+    def semaphore_for(self, model: str) -> asyncio.Semaphore:
+        """Return (creating if needed) the semaphore for `model`.
+
+        Created lazily so memory isn't burned on cold models. Lifetime
+        matches the scheduler — semaphores are not pruned on eviction
+        because reusing the same semaphore on reload is harmless and
+        cheaper than recreating.
+        """
+        sem = self._sems.get(model)
+        if sem is None:
+            sem = asyncio.Semaphore(self._parallel)
+            self._sems[model] = sem
+        return sem
+
+
 @dataclass
 class SchedulerMetrics:
     """Tracks scheduler performance metrics.
@@ -201,6 +248,10 @@ class Scheduler:
         # eviction scorer to keep loaded models alive across silent gaps
         # between same-program calls.
         self.burst_hints = BurstHints()
+        # Per-model concurrent-dispatch gate. parallel_per_model defaults
+        # to 1 (current sequential behavior). When raised, _process_batch
+        # fans out same-model envelopes through this semaphore.
+        self.inflight = InflightTracker(config.scheduler.parallel_per_model)
 
     async def start(self) -> None:
         """Start the scheduler loop."""
@@ -520,8 +571,12 @@ class Scheduler:
     async def _process_batch(self, batch: list[RequestEnvelope]) -> None:
         """Process a batch of requests by forwarding them to Ollama.
 
-        Streaming and non-streaming requests are handled differently.
-        Embedding requests are sent concurrently for throughput.
+        Embeddings always run concurrently (they're cheap and short).
+        Non-embeddings are gated through `InflightTracker` so per-model
+        concurrent dispatches never exceed `scheduler.parallel_per_model`.
+        With the default value of 1, this preserves v0.2.x sequential
+        behavior. With a higher value (and matching OLLAMA_NUM_PARALLEL),
+        same-model envelopes fan out and Ollama serves them in parallel.
 
         Args:
             batch: List of request envelopes to process.
@@ -535,11 +590,20 @@ class Scheduler:
             else:
                 others.append(envelope)
 
-        # Process non-embedding requests sequentially
-        for envelope in others:
-            await self._forward_single(envelope)
+        # Non-embeddings: gated by per-model parallelism budget. All
+        # envelopes in `others` share the same model (callers always
+        # build per-model batches via dequeue_batch), so a single
+        # semaphore handles the whole group.
+        if others:
+            sem = self.inflight.semaphore_for(others[0].model)
 
-        # Process embeddings concurrently
+            async def _gated(env: RequestEnvelope) -> None:
+                async with sem:
+                    await self._forward_single(env)
+
+            await asyncio.gather(*(_gated(e) for e in others), return_exceptions=True)
+
+        # Embeddings always concurrent (no semaphore — they're fast).
         if embeddings:
             tasks = [self._forward_single(e) for e in embeddings]
             await asyncio.gather(*tasks, return_exceptions=True)

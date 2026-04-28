@@ -32,6 +32,14 @@ scheduler:
                                     # after this many minutes of no activity. 0 disables
                                     # time-based eviction (only memory-pressure eviction).
                                     # Models with pending requests are never time-evicted.
+  parallel_per_model: 1            # MARSHAL_SCHEDULER_PARALLEL_PER_MODEL — max concurrent
+                                    # inference dispatches to a single loaded model. Default 1
+                                    # = v0.2.x sequential behavior. To unlock parallel execution:
+                                    # 1. Start Ollama with OLLAMA_NUM_PARALLEL >= this value
+                                    #    (so Ollama allocates enough KV cache slots).
+                                    # 2. Raise this value to match.
+                                    # Marshal scales actual concurrency with queue depth (a
+                                    # 1-envelope queue still serves 1 at a time).
 
 # Per-program configuration
 # Programs identify themselves via the X-Program-ID header.

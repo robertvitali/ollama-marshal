@@ -103,6 +103,17 @@ class SchedulerConfig(BaseModel):
             "Models with pending requests are never time-evicted."
         ),
     )
+    parallel_per_model: int = Field(
+        default=1,
+        description=(
+            "Max concurrent inference dispatches per loaded model. Default 1 "
+            "matches v0.2.x sequential behavior. To benefit from parallel "
+            "execution: (1) set OLLAMA_NUM_PARALLEL >= this value at Ollama "
+            "server startup so Ollama allocates enough KV cache slots, "
+            "(2) raise this value to match. Marshal scales actual concurrency "
+            "with queue depth (a 1-envelope queue still serves 1 at a time)."
+        ),
+    )
 
 
 class ProgramConfig(BaseModel):
@@ -219,6 +230,7 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 "drain_timeout",
                 "request_timeout_s",
                 "idle_eviction_minutes",
+                "parallel_per_model",
             ):
                 data[section][field] = int(value)
             elif field == "unload_models":

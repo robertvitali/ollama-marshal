@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from ollama_marshal.config import MarshalConfig, Priority, ProgramConfig
 from ollama_marshal.queue import ModelQueues, RequestEnvelope
-from ollama_marshal.scheduler import BurstHints, Scheduler, SchedulerMetrics
+from ollama_marshal.scheduler import (
+    BurstHints,
+    InflightTracker,
+    Scheduler,
+    SchedulerMetrics,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1205,3 +1211,140 @@ class TestBurstHintsIntegration:
         assert captured["pending"]["burst-protected"] == 50
         # And the chosen target was low-priority (not the burst one).
         sched.lifecycle.unload.assert_awaited_with("low-priority")
+
+
+# ---------------------------------------------------------------------------
+# InflightTracker — per-model dispatch concurrency gate
+# ---------------------------------------------------------------------------
+
+
+class TestInflightTracker:
+    def test_default_at_least_one(self):
+        # 0 or negative would deadlock all dispatch — clamp to 1.
+        assert InflightTracker(0).parallel_per_model == 1
+        assert InflightTracker(-5).parallel_per_model == 1
+
+    def test_creates_semaphore_lazily(self):
+        tracker = InflightTracker(4)
+        sem_a = tracker.semaphore_for("model-a")
+        sem_b = tracker.semaphore_for("model-b")
+        # Same model returns the same semaphore — that is the whole point.
+        assert tracker.semaphore_for("model-a") is sem_a
+        assert sem_a is not sem_b
+
+    async def test_semaphore_caps_concurrency(self):
+        tracker = InflightTracker(2)
+        sem = tracker.semaphore_for("model")
+
+        in_flight = 0
+        peak = 0
+
+        async def worker():
+            nonlocal in_flight, peak
+            async with sem:
+                in_flight += 1
+                peak = max(peak, in_flight)
+                await asyncio.sleep(0.01)
+                in_flight -= 1
+
+        # 5 workers but cap is 2 — peak should never exceed 2.
+        await asyncio.gather(*(worker() for _ in range(5)))
+        assert peak == 2
+
+
+# ---------------------------------------------------------------------------
+# _process_batch with parallel_per_model
+# ---------------------------------------------------------------------------
+
+
+class TestProcessBatchParallelism:
+    """Verify dispatch concurrency matches scheduler.parallel_per_model."""
+
+    async def test_default_serializes(self):
+        # parallel_per_model=1 (default) → at most 1 in flight at a time.
+        sched = _make_scheduler()
+        # Five envelopes all for the same model.
+        batch = [_make_envelope(model="m") for _ in range(5)]
+
+        in_flight = 0
+        peak = 0
+
+        async def fake_forward(env):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.005)
+            in_flight -= 1
+
+        with patch.object(sched, "_forward_single", side_effect=fake_forward):
+            await sched._process_batch(batch)
+
+        assert peak == 1  # current behavior: serial
+
+    async def test_parallel_4_runs_4_concurrent(self):
+        cfg = _make_config(**{"scheduler.parallel_per_model": 4})
+        sched = _make_scheduler(config=cfg)
+        batch = [_make_envelope(model="m") for _ in range(10)]
+
+        in_flight = 0
+        peak = 0
+
+        async def fake_forward(env):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.005)
+            in_flight -= 1
+
+        with patch.object(sched, "_forward_single", side_effect=fake_forward):
+            await sched._process_batch(batch)
+
+        # Cap at parallel_per_model. (Could be < 4 if scheduling jitter
+        # never lined up 4-at-a-time, but with 10 envelopes and a real
+        # event loop they should overlap.)
+        assert peak <= 4
+        assert peak >= 2  # at least some parallelism observed
+
+    async def test_embeddings_always_concurrent(self):
+        # Embeddings ignore the gate — they should fan out in parallel
+        # regardless of parallel_per_model setting.
+        sched = _make_scheduler()  # default parallel_per_model=1
+        batch = [
+            _make_envelope(model="m", endpoint="/api/embeddings") for _ in range(5)
+        ]
+
+        in_flight = 0
+        peak = 0
+
+        async def fake_forward(env):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.005)
+            in_flight -= 1
+
+        with patch.object(sched, "_forward_single", side_effect=fake_forward):
+            await sched._process_batch(batch)
+
+        assert peak == 5  # all 5 embeddings ran concurrently
+
+    async def test_semaphore_releases_on_exception(self):
+        # If _forward_single raises, the semaphore must still release;
+        # otherwise a single failure permanently shrinks the cap.
+        cfg = _make_config(**{"scheduler.parallel_per_model": 2})
+        sched = _make_scheduler(config=cfg)
+        batch = [_make_envelope(model="m") for _ in range(4)]
+
+        async def bad_forward(env):
+            raise RuntimeError("boom")
+
+        with patch.object(sched, "_forward_single", side_effect=bad_forward):
+            # asyncio.gather(return_exceptions=True) swallows them.
+            await sched._process_batch(batch)
+
+        # All 4 should have been attempted (semaphore released after each).
+        # Verify the semaphore is back to fully available (2/2 free).
+        sem = sched.inflight.semaphore_for("m")
+        # Both slots free → can acquire twice without blocking.
+        async with sem, sem:
+            pass
