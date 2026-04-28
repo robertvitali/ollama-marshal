@@ -982,3 +982,82 @@ class TestRemoveModelClearsBothCaches:
         assert "qwen3.5:9b-bf16" not in json.loads(
             (tmp_path / "metadata.json").read_text()
         )
+
+
+# ---------------------------------------------------------------------------
+# is_known_model + opportunistic resync
+# ---------------------------------------------------------------------------
+
+
+class TestIsKnownModel:
+    async def test_returns_true_for_cached_model(self, registry):
+        registry._known_models = {"llama3:latest", "mistral:latest"}
+        registry._known_models_last_sync = 9_999_999.0  # block resync
+        assert await registry.is_known_model("llama3:latest") is True
+
+    async def test_returns_false_for_unknown_within_resync_window(self, registry):
+        # Simulate a recent sync — should not re-fetch.
+        import time as _time
+
+        registry._known_models = {"llama3:latest"}
+        registry._known_models_last_sync = _time.monotonic()
+        # No mock — if it tried to fetch, it'd raise (no Ollama in tests).
+        assert await registry.is_known_model("nope:latest") is False
+
+    async def test_resyncs_after_window_expires(self, registry):
+        # Stale last_sync forces a re-fetch.
+        registry._known_models = set()
+        registry._known_models_last_sync = 0.0  # very old
+
+        with patch.object(
+            registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            return_value=["just-pulled:latest"],
+        ):
+            result = await registry.is_known_model("just-pulled:latest")
+
+        assert result is True
+        assert "just-pulled:latest" in registry._known_models
+
+    async def test_resync_failure_fails_open(self, registry):
+        # If Ollama is unreachable mid-flight, prefer letting the request
+        # through over wrongly 404-ing.
+        registry._known_models = set()
+        registry._known_models_last_sync = 0.0
+
+        with patch.object(
+            registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            side_effect=httpx.HTTPError("ollama down"),
+        ):
+            assert await registry.is_known_model("anything:latest") is True
+
+    async def test_returns_false_after_resync_still_missing(self, registry):
+        # User asked for a model that wasn't pulled — re-sync confirms it.
+        registry._known_models = {"old:latest"}
+        registry._known_models_last_sync = 0.0
+
+        with patch.object(
+            registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            return_value=["old:latest"],
+        ):
+            assert await registry.is_known_model("never-pulled:latest") is False
+
+    async def test_sync_with_ollama_populates_known_models(self, populated_registry):
+        with patch.object(
+            populated_registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            return_value=["llama3:latest", "mistral:latest"],
+        ):
+            await populated_registry._sync_with_ollama()
+
+        assert populated_registry._known_models == {
+            "llama3:latest",
+            "mistral:latest",
+        }
+        assert populated_registry._known_models_last_sync > 0.0

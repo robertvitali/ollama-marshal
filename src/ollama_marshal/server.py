@@ -421,6 +421,21 @@ def _record_burst_hint(request: Request, program_id: str, model: str) -> None:
     sched.burst_hints.record(program_id, model, n, max_skips)
 
 
+async def _is_known_model(model: str) -> bool:
+    """Check if `model` is installed in Ollama (defensive against missing registry).
+
+    Wraps `_registry.is_known_model(...)` with a fallback when the
+    registry isn't initialized (test paths that bypass lifespan). In
+    that case we fail open — let the request through and let the
+    scheduler handle the missing-model error normally.
+    """
+    registry = globals().get("_registry")
+    if registry is None or not hasattr(registry, "is_known_model"):
+        return True
+    result: bool = await registry.is_known_model(model)
+    return result
+
+
 async def _inject_num_ctx(model: str, body: dict[str, Any]) -> None:
     """Inject `options.num_ctx = model_max_context` if the client didn't set one.
 
@@ -499,6 +514,28 @@ async def _enqueue_inference(
     stream = body.get("stream", False)
     program_id = request.headers.get("x-program-id", "default")
     timeout_s = _resolve_timeout(request)
+
+    # Fail-fast on unknown models. Without this, marshal would let the
+    # request sit in the queue for proxy.request_timeout_s (default 1h)
+    # while lifecycle.preload retries every ~2 min trying to load a
+    # model Ollama doesn't have. Better to return 404 in milliseconds
+    # so the client gets a clear, fast error.
+    if model and not await _is_known_model(model):
+        logger.warning(
+            "server.request_rejected_unknown_model",
+            model=model,
+            program=program_id,
+            endpoint=endpoint,
+        )
+        return JSONResponse(
+            {
+                "error": (
+                    f"Model {model!r} is not installed in Ollama. "
+                    f"Run `ollama pull {model}` or check the model name."
+                )
+            },
+            status_code=404,
+        )
 
     # Capture optional X-Burst-Size hint so the eviction scorer protects
     # this model across the rest of the burst even if the client submits
@@ -603,6 +640,31 @@ async def _enqueue_and_wait(
     """
     program_id = request.headers.get("x-program-id", "default")
     timeout_s = _resolve_timeout(request)
+
+    # Same fail-fast unknown-model check as _enqueue_inference. OpenAI
+    # clients are especially likely to mis-name models since they
+    # share name conventions with the OpenAI catalog (e.g. "gpt-4")
+    # rather than Ollama's local-model names.
+    if model and not await _is_known_model(model):
+        logger.warning(
+            "server.request_rejected_unknown_model",
+            model=model,
+            program=program_id,
+            endpoint=endpoint,
+        )
+        return JSONResponse(
+            {
+                "error": {
+                    "message": (
+                        f"Model {model!r} is not installed in Ollama. "
+                        f"Run `ollama pull {model}` or check the model name."
+                    ),
+                    "type": "model_not_found",
+                    "code": "model_not_found",
+                }
+            },
+            status_code=404,
+        )
 
     # Capture optional burst-size hint (same semantics as the Ollama-
     # native path).

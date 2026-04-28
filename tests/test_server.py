@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -506,6 +507,163 @@ class TestEnqueueAndWait:
                 await task
             except asyncio.CancelledError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Fail-fast on unknown models (Surface B)
+# ---------------------------------------------------------------------------
+
+
+class TestFailFastUnknownModel:
+    """Marshal must 404 in milliseconds for models not installed in Ollama.
+
+    Without this, the request would sit in the queue for proxy.request_timeout_s
+    (default 1h) while lifecycle.preload retries trying to load a model
+    Ollama doesn't have.
+    """
+
+    def _registry_with_known(self, *, known: bool) -> MagicMock:
+        from ollama_marshal.registry import ModelRegistry
+
+        reg = MagicMock(spec=ModelRegistry)
+        reg.is_known_model = AsyncMock(return_value=known)
+        return reg
+
+    async def test_is_known_model_returns_true_when_registry_unset(self):
+        # Test paths that bypass lifespan don't set _registry — fail open.
+        original = getattr(server_mod, "_registry", None)
+        if hasattr(server_mod, "_registry"):
+            del server_mod._registry
+        try:
+            assert await server_mod._is_known_model("anything:latest") is True
+        finally:
+            if original is not None:
+                server_mod._registry = original
+
+    async def test_is_known_model_returns_true_when_registry_lacks_method(self):
+        # Defensive: legacy registry stub without is_known_model — fail open.
+        original = getattr(server_mod, "_registry", None)
+        legacy = MagicMock()
+        del legacy.is_known_model
+        server_mod._registry = legacy
+        try:
+            assert await server_mod._is_known_model("anything:latest") is True
+        finally:
+            if original is not None:
+                server_mod._registry = original
+            else:
+                del server_mod._registry
+
+    async def test_is_known_model_delegates_to_registry(self):
+        original = getattr(server_mod, "_registry", None)
+        server_mod._registry = self._registry_with_known(known=False)
+        try:
+            assert await server_mod._is_known_model("nope:latest") is False
+        finally:
+            if original is not None:
+                server_mod._registry = original
+            else:
+                del server_mod._registry
+
+    async def test_enqueue_inference_returns_404_for_unknown_model(self):
+        original_registry = getattr(server_mod, "_registry", None)
+        original_queues = getattr(server_mod, "_queues", None)
+        server_mod._registry = self._registry_with_known(known=False)
+        server_mod._queues = ModelQueues()
+
+        request = MagicMock()
+        request.headers = {"x-program-id": "test"}
+        body = {"model": "doesnotexist:bf16", "stream": False}
+
+        try:
+            result = await server_mod._enqueue_inference(request, body, "/api/chat")
+            assert result.status_code == 404
+            payload = json.loads(result.body)
+            assert "doesnotexist:bf16" in payload["error"]
+            assert "ollama pull" in payload["error"]
+            # Nothing should have been queued.
+            assert await server_mod._queues.total_pending() == 0
+        finally:
+            if original_registry is not None:
+                server_mod._registry = original_registry
+            else:
+                del server_mod._registry
+            if original_queues is not None:
+                server_mod._queues = original_queues
+
+    async def test_enqueue_and_wait_returns_openai_404_for_unknown_model(self):
+        original_registry = getattr(server_mod, "_registry", None)
+        original_queues = getattr(server_mod, "_queues", None)
+        server_mod._registry = self._registry_with_known(known=False)
+        server_mod._queues = ModelQueues()
+
+        request = MagicMock()
+        request.headers = {}
+
+        try:
+            result = await server_mod._enqueue_and_wait(
+                request,
+                "gpt-4-turbo",  # OpenAI-style name, not in Ollama
+                {"model": "gpt-4-turbo"},
+                "/v1/chat/completions",
+                stream=False,
+            )
+            assert result.status_code == 404
+            payload = json.loads(result.body)
+            assert payload["error"]["type"] == "model_not_found"
+            assert payload["error"]["code"] == "model_not_found"
+            assert "gpt-4-turbo" in payload["error"]["message"]
+            assert await server_mod._queues.total_pending() == 0
+        finally:
+            if original_registry is not None:
+                server_mod._registry = original_registry
+            else:
+                del server_mod._registry
+            if original_queues is not None:
+                server_mod._queues = original_queues
+
+    async def test_enqueue_inference_passes_through_for_known_model(self):
+        # Sanity: when registry says known=True, normal queue path runs.
+        original_registry = getattr(server_mod, "_registry", None)
+        original_queues = getattr(server_mod, "_queues", None)
+        server_mod._registry = self._registry_with_known(known=True)
+        # Stub probe_metadata so num_ctx injection no-ops.
+        server_mod._registry.probe_metadata = AsyncMock(return_value=None)
+        server_mod._registry.get_metadata = MagicMock(return_value=None)
+        server_mod._registry.get_max_context = MagicMock(return_value=None)
+        queues = ModelQueues()
+        server_mod._queues = queues
+
+        request = MagicMock()
+        request.headers = {}
+        body = {"model": "llama3:latest", "stream": False}
+
+        async def complete_after_enqueue():
+            for _ in range(50):
+                if await queues.total_pending() > 0:
+                    break
+                await asyncio.sleep(0.01)
+            envs = await queues.get_all_sorted_by_arrival()
+            if envs:
+                envs[0].complete({"response": "ok"})
+
+        task = asyncio.create_task(complete_after_enqueue())
+        try:
+            result = await server_mod._enqueue_inference(request, body, "/api/chat")
+            # Did NOT 404 — the request reached the queue.
+            assert getattr(result, "status_code", 200) != 404
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            if original_registry is not None:
+                server_mod._registry = original_registry
+            else:
+                del server_mod._registry
+            if original_queues is not None:
+                server_mod._queues = original_queues
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 """Model size registry with background benchmarking and caching.
 
-Tracks two pieces of per-model state:
+Tracks three pieces of per-model state:
 
 1. **Loaded VRAM size** (`model_sizes.json`) — measured by loading the
    model and reading `/api/ps`. Used by the scheduler to decide if a
@@ -10,11 +10,16 @@ Tracks two pieces of per-model state:
    `kv_per_slot_at_max_ctx`. Used to (a) inject `options.num_ctx` so
    Ollama doesn't silently truncate context, and (b) compute how many
    concurrent inference slots fit per loaded model.
+3. **Known-models set** (in-memory, sourced from `/api/tags`). Used by
+   the server to fail-fast on requests for models that aren't installed
+   in Ollama, avoiding the 1h request-timeout death-loop where marshal
+   keeps trying to preload a model that doesn't exist.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,6 +48,13 @@ _DEFAULT_KV_DTYPE_BYTES = 2
 _FALLBACK_MAX_CONTEXT = 4096
 _FALLBACK_NUM_LAYERS = 32
 _FALLBACK_KV_DIM = 4096
+
+# Cap on how often `is_known_model` may opportunistically re-sync the
+# /api/tags list when asked about a model it doesn't recognize. Prevents
+# a flood of unknown-model requests from DOSing Ollama's /api/tags
+# endpoint while still letting marshal pick up newly-pulled models
+# within a few seconds.
+_KNOWN_MODELS_RESYNC_MIN_INTERVAL_S = 5.0
 
 
 @dataclass
@@ -157,6 +169,12 @@ class ModelRegistry:
         self._sizes: dict[str, int] = {}
         self._metadata: dict[str, ModelMetadata] = {}
         self._benchmarking: set[str] = set()
+        # Source-of-truth set for "is this model installed in Ollama right
+        # now". Populated by _sync_with_ollama and refreshed
+        # opportunistically by is_known_model(). Distinct from `_sizes`
+        # (which only contains benchmarked models) and `_metadata` (probed).
+        self._known_models: set[str] = set()
+        self._known_models_last_sync: float = 0.0
 
     async def initialize(self) -> None:
         """Load cached registry and sync with current Ollama models."""
@@ -236,6 +254,8 @@ class ModelRegistry:
 
         Removes entries for models no longer present. New models are
         identified but not benchmarked here (call benchmark_unknown for that).
+        Also refreshes `_known_models` (the fail-fast lookup set used by
+        `is_known_model`).
         """
         try:
             current_models = await self._fetch_model_list()
@@ -243,7 +263,11 @@ class ModelRegistry:
             logger.warning("model_registry.sync_failed", reason="cannot reach Ollama")
             return
 
-        # Remove models no longer downloaded (from both caches).
+        # Refresh the source-of-truth set used by is_known_model().
+        self._known_models = set(current_models)
+        self._known_models_last_sync = time.monotonic()
+
+        # Remove entries for deleted models (from both on-disk caches).
         stale = set(self._sizes.keys()) - set(current_models)
         meta_stale = set(self._metadata.keys()) - set(current_models)
         for model in stale:
@@ -529,6 +553,46 @@ class ModelRegistry:
         return _ProbeResult(
             metadata=meta, used_fallback=used_fallback, missing_fields=missing
         )
+
+    async def is_known_model(self, model: str) -> bool:
+        """Return True if `model` is currently installed in Ollama.
+
+        Used by the server to fail-fast on inference requests for models
+        Ollama doesn't have, instead of letting `lifecycle.preload`
+        retry for an hour until the request times out.
+
+        Behavior:
+        - If the model is in the cached `_known_models` set, return True
+          immediately (zero HTTP).
+        - If not in the cache AND it's been more than
+          `_KNOWN_MODELS_RESYNC_MIN_INTERVAL_S` since the last sync,
+          re-fetch `/api/tags` opportunistically. Catches the case where
+          a user just ran `ollama pull <model>` and immediately fired
+          a request — without this re-sync, we'd false-fail until the
+          next periodic sync.
+        - If still not in the set after the re-sync attempt (or the
+          re-sync was rate-limited), return False.
+        """
+        if model in self._known_models:
+            return True
+        # Rate-limited opportunistic re-sync.
+        now = time.monotonic()
+        if now - self._known_models_last_sync < _KNOWN_MODELS_RESYNC_MIN_INTERVAL_S:
+            return False  # too soon to re-sync; trust the cached negative
+        try:
+            current_models = await self._fetch_model_list()
+        except httpx.HTTPError:
+            # Couldn't reach Ollama — fail open (let the request through;
+            # better to attempt and fail at preload than to wrongly 404
+            # if Ollama just briefly hiccupped).
+            logger.warning(
+                "model_registry.known_models_resync_failed",
+                model=model,
+            )
+            return True
+        self._known_models = set(current_models)
+        self._known_models_last_sync = now
+        return model in self._known_models
 
     def get_metadata(self, model: str) -> ModelMetadata | None:
         """Return cached metadata for a model (None if not yet probed)."""
