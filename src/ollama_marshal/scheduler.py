@@ -80,6 +80,15 @@ class Scheduler:
         self.metrics = SchedulerMetrics()
         self._task: asyncio.Task[None] | None = None
         self._running = False
+        # Maps model name -> monotonic timestamp of last successful dispatch.
+        # Used by _idle_evict_unused_models to time-evict models that haven't
+        # been used in `config.scheduler.idle_eviction_minutes` minutes.
+        self._last_activity: dict[str, float] = {}
+        # Maps model name -> {program_id: monotonic timestamp of last dispatch}.
+        # Surfaces "who is currently using this loaded model" in the status
+        # payload and dashboard. Populated in _forward_single, cleared on
+        # idle/forced eviction so dropped models don't show stale callers.
+        self._active_programs: dict[str, dict[str, float]] = {}
 
     async def start(self) -> None:
         """Start the scheduler loop."""
@@ -118,10 +127,12 @@ class Scheduler:
     async def _tick(self) -> None:
         """One iteration of the scheduler loop.
 
-        1. Forward requests for loaded models (immediate)
-        2. Handle unskippable requests (fairness enforcement)
-        3. Bin-pack fitting models into remaining VRAM
-        4. Increment skip counters for remaining requests
+        1. Forward requests for already-loaded models (immediate)
+        2. Handle critical-priority preemption (load critical model now)
+        3. Handle unskippable requests (fairness enforcement)
+        4. Bin-pack fitting models into remaining VRAM
+        5. Idle eviction — unload models that have been quiet longer than
+           `scheduler.idle_eviction_minutes` (0 disables)
         """
         # Step 1: Forward requests for models already loaded
         await self._forward_loaded_model_requests()
@@ -135,6 +146,69 @@ class Scheduler:
         # Step 4: Bin-pack — load fitting models + increment skip counters
         # for models that were passed over this round
         await self._bin_pack_models()
+
+        # Step 5: Idle eviction — unload models that haven't been touched
+        # in a while, regardless of memory pressure. Configurable; 0 disables.
+        await self._idle_evict_unused_models()
+
+    def active_programs_by_model(self) -> dict[str, list[str]]:
+        """Return programs that have recently dispatched against each loaded model.
+
+        Used by the status payload to show "who is using this loaded model"
+        even when the model is currently idle (no pending requests). Dropped
+        when the model is unloaded.
+        """
+        return {
+            model: sorted(progs.keys())
+            for model, progs in self._active_programs.items()
+            if progs
+        }
+
+    async def _idle_evict_unused_models(self) -> None:
+        """Evict loaded models that have been idle longer than the threshold.
+
+        Skips models with pending requests (they're about to be served).
+        Only fires if `scheduler.idle_eviction_minutes` > 0. The check runs
+        every tick (cheap — just walks loaded models and compares timestamps).
+        """
+        threshold_min = self.config.scheduler.idle_eviction_minutes
+        if threshold_min <= 0:
+            return
+
+        threshold_s = threshold_min * 60
+        now = time.monotonic()
+        loaded = self.memory.get_loaded_models()
+
+        for model_name in list(loaded):
+            # Stamp first-seen models as active now — gives them a full
+            # idle window before they're eligible for time-eviction.
+            if model_name not in self._last_activity:
+                self._last_activity[model_name] = now
+                continue
+
+            idle_s = now - self._last_activity[model_name]
+            if idle_s < threshold_s:
+                continue
+
+            # Don't evict a model that has pending requests.
+            pending = await self.queues.pending_count(model_name)
+            if pending > 0:
+                continue
+
+            logger.info(
+                "scheduler.idle_evict",
+                model=model_name,
+                idle_s=round(idle_s, 1),
+                threshold_s=threshold_s,
+            )
+            success = await self.lifecycle.unload(model_name)
+            if success:
+                self.metrics.evictions += 1
+                self._last_activity.pop(model_name, None)
+                self._active_programs.pop(model_name, None)
+                await self.memory.refresh()
+            # Only evict one per tick — keeps the loop lightweight.
+            break
 
     async def _forward_loaded_model_requests(self) -> None:
         """Forward all pending requests whose model is already loaded."""
@@ -292,7 +366,7 @@ class Scheduler:
             "scheduler.evicting",
             model=target,
             pending=pending_counts.get(target, 0),
-            reason=f"making room for {needed_for}",
+            needed_for=needed_for,
         )
 
         # Drain pending requests for the eviction target first (drain-before-evict)
@@ -310,6 +384,8 @@ class Scheduler:
         success = await self.lifecycle.unload(target)
         if success:
             self.metrics.evictions += 1
+            self._last_activity.pop(target, None)
+            self._active_programs.pop(target, None)
             await self.memory.refresh()
         return success
 
@@ -354,6 +430,14 @@ class Scheduler:
                 stream=envelope.stream,
             )
             envelope.complete(result)
+            # Stamp this model as recently active so idle-eviction doesn't
+            # touch it. Done on dispatch (not on completion) so a long
+            # streaming response doesn't get unloaded mid-flight.
+            now = time.monotonic()
+            self._last_activity[envelope.model] = now
+            self._active_programs.setdefault(envelope.model, {})[
+                envelope.program_id
+            ] = now
             wait_ms = envelope.wait_time * 1000
             self.metrics.requests_served += 1
             self.metrics.total_wait_ms += wait_ms
@@ -365,10 +449,13 @@ class Scheduler:
                 endpoint=envelope.endpoint,
             )
         except Exception as exc:
+            # Some httpx exception subclasses have empty str(); always include
+            # the type name so the log entry is useful.
             logger.error(
                 "scheduler.request_failed",
                 model=envelope.model,
                 endpoint=envelope.endpoint,
-                error=str(exc),
+                error=str(exc) or repr(exc),
+                error_type=type(exc).__name__,
             )
             envelope.fail(exc)

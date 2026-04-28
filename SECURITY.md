@@ -4,13 +4,15 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+| 0.2.x   | :white_check_mark: |
+| 0.1.x   | :x:                |
 
 ## Reporting a Vulnerability
 
 **Do not open public issues for security vulnerabilities.**
 
-Instead, please email **robert.dominic.vitali@gmail.com** with:
+Instead, please open a [private security advisory](https://github.com/robertvitali/ollama-marshal/security/advisories/new)
+on this repository with:
 
 - A description of the vulnerability
 - Steps to reproduce the issue

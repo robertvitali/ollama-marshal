@@ -16,12 +16,12 @@ scheduling that maximizes VRAM utilization.
 ## Project Layout
 
 ```
-src/ollama_marshal/    — package source (10 modules)
+src/ollama_marshal/    — package source (11 modules)
 tests/                 — pytest unit + integration tests
 ```
 
 Modules in dependency order: config → queue → registry → memory → lifecycle
-→ scheduler → stream → openai_compat → server → cli
+→ scheduler → stream → openai_compat → server → dashboard → cli
 
 ## Development Commands
 

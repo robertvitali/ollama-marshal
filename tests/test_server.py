@@ -36,6 +36,9 @@ def _mock_memory():
 def _mock_queues():
     q = MagicMock(spec=ModelQueues)
     q.pending_by_model = AsyncMock(return_value={"llama3:latest": 2})
+    q.pending_programs_by_model = AsyncMock(
+        return_value={"llama3:latest": ["program-alpha"]}
+    )
     q.total_pending = AsyncMock(return_value=2)
     q.enqueue = AsyncMock()
     return q
@@ -48,6 +51,9 @@ def _mock_scheduler():
         model_swaps=3,
         evictions=1,
         average_wait_ms=42.5,
+    )
+    sched.active_programs_by_model = MagicMock(
+        return_value={"llama3:latest": ["program-beta"]}
     )
     return sched
 
@@ -64,10 +70,12 @@ class TestCreateApp:
         assert isinstance(app, FastAPI)
 
     def test_app_title_and_version(self):
+        from ollama_marshal import __version__
+
         config = MarshalConfig()
         app = create_app(config)
         assert app.title == "ollama-marshal"
-        assert app.version == "0.1.0"
+        assert app.version == __version__
 
     def test_stores_config_in_state(self):
         config = MarshalConfig()
@@ -114,8 +122,63 @@ class TestRouteRegistration:
     def test_marshal_status_route_exists(self):
         assert "/api/marshal/status" in self._get_routes()
 
+    def test_status_alias_route_exists(self):
+        # Short alias so `curl localhost:11435/status` works.
+        assert "/status" in self._get_routes()
+
     def test_passthrough_route_exists(self):
         assert "/api/{path:path}" in self._get_routes()
+
+
+# ---------------------------------------------------------------------------
+# _resolve_timeout (per-request timeout override via X-Request-Timeout header)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveTimeout:
+    """Cover the per-request X-Request-Timeout header + config fallback."""
+
+    def _request(self, headers: dict, *, with_config: bool = True) -> MagicMock:
+        req = MagicMock()
+        req.headers = headers
+        if with_config:
+            cfg = MarshalConfig()
+            cfg.proxy.request_timeout_s = 1234
+            req.app.state.config = cfg
+        else:
+            req.app.state = MagicMock(spec=[])
+        return req
+
+    def test_no_header_uses_config(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        assert _resolve_timeout(self._request({})) == 1234
+
+    def test_header_overrides_config(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        assert _resolve_timeout(self._request({"x-request-timeout": "60"})) == 60
+
+    def test_header_zero_falls_back_to_config(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        # 0 is invalid; we ignore it and use config.
+        assert _resolve_timeout(self._request({"x-request-timeout": "0"})) == 1234
+
+    def test_header_negative_falls_back_to_config(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        assert _resolve_timeout(self._request({"x-request-timeout": "-5"})) == 1234
+
+    def test_header_non_int_falls_back_to_config(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        assert _resolve_timeout(self._request({"x-request-timeout": "abc"})) == 1234
+
+    def test_no_config_uses_3600s_default(self):
+        from ollama_marshal.server import _resolve_timeout
+
+        assert _resolve_timeout(self._request({}, with_config=False)) == 3600
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +530,12 @@ class TestMarshalStatus:
         # Verify nested structure
         assert len(result["loaded_models"]) == 1
         assert result["loaded_models"][0]["name"] == "llama3:latest"
+        # Programs are the union of pending-queue programs and recently-active
+        # programs from the scheduler, sorted and deduped.
+        assert result["loaded_models"][0]["programs"] == [
+            "program-alpha",
+            "program-beta",
+        ]
         assert result["metrics"]["requests_served"] == 10
         assert result["queue"]["total_pending"] == 2
 

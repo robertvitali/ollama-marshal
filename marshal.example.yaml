@@ -11,6 +11,10 @@ ollama:
 proxy:
   host: "0.0.0.0"                  # MARSHAL_PROXY_HOST
   port: 11435                       # MARSHAL_PROXY_PORT
+  request_timeout_s: 3600          # MARSHAL_PROXY_REQUEST_TIMEOUT_S — server-side max
+                                    # wait for a queued request, in seconds. Default 1h.
+                                    # Returns 504 if exceeded. Clients can override
+                                    # per-request via the X-Request-Timeout header.
 
 # Memory management
 memory:
@@ -24,6 +28,10 @@ memory:
 scheduler:
   max_skips: 3                     # MARSHAL_SCHEDULER_MAX_SKIPS — per-request skip limit
   model_detect_interval: 30        # MARSHAL_SCHEDULER_MODEL_DETECT_INTERVAL — seconds between /api/tags polls
+  idle_eviction_minutes: 15        # MARSHAL_SCHEDULER_IDLE_EVICTION_MINUTES — unload a model
+                                    # after this many minutes of no activity. 0 disables
+                                    # time-based eviction (only memory-pressure eviction).
+                                    # Models with pending requests are never time-evicted.
 
 # Per-program configuration
 # Programs identify themselves via the X-Program-ID header.

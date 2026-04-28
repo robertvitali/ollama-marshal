@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Annotated
 
 import httpx
@@ -12,6 +13,7 @@ import uvicorn
 
 from ollama_marshal import __version__
 from ollama_marshal.config import LogFormat, load_config
+from ollama_marshal.dashboard import format_wait_ms
 
 app = typer.Typer(
     name="ollama-marshal",
@@ -168,22 +170,47 @@ def status(
     else:
         for m in loaded:
             size_gb = m["size_vram"] / (1024**3)
+            progs = m.get("programs") or []
+            progs_str = ", ".join(progs) if progs else "—"
             typer.echo(
                 f"    {m['name']:<30} "
                 f"{size_gb:.1f} GB   "
-                f"{m['pending_requests']} pending"
+                f"{m['pending_requests']} pending   "
+                f"programs: {progs_str}"
             )
     typer.echo()
 
-    # Memory
+    # Memory: marshal budget + system RAM + swap
     mem = data.get("memory", {})
-    total_gb = mem.get("total", 0) / (1024**3)
-    used_gb = mem.get("used_by_models", 0) / (1024**3)
-    avail_gb = mem.get("available", 0) / (1024**3)
+    budget_total_gb = mem.get("total", 0) / (1024**3)
+    budget_used_gb = mem.get("used_by_models", 0) / (1024**3)
+    budget_avail_gb = mem.get("available", 0) / (1024**3)
     typer.echo(
-        f"  Memory:  {used_gb:.1f} / {total_gb:.1f} GB used"
-        f"  ({avail_gb:.1f} GB available)"
+        f"  Marshal budget:  {budget_used_gb:.1f} / {budget_total_gb:.1f} GB"
+        f" used by models  ({budget_avail_gb:.1f} GB available)"
     )
+
+    sys_mem = mem.get("system")
+    if sys_mem:
+        sys_total_gb = sys_mem["total"] / (1024**3)
+        sys_used_gb = sys_mem["used"] / (1024**3)
+        sys_avail_gb = sys_mem["available"] / (1024**3)
+        typer.echo(
+            f"  System RAM:      {sys_used_gb:.1f} / {sys_total_gb:.1f} GB"
+            f" used  ({sys_avail_gb:.1f} GB available, {sys_mem['percent']}%)"
+        )
+
+    swap = mem.get("swap")
+    if swap and swap.get("total", 0) > 0:
+        swap_total_gb = swap["total"] / (1024**3)
+        swap_used_gb = swap["used"] / (1024**3)
+        if swap_used_gb > 0.01:
+            typer.echo(
+                f"  Swap:            {swap_used_gb:.1f} / {swap_total_gb:.1f} GB"
+                f" used  ({swap['percent']}%)"
+            )
+        else:
+            typer.echo(f"  Swap:            unused ({swap_total_gb:.1f} GB available)")
     typer.echo()
 
     # Queue
@@ -200,8 +227,46 @@ def status(
     typer.echo(f"  Requests served:  {metrics.get('requests_served', 0)}")
     typer.echo(f"  Model swaps:      {metrics.get('model_swaps', 0)}")
     typer.echo(f"  Evictions:        {metrics.get('evictions', 0)}")
-    typer.echo(f"  Avg wait:         {metrics.get('average_wait_ms', 0):.1f} ms")
+    typer.echo(
+        f"  Avg wait:         {format_wait_ms(metrics.get('average_wait_ms', 0))}"
+    )
     typer.echo("=" * 50)
+
+
+@app.command()
+def dashboard(
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Proxy host to query."),
+    ] = "http://localhost:11435",
+    log_path: Annotated[
+        str,
+        typer.Option(
+            "--log-path",
+            help="Path to marshal's stdout log file (for the events panel).",
+        ),
+    ] = str(Path.home() / ".ollama-marshal" / "marshal.out.log"),
+    refresh_hz: Annotated[
+        float,
+        typer.Option(
+            "--refresh-hz",
+            help="Refresh rate in Hz (default 2.0 = every 0.5s).",
+        ),
+    ] = 2.0,
+) -> None:
+    """Live TUI dashboard — single-window view of marshal's queue and memory.
+
+    Continuously updates with status, loaded models, memory usage, metrics,
+    and a scrolling tail of scheduling events. Replaces the 3-pane
+    `watch + tail -f + dryrun` setup with one window. Ctrl+C to quit.
+    """
+    from ollama_marshal.dashboard import run_dashboard
+
+    run_dashboard(
+        marshal_url=host,
+        log_path=Path(log_path),
+        refresh_hz=refresh_hz,
+    )
 
 
 @app.command()
