@@ -19,6 +19,113 @@ logger = structlog.get_logger()
 
 _SCHEDULER_TICK = 0.1  # seconds between scheduler loop iterations
 
+# How long a single X-Burst-Size hint stays "active" without renewal.
+# Each request from the same program-model pair refreshes the timer, so
+# steady streams stay protected. After this many seconds of silence, the
+# hint expires and the boost falls back to actual queue depth.
+_BURST_HINT_TTL_S = 30.0
+
+# Hard cap on per-request burst boost so an adversarial client can't
+# claim to be in a 1,000,000-call burst and starve every other program.
+# Anchored at max_skips * 4 so the cap scales with whatever fairness
+# threshold the user has configured. (Default max_skips=3 → cap=12.)
+_BURST_HINT_CAP_MULTIPLIER = 4
+
+
+@dataclass
+class BurstHint:
+    """A live X-Burst-Size hint for a (program, model) pair.
+
+    The boost added to that model's effective pending count when scoring
+    eviction candidates. Refreshed each time a request for the same pair
+    sets a new (or same) X-Burst-Size header. Expires automatically
+    `_BURST_HINT_TTL_S` seconds after the last refresh.
+    """
+
+    boost: int
+    expires_at: float  # monotonic deadline
+
+
+class BurstHints:
+    """Per-program-model burst-size hint store with TTL-based expiry.
+
+    Used by the eviction scorer (memory.py:get_eviction_candidates) to
+    treat a program's "expected pending demand" as larger than the actual
+    queue depth — so a model can survive eviction across N sequential
+    calls from a long-running program even when only one call is in
+    flight at a time.
+    """
+
+    def __init__(
+        self,
+        ttl_s: float = _BURST_HINT_TTL_S,
+        cap_multiplier: int = _BURST_HINT_CAP_MULTIPLIER,
+    ) -> None:
+        self._hints: dict[tuple[str, str], BurstHint] = {}
+        self._ttl_s = ttl_s
+        self._cap_multiplier = cap_multiplier
+
+    def record(
+        self,
+        program_id: str,
+        model: str,
+        n: int,
+        max_skips: int,
+        now: float | None = None,
+    ) -> int:
+        """Record (or refresh) a burst hint for a (program, model) pair.
+
+        The provided `n` is capped at `max_skips * cap_multiplier` so
+        a misbehaving client can't claim infinite priority.
+
+        Returns the effective boost stored after capping.
+        """
+        if not program_id or not model or n <= 0:
+            return 0
+        cap = max(1, max_skips * self._cap_multiplier)
+        boost = min(int(n), cap)
+        ts = time.monotonic() if now is None else now
+        self._hints[(program_id, model)] = BurstHint(
+            boost=boost, expires_at=ts + self._ttl_s
+        )
+        return boost
+
+    def boost_for_model(self, model: str, now: float | None = None) -> int:
+        """Sum of all live hint boosts targeting this model.
+
+        Multiple programs hinting the same model add together — the
+        eviction scorer should treat the model as "expecting all of
+        them combined."
+        """
+        ts = time.monotonic() if now is None else now
+        total = 0
+        for (_prog, m), hint in self._hints.items():
+            if m != model or hint.expires_at <= ts:
+                continue
+            total += hint.boost
+        return total
+
+    def all_boosts_by_model(self, now: float | None = None) -> dict[str, int]:
+        """Return current per-model boost dict (live hints only)."""
+        ts = time.monotonic() if now is None else now
+        result: dict[str, int] = {}
+        for (_prog, model), hint in self._hints.items():
+            if hint.expires_at <= ts:
+                continue
+            result[model] = result.get(model, 0) + hint.boost
+        return result
+
+    def prune_expired(self, now: float | None = None) -> int:
+        """Drop expired entries. Returns the count removed.
+
+        Cheap to call every scheduler tick — typical hint dict is small
+        (one entry per active program-model pair).
+        """
+        ts = time.monotonic() if now is None else now
+        before = len(self._hints)
+        self._hints = {k: v for k, v in self._hints.items() if v.expires_at > ts}
+        return before - len(self._hints)
+
 
 @dataclass
 class SchedulerMetrics:
@@ -89,6 +196,11 @@ class Scheduler:
         # payload and dashboard. Populated in _forward_single, cleared on
         # idle/forced eviction so dropped models don't show stale callers.
         self._active_programs: dict[str, dict[str, float]] = {}
+        # X-Burst-Size hints (sequential-submission programs declaring
+        # "I have more requests coming for this model"). Used by the
+        # eviction scorer to keep loaded models alive across silent gaps
+        # between same-program calls.
+        self.burst_hints = BurstHints()
 
     async def start(self) -> None:
         """Start the scheduler loop."""
@@ -133,6 +245,8 @@ class Scheduler:
         4. Bin-pack fitting models into remaining VRAM
         5. Idle eviction — unload models that have been quiet longer than
            `scheduler.idle_eviction_minutes` (0 disables)
+        6. Drop expired X-Burst-Size hints (cleanup; doesn't affect
+           dispatch decisions on this tick)
         """
         # Step 1: Forward requests for models already loaded
         await self._forward_loaded_model_requests()
@@ -150,6 +264,12 @@ class Scheduler:
         # Step 5: Idle eviction — unload models that haven't been touched
         # in a while, regardless of memory pressure. Configurable; 0 disables.
         await self._idle_evict_unused_models()
+
+        # Step 6: Drop expired X-Burst-Size hints. Cheap dict comprehension.
+        # Doing this on the tick (rather than lazy-on-read) means the hint
+        # store can't grow indefinitely if a client sets hints on a
+        # never-recurring program-model pair.
+        self.burst_hints.prune_expired()
 
     def active_programs_by_model(self) -> dict[str, list[str]]:
         """Return programs that have recently dispatched against each loaded model.
@@ -334,6 +454,14 @@ class Scheduler:
             True if a model was evicted.
         """
         pending_counts = await self.queues.pending_by_model()
+        # Add live X-Burst-Size hint boosts so a sequential-submission
+        # program with only 1 envelope visible but a declared 50-burst
+        # is treated as a 50-deep queue for eviction-scoring purposes.
+        burst_boosts = self.burst_hints.all_boosts_by_model()
+        if burst_boosts:
+            pending_counts = dict(pending_counts)
+            for model_name, boost in burst_boosts.items():
+                pending_counts[model_name] = pending_counts.get(model_name, 0) + boost
 
         # Build priority map: use the highest priority of any pending
         # request for each loaded model (critical > normal)

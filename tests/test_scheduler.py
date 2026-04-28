@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from ollama_marshal.config import MarshalConfig, Priority, ProgramConfig
 from ollama_marshal.queue import ModelQueues, RequestEnvelope
-from ollama_marshal.scheduler import Scheduler, SchedulerMetrics
+from ollama_marshal.scheduler import BurstHints, Scheduler, SchedulerMetrics
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1072,3 +1072,136 @@ class TestIdleEvictUnusedModels:
 
         # Loop breaks after first eviction. Next tick handles the rest.
         assert sched.lifecycle.unload.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# BurstHints — X-Burst-Size header storage with TTL-based expiry
+# ---------------------------------------------------------------------------
+
+
+class TestBurstHintsRecord:
+    def test_records_hint_under_cap(self):
+        hints = BurstHints()
+        result = hints.record("ai-portfolio", "qwen3.5:9b", 10, max_skips=3, now=100.0)
+        # Cap = 3 * 4 = 12, so 10 fits and is stored verbatim.
+        assert result == 10
+
+    def test_caps_at_max_skips_times_multiplier(self):
+        hints = BurstHints()
+        # max_skips=3 → cap = 3*4 = 12. Asking for 999 gets clamped.
+        result = hints.record("attacker", "model", 999, max_skips=3)
+        assert result == 12
+
+    def test_zero_or_negative_ignored(self):
+        hints = BurstHints()
+        assert hints.record("p", "m", 0, max_skips=3) == 0
+        assert hints.record("p", "m", -5, max_skips=3) == 0
+        # Nothing stored.
+        assert hints.boost_for_model("m") == 0
+
+    def test_empty_program_or_model_ignored(self):
+        hints = BurstHints()
+        assert hints.record("", "m", 5, max_skips=3) == 0
+        assert hints.record("p", "", 5, max_skips=3) == 0
+        assert hints.boost_for_model("m") == 0
+
+    def test_refresh_replaces_previous(self):
+        hints = BurstHints()
+        hints.record("p", "m", 5, max_skips=3, now=100.0)
+        # Recording again with a different value replaces, not adds.
+        hints.record("p", "m", 8, max_skips=3, now=110.0)
+        assert hints.boost_for_model("m", now=110.0) == 8
+
+
+class TestBurstHintsBoostQueries:
+    def test_boost_for_model_sums_across_programs(self):
+        hints = BurstHints()
+        hints.record("ai-email", "qwen3.5:9b", 5, max_skips=3, now=100.0)
+        hints.record("ai-portfolio", "qwen3.5:9b", 7, max_skips=3, now=100.0)
+        # Two programs targeting the same model — boosts add.
+        assert hints.boost_for_model("qwen3.5:9b", now=101.0) == 12
+
+    def test_boost_for_model_ignores_other_models(self):
+        hints = BurstHints()
+        hints.record("p", "model-a", 5, max_skips=3, now=100.0)
+        hints.record("p", "model-b", 9, max_skips=3, now=100.0)
+        assert hints.boost_for_model("model-a", now=101.0) == 5
+        assert hints.boost_for_model("model-b", now=101.0) == 9
+
+    def test_boost_returns_zero_after_expiry(self):
+        # TTL is 30s by default. now=200 is well past 100+30=130.
+        hints = BurstHints()
+        hints.record("p", "m", 5, max_skips=3, now=100.0)
+        assert hints.boost_for_model("m", now=200.0) == 0
+
+    def test_all_boosts_by_model(self):
+        hints = BurstHints()
+        hints.record("p1", "model-a", 3, max_skips=3, now=100.0)
+        hints.record("p2", "model-a", 4, max_skips=3, now=100.0)
+        hints.record("p1", "model-b", 5, max_skips=3, now=100.0)
+        result = hints.all_boosts_by_model(now=101.0)
+        assert result == {"model-a": 7, "model-b": 5}
+
+
+class TestBurstHintsExpiry:
+    def test_prune_removes_expired_keeps_live(self):
+        hints = BurstHints()
+        hints.record("p", "old", 5, max_skips=3, now=10.0)  # expires at 40
+        hints.record("p", "fresh", 7, max_skips=3, now=100.0)  # expires at 130
+        removed = hints.prune_expired(now=110.0)
+        assert removed == 1
+        assert hints.boost_for_model("old", now=110.0) == 0
+        assert hints.boost_for_model("fresh", now=110.0) == 7
+
+    def test_prune_no_op_when_all_live(self):
+        hints = BurstHints()
+        hints.record("p", "m", 5, max_skips=3, now=100.0)
+        assert hints.prune_expired(now=120.0) == 0  # within TTL
+
+    def test_prune_empty_safe(self):
+        hints = BurstHints()
+        assert hints.prune_expired(now=100.0) == 0
+
+    def test_custom_ttl(self):
+        hints = BurstHints(ttl_s=5.0)
+        hints.record("p", "m", 5, max_skips=3, now=100.0)  # expires at 105
+        # 4s later: still live.
+        assert hints.boost_for_model("m", now=104.0) == 5
+        # 6s later: expired.
+        assert hints.boost_for_model("m", now=106.0) == 0
+
+
+class TestBurstHintsIntegration:
+    """End-to-end: scheduler eviction scoring picks up burst boosts."""
+
+    async def test_burst_protects_from_eviction(self):
+        sched = _make_scheduler()
+        # No actual envelopes for "burst-protected", so pending=0 normally.
+        # But a burst hint of 50 should make it the LEAST evictable model.
+        # max_skips=15 → cap is 60, so the requested 50 stays uncapped.
+        sched.burst_hints.record("ai-portfolio", "burst-protected", 50, max_skips=15)
+
+        memory = sched.memory
+        memory.get_loaded_models.return_value = {
+            "burst-protected": object(),
+            "low-priority": object(),
+        }
+
+        # The pending_by_model + burst_boosts dict that _evict_one builds
+        # should make low-priority the eviction target. Mock this by
+        # capturing what gets passed to memory.get_eviction_candidates.
+        captured: dict = {}
+
+        def capture(pending_counts, program_priorities):
+            captured["pending"] = dict(pending_counts)
+            return ["low-priority", "burst-protected"]
+
+        memory.get_eviction_candidates.side_effect = capture
+        sched.queues.pending_by_model = AsyncMock(return_value={})
+
+        await sched._evict_one(needed_for="other-model")
+
+        # Burst boost must have been added before scoring.
+        assert captured["pending"]["burst-protected"] == 50
+        # And the chosen target was low-priority (not the burst one).
+        sched.lifecycle.unload.assert_awaited_with("low-priority")

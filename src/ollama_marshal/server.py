@@ -310,6 +310,32 @@ def _register_routes(app: FastAPI) -> None:
         )
 
 
+def _record_burst_hint(request: Request, program_id: str, model: str) -> None:
+    """Read the optional X-Burst-Size header and forward to scheduler.
+
+    Programs that submit work sequentially (e.g. tool-calling loops)
+    can declare expected total demand via this header so marshal's
+    eviction scorer treats their model as "expecting N more calls"
+    even when only 1 is currently queued. Header is parsed defensively
+    — non-numeric or non-positive values are silently ignored.
+    """
+    raw = request.headers.get("x-burst-size")
+    if not raw:
+        return
+    try:
+        n = int(raw)
+    except ValueError:
+        return
+    if n <= 0:
+        return
+    sched = globals().get("_scheduler")
+    cfg = globals().get("_config")
+    if sched is None or not hasattr(sched, "burst_hints"):
+        return
+    max_skips = cfg.scheduler.max_skips if cfg is not None else 3
+    sched.burst_hints.record(program_id, model, n, max_skips)
+
+
 async def _inject_num_ctx(model: str, body: dict[str, Any]) -> None:
     """Inject `options.num_ctx = model_max_context` if the client didn't set one.
 
@@ -388,6 +414,11 @@ async def _enqueue_inference(
     stream = body.get("stream", False)
     program_id = request.headers.get("x-program-id", "default")
     timeout_s = _resolve_timeout(request)
+
+    # Capture optional X-Burst-Size hint so the eviction scorer protects
+    # this model across the rest of the burst even if the client submits
+    # the remaining calls sequentially.
+    _record_burst_hint(request, program_id, model)
 
     # Stop Ollama from silently shrinking num_ctx to fit its slot budget.
     await _inject_num_ctx(model, body)
@@ -478,6 +509,10 @@ async def _enqueue_and_wait(
     """
     program_id = request.headers.get("x-program-id", "default")
     timeout_s = _resolve_timeout(request)
+
+    # Capture optional burst-size hint (same semantics as the Ollama-
+    # native path).
+    _record_burst_hint(request, program_id, model)
 
     # Same num_ctx injection as the Ollama-native path; OpenAI clients
     # rarely set num_ctx explicitly so they're the most likely to be

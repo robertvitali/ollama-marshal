@@ -557,6 +557,96 @@ class TestMarshalStatus:
 
 
 # ---------------------------------------------------------------------------
+# _record_burst_hint — X-Burst-Size header extraction
+# ---------------------------------------------------------------------------
+
+
+class TestRecordBurstHint:
+    def _request(self, headers: dict) -> MagicMock:
+        req = MagicMock()
+        req.headers = headers
+        return req
+
+    def test_records_when_header_present(self):
+        sched = MagicMock()
+        sched.burst_hints = MagicMock()
+        sched.burst_hints.record = MagicMock(return_value=10)
+        cfg = MagicMock()
+        cfg.scheduler.max_skips = 5
+        original_sched = getattr(server_mod, "_scheduler", None)
+        original_cfg = getattr(server_mod, "_config", None)
+        server_mod._scheduler = sched
+        server_mod._config = cfg
+        try:
+            server_mod._record_burst_hint(
+                self._request({"x-burst-size": "10"}), "ai-portfolio", "qwen3"
+            )
+        finally:
+            if original_sched is not None:
+                server_mod._scheduler = original_sched
+            if original_cfg is not None:
+                server_mod._config = original_cfg
+        sched.burst_hints.record.assert_called_once_with("ai-portfolio", "qwen3", 10, 5)
+
+    def test_skips_when_header_absent(self):
+        sched = MagicMock()
+        sched.burst_hints = MagicMock()
+        original_sched = getattr(server_mod, "_scheduler", None)
+        server_mod._scheduler = sched
+        try:
+            server_mod._record_burst_hint(self._request({}), "ai-portfolio", "qwen3")
+        finally:
+            if original_sched is not None:
+                server_mod._scheduler = original_sched
+        sched.burst_hints.record.assert_not_called()
+
+    def test_skips_non_numeric_header(self):
+        sched = MagicMock()
+        sched.burst_hints = MagicMock()
+        original_sched = getattr(server_mod, "_scheduler", None)
+        server_mod._scheduler = sched
+        try:
+            server_mod._record_burst_hint(
+                self._request({"x-burst-size": "not-a-number"}), "p", "m"
+            )
+        finally:
+            if original_sched is not None:
+                server_mod._scheduler = original_sched
+        sched.burst_hints.record.assert_not_called()
+
+    def test_skips_zero_or_negative(self):
+        sched = MagicMock()
+        sched.burst_hints = MagicMock()
+        original_sched = getattr(server_mod, "_scheduler", None)
+        server_mod._scheduler = sched
+        try:
+            server_mod._record_burst_hint(
+                self._request({"x-burst-size": "0"}), "p", "m"
+            )
+            server_mod._record_burst_hint(
+                self._request({"x-burst-size": "-5"}), "p", "m"
+            )
+        finally:
+            if original_sched is not None:
+                server_mod._scheduler = original_sched
+        sched.burst_hints.record.assert_not_called()
+
+    def test_skips_when_scheduler_unset(self):
+        # No scheduler in module globals (e.g., tests bypassing lifespan).
+        original_sched = getattr(server_mod, "_scheduler", None)
+        if hasattr(server_mod, "_scheduler"):
+            del server_mod._scheduler
+        try:
+            # Should not raise.
+            server_mod._record_burst_hint(
+                self._request({"x-burst-size": "10"}), "p", "m"
+            )
+        finally:
+            if original_sched is not None:
+                server_mod._scheduler = original_sched
+
+
+# ---------------------------------------------------------------------------
 # _inject_num_ctx
 # ---------------------------------------------------------------------------
 
