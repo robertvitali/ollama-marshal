@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from ollama_marshal.registry import ModelRegistry
+from ollama_marshal.registry import ModelMetadata, ModelRegistry
 
 PATCH_ASYNC_CLIENT = "ollama_marshal.registry.httpx.AsyncClient"
 
@@ -636,6 +636,10 @@ class TestInitialize:
             ) as mock_load,
             patch.object(
                 registry,
+                "_load_metadata_cache",
+            ) as mock_load_meta,
+            patch.object(
+                registry,
                 "_sync_with_ollama",
                 new_callable=AsyncMock,
             ) as mock_sync,
@@ -643,6 +647,7 @@ class TestInitialize:
             await registry.initialize()
 
         mock_load.assert_called_once()
+        mock_load_meta.assert_called_once()
         mock_sync.assert_called_once()
 
 
@@ -673,4 +678,307 @@ class TestConstructor:
     def test_initial_state_empty(self):
         reg = ModelRegistry()
         assert reg._sizes == {}
+        assert reg._metadata == {}
         assert reg._benchmarking == set()
+
+
+# ---------------------------------------------------------------------------
+# ModelMetadata dataclass + KV-cache math
+# ---------------------------------------------------------------------------
+
+
+def _qwen3_meta() -> ModelMetadata:
+    """Realistic Qwen3-9B-style metadata for KV math tests."""
+    return ModelMetadata(
+        name="qwen3.5:9b-bf16",
+        architecture="qwen3",
+        max_context_length=32768,
+        num_layers=28,
+        embedding_length=3584,
+        head_count=28,
+        head_count_kv=4,  # GQA: 28 attention heads, 4 KV heads
+        kv_dtype_bytes=2,
+        probed_at="2026-04-28T03:00:00+00:00",
+    )
+
+
+class TestModelMetadataMath:
+    def test_head_dim(self):
+        m = _qwen3_meta()
+        # head_dim = embedding_length / head_count = 3584 / 28 = 128
+        assert m.head_dim == 128
+
+    def test_kv_dim(self):
+        m = _qwen3_meta()
+        # kv_dim = head_dim * head_count_kv = 128 * 4 = 512
+        assert m.kv_dim == 512
+
+    def test_kv_per_slot_at_max_ctx(self):
+        m = _qwen3_meta()
+        # max_ctx * num_layers * kv_dim * dtype_bytes * 2
+        # 32768 * 28 * 512 * 2 * 2
+        expected = 32768 * 28 * 512 * 2 * 2
+        assert m.kv_per_slot_at_max_ctx == expected
+
+    def test_kv_per_slot_at_smaller_ctx(self):
+        m = _qwen3_meta()
+        # Halving context halves the KV cost.
+        small = m.kv_per_slot_at_ctx(4096)
+        full = m.kv_per_slot_at_max_ctx
+        assert small * 8 == full  # 32768 / 4096 = 8
+
+    def test_head_dim_zero_safe(self):
+        # Defensive: avoid div-by-zero if head_count is unknown.
+        m = ModelMetadata(
+            name="x",
+            architecture="x",
+            max_context_length=1,
+            num_layers=1,
+            embedding_length=1,
+            head_count=0,
+            head_count_kv=0,
+        )
+        assert m.head_dim == 0
+        assert m.kv_dim == 0
+        assert m.kv_per_slot_at_max_ctx == 0
+
+
+class TestModelMetadataRoundtrip:
+    def test_to_and_from_json_dict(self):
+        original = _qwen3_meta()
+        d = original.to_json_dict()
+        # Computed field must be present in serialized form.
+        assert d["kv_per_slot_at_max_ctx"] == original.kv_per_slot_at_max_ctx
+        roundtripped = ModelMetadata.from_json_dict(d)
+        assert roundtripped == original
+
+    def test_from_json_dict_with_extra_fields(self):
+        # Extra (computed) fields like kv_per_slot_at_max_ctx should be
+        # ignored on read since they're derived.
+        d = _qwen3_meta().to_json_dict()
+        d["unrelated"] = 42
+        m = ModelMetadata.from_json_dict(d)
+        assert m.architecture == "qwen3"
+
+    def test_from_json_dict_missing_optional_fields(self):
+        # kv_dtype_bytes and probed_at have defaults.
+        d = {
+            "name": "x",
+            "architecture": "llama",
+            "max_context_length": 8192,
+            "num_layers": 32,
+            "embedding_length": 4096,
+            "head_count": 32,
+            "head_count_kv": 8,
+        }
+        m = ModelMetadata.from_json_dict(d)
+        assert m.kv_dtype_bytes == 2
+        assert m.probed_at == ""
+
+
+# ---------------------------------------------------------------------------
+# _parse_show_response
+# ---------------------------------------------------------------------------
+
+
+def _show_response(arch: str = "qwen3", **overrides) -> dict:
+    """Build a realistic /api/show JSON body for tests."""
+    info = {
+        "general.architecture": arch,
+        f"{arch}.context_length": 32768,
+        f"{arch}.block_count": 28,
+        f"{arch}.embedding_length": 3584,
+        f"{arch}.attention.head_count": 28,
+        f"{arch}.attention.head_count_kv": 4,
+    }
+    info.update(overrides)
+    return {"model_info": info}
+
+
+class TestParseShowResponse:
+    def test_full_response(self):
+        result = ModelRegistry._parse_show_response("qwen3.5:9b-bf16", _show_response())
+        assert result.used_fallback is False
+        assert result.metadata.architecture == "qwen3"
+        assert result.metadata.max_context_length == 32768
+        assert result.metadata.num_layers == 28
+        assert result.metadata.head_count == 28
+        assert result.metadata.head_count_kv == 4
+
+    def test_missing_context_length_uses_fallback(self):
+        body = _show_response()
+        del body["model_info"]["qwen3.context_length"]
+        result = ModelRegistry._parse_show_response("x", body)
+        assert result.used_fallback is True
+        assert "context_length" in result.missing_fields
+        assert result.metadata.max_context_length == 4096  # fallback
+
+    def test_missing_head_count_kv_defaults_to_head_count(self):
+        # No GQA — many older models. head_count_kv inherits head_count.
+        body = _show_response()
+        del body["model_info"]["qwen3.attention.head_count_kv"]
+        result = ModelRegistry._parse_show_response("x", body)
+        # Inheriting from head_count is NOT a fallback (it's the documented
+        # behavior for non-GQA models).
+        assert result.metadata.head_count_kv == 28
+        assert "attention.head_count_kv" not in result.missing_fields
+
+    def test_unknown_architecture(self):
+        # No general.architecture → arch="unknown" → no per-arch keys exist
+        # → all fallbacks.
+        result = ModelRegistry._parse_show_response("x", {"model_info": {}})
+        assert result.used_fallback is True
+        assert result.metadata.architecture == "unknown"
+
+    def test_invalid_int_uses_fallback(self):
+        body = _show_response()
+        body["model_info"]["qwen3.context_length"] = "not-a-number"
+        result = ModelRegistry._parse_show_response("x", body)
+        assert result.used_fallback is True
+        assert result.metadata.max_context_length == 4096
+
+
+# ---------------------------------------------------------------------------
+# probe_metadata + cache I/O
+# ---------------------------------------------------------------------------
+
+
+class TestProbeMetadata:
+    async def test_caches_and_persists(self, tmp_path):
+        meta_path = tmp_path / "metadata.json"
+        reg = ModelRegistry(
+            registry_path=tmp_path / "sizes.json",
+            metadata_path=meta_path,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            return_value=MagicMock(
+                json=MagicMock(return_value=_show_response()),
+                raise_for_status=MagicMock(),
+            )
+        )
+        with patch(PATCH_ASYNC_CLIENT) as mock_cls:
+            mock_cls.return_value.__aenter__.return_value = mock_client
+            result = await reg.probe_metadata("qwen3.5:9b-bf16")
+
+        assert result is not None
+        assert result.architecture == "qwen3"
+        # Second probe hits the in-memory cache, no HTTP call.
+        with patch(PATCH_ASYNC_CLIENT) as mock_cls2:
+            again = await reg.probe_metadata("qwen3.5:9b-bf16")
+            mock_cls2.assert_not_called()
+        assert again is result
+        # And the on-disk cache exists with the new entry.
+        assert meta_path.exists()
+        on_disk = json.loads(meta_path.read_text())
+        assert "qwen3.5:9b-bf16" in on_disk
+
+    async def test_returns_none_on_http_error(self, registry):
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.HTTPError("down"))
+        with patch(PATCH_ASYNC_CLIENT) as mock_cls:
+            mock_cls.return_value.__aenter__.return_value = mock_client
+            result = await registry.probe_metadata("model:x")
+        assert result is None
+        # Cache stays empty so next probe will retry.
+        assert registry.get_metadata("model:x") is None
+
+
+class TestMetadataCacheIO:
+    def test_load_existing(self, tmp_path):
+        path = tmp_path / "metadata.json"
+        path.write_text(json.dumps({"qwen3.5:9b-bf16": _qwen3_meta().to_json_dict()}))
+        reg = ModelRegistry(metadata_path=path)
+        reg._load_metadata_cache()
+        assert "qwen3.5:9b-bf16" in reg._metadata
+        assert reg._metadata["qwen3.5:9b-bf16"].max_context_length == 32768
+
+    def test_load_corrupt_recovers(self, tmp_path):
+        path = tmp_path / "metadata.json"
+        path.write_text("{not valid json")
+        reg = ModelRegistry(metadata_path=path)
+        reg._load_metadata_cache()
+        assert reg._metadata == {}
+
+    def test_load_skips_bad_entries(self, tmp_path):
+        # Mix one good entry and one missing-key entry — only the good
+        # one should be loaded.
+        path = tmp_path / "metadata.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "good": _qwen3_meta().to_json_dict(),
+                    "bad": {"name": "bad"},  # missing required keys
+                }
+            )
+        )
+        reg = ModelRegistry(metadata_path=path)
+        reg._load_metadata_cache()
+        assert "good" in reg._metadata
+        assert "bad" not in reg._metadata
+
+
+# ---------------------------------------------------------------------------
+# Convenience getters
+# ---------------------------------------------------------------------------
+
+
+class TestMetadataGetters:
+    def test_get_metadata_missing_returns_none(self, registry):
+        assert registry.get_metadata("not-cached") is None
+
+    def test_get_metadata_returns_cached(self, registry):
+        registry._metadata["qwen3.5:9b-bf16"] = _qwen3_meta()
+        assert registry.get_metadata("qwen3.5:9b-bf16").architecture == "qwen3"
+
+    def test_get_max_context(self, registry):
+        registry._metadata["qwen3.5:9b-bf16"] = _qwen3_meta()
+        assert registry.get_max_context("qwen3.5:9b-bf16") == 32768
+
+    def test_get_max_context_missing(self, registry):
+        assert registry.get_max_context("x") is None
+
+    def test_get_kv_per_slot_default_max(self, registry):
+        registry._metadata["qwen3.5:9b-bf16"] = _qwen3_meta()
+        # Default ctx = max
+        assert (
+            registry.get_kv_per_slot("qwen3.5:9b-bf16")
+            == _qwen3_meta().kv_per_slot_at_max_ctx
+        )
+
+    def test_get_kv_per_slot_explicit_ctx(self, registry):
+        registry._metadata["qwen3.5:9b-bf16"] = _qwen3_meta()
+        small = registry.get_kv_per_slot("qwen3.5:9b-bf16", ctx=4096)
+        full = registry.get_kv_per_slot("qwen3.5:9b-bf16")
+        assert small * 8 == full
+
+    def test_get_kv_per_slot_missing(self, registry):
+        assert registry.get_kv_per_slot("x") is None
+
+
+# ---------------------------------------------------------------------------
+# remove_model: clears both caches
+# ---------------------------------------------------------------------------
+
+
+class TestRemoveModelClearsBothCaches:
+    def test_removes_size_and_metadata(self, tmp_path):
+        reg = ModelRegistry(
+            registry_path=tmp_path / "sizes.json",
+            metadata_path=tmp_path / "metadata.json",
+        )
+        reg._sizes["qwen3.5:9b-bf16"] = 6_000_000_000
+        reg._metadata["qwen3.5:9b-bf16"] = _qwen3_meta()
+
+        reg.remove_model("qwen3.5:9b-bf16")
+
+        assert "qwen3.5:9b-bf16" not in reg._sizes
+        assert "qwen3.5:9b-bf16" not in reg._metadata
+        # Both files written.
+        assert "qwen3.5:9b-bf16" not in json.loads(
+            (tmp_path / "sizes.json").read_text()
+        )
+        assert "qwen3.5:9b-bf16" not in json.loads(
+            (tmp_path / "metadata.json").read_text()
+        )
