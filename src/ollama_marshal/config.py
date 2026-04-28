@@ -331,9 +331,9 @@ class RetryConfig(BaseModel):
 
     - **Streaming requests are NEVER retried.** Once chunks have shipped,
       we can't safely re-issue.
-    - **ReadTimeout is NOT retried** unless `retry_read_timeouts` is
-      enabled — Ollama may have already started generating, so retrying
-      could double-bill or re-execute a tool call.
+    - **ReadTimeout is NOT retried** unless `read_timeouts` is enabled
+      — Ollama may have already started generating, so retrying could
+      double-bill or re-execute a tool call.
     - Only `ConnectError`/`ConnectTimeout` and HTTP 502/503/504 retry
       by default.
 

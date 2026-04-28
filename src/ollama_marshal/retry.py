@@ -13,7 +13,7 @@ Design constraints:
 - **ReadTimeout is NOT retried by default for non-idempotent endpoints.**
   Ollama may have already started generating; retrying could double-bill
   the model run or, worse, re-execute a tool call. Configurable via
-  `retry_read_timeouts: false` (the default).
+  `retry.read_timeouts: false` (the default).
 - **Only ConnectError, ConnectTimeout, and 502/503/504 statuses retry.**
   These are unambiguously "Ollama hadn't started processing yet."
 - **Per-request override**: clients can set `X-Marshal-Retry-Max` to
