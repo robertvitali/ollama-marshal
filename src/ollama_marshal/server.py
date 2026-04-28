@@ -310,6 +310,43 @@ def _register_routes(app: FastAPI) -> None:
         )
 
 
+async def _inject_num_ctx(model: str, body: dict[str, Any]) -> None:
+    """Inject `options.num_ctx = model_max_context` if the client didn't set one.
+
+    Without this, Ollama uses its server-side default (2048) and may
+    *silently truncate* a model's effective context window down from its
+    architectural max. That's a correctness bug for any client that
+    expects the model's full context to be available — analyses get
+    quietly worse with no error or warning.
+
+    Behavior:
+    - Probes registry metadata if not yet cached (one-shot `/api/show`,
+      ~10ms locally on first sight; cached forever after).
+    - If the client already set `options.num_ctx`, we don't override it.
+    - If metadata can't be resolved (model unknown, Ollama down), we
+      skip injection and fall back to current behavior.
+    """
+    if not model:
+        return
+    options = body.setdefault("options", {})
+    if not isinstance(options, dict):
+        # Client sent something weird as `options`; don't touch it.
+        return
+    if "num_ctx" in options:
+        # Client knows what it wants. Respect it.
+        return
+    # Registry may not yet be initialized (e.g. in unit tests that don't
+    # exercise the full lifespan). Bail silently in that case.
+    registry = globals().get("_registry")
+    if registry is None:
+        return
+    # probe_metadata is idempotent — returns the cached entry if present.
+    meta = await registry.probe_metadata(model)
+    if meta is None:
+        return
+    options["num_ctx"] = meta.max_context_length
+
+
 def _resolve_timeout(request: Request) -> int:
     """Resolve the wait-for-scheduler timeout for this request.
 
@@ -352,6 +389,9 @@ async def _enqueue_inference(
     program_id = request.headers.get("x-program-id", "default")
     timeout_s = _resolve_timeout(request)
 
+    # Stop Ollama from silently shrinking num_ctx to fit its slot budget.
+    await _inject_num_ctx(model, body)
+
     envelope = RequestEnvelope(
         model=model,
         program_id=program_id,
@@ -367,6 +407,7 @@ async def _enqueue_inference(
         endpoint=endpoint,
         stream=stream,
         timeout_s=timeout_s,
+        num_ctx=body.get("options", {}).get("num_ctx"),
     )
 
     await _queues.enqueue(envelope)
@@ -437,6 +478,11 @@ async def _enqueue_and_wait(
     """
     program_id = request.headers.get("x-program-id", "default")
     timeout_s = _resolve_timeout(request)
+
+    # Same num_ctx injection as the Ollama-native path; OpenAI clients
+    # rarely set num_ctx explicitly so they're the most likely to be
+    # bitten by Ollama's silent context truncation.
+    await _inject_num_ctx(model, ollama_body)
 
     envelope = RequestEnvelope(
         model=model,

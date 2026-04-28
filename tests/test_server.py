@@ -58,6 +58,22 @@ def _mock_scheduler():
     return sched
 
 
+def _mock_registry():
+    """Stub registry whose probe_metadata is an awaitable that returns None.
+
+    Prevents the num_ctx injection helper from blowing up in tests that
+    set module globals directly without going through lifespan. Returning
+    None means injection is a no-op (current Ollama default behavior).
+    """
+    from ollama_marshal.registry import ModelRegistry
+
+    reg = MagicMock(spec=ModelRegistry)
+    reg.probe_metadata = AsyncMock(return_value=None)
+    reg.get_metadata = MagicMock(return_value=None)
+    reg.get_max_context = MagicMock(return_value=None)
+    return reg
+
+
 # ---------------------------------------------------------------------------
 # create_app
 # ---------------------------------------------------------------------------
@@ -541,6 +557,121 @@ class TestMarshalStatus:
 
 
 # ---------------------------------------------------------------------------
+# _inject_num_ctx
+# ---------------------------------------------------------------------------
+
+
+class TestInjectNumCtx:
+    """Verify the num_ctx-injection helper.
+
+    Stops Ollama from silently truncating context when KV cache slots
+    don't fit at the model's full architectural context length.
+    """
+
+    async def test_injects_when_options_missing(self):
+        """No options block at all → registry max gets injected."""
+        from ollama_marshal.registry import ModelMetadata
+
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(
+            return_value=ModelMetadata(
+                name="qwen3.5:9b-bf16",
+                architecture="qwen3",
+                max_context_length=32768,
+                num_layers=28,
+                embedding_length=3584,
+                head_count=28,
+                head_count_kv=4,
+            )
+        )
+        original_registry = getattr(server_mod, "_registry", None)
+        server_mod._registry = registry
+
+        body: dict = {"model": "qwen3.5:9b-bf16"}
+        try:
+            await server_mod._inject_num_ctx("qwen3.5:9b-bf16", body)
+        finally:
+            if original_registry is not None:
+                server_mod._registry = original_registry
+            else:
+                del server_mod._registry
+
+        assert body["options"]["num_ctx"] == 32768
+
+    async def test_preserves_existing_num_ctx(self):
+        """Client-set num_ctx wins."""
+        from ollama_marshal.registry import ModelMetadata
+
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(
+            return_value=ModelMetadata(
+                name="m",
+                architecture="x",
+                max_context_length=99999,
+                num_layers=1,
+                embedding_length=1,
+                head_count=1,
+                head_count_kv=1,
+            )
+        )
+        original_registry = getattr(server_mod, "_registry", None)
+        server_mod._registry = registry
+        body: dict = {"model": "m", "options": {"num_ctx": 4096}}
+        try:
+            await server_mod._inject_num_ctx("m", body)
+        finally:
+            if original_registry is not None:
+                server_mod._registry = original_registry
+            else:
+                del server_mod._registry
+        # Client value preserved.
+        assert body["options"]["num_ctx"] == 4096
+
+    async def test_skips_when_metadata_missing(self):
+        """No metadata for the model → no injection (don't break unknown models)."""
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(return_value=None)
+        original_registry = getattr(server_mod, "_registry", None)
+        server_mod._registry = registry
+        body: dict = {"model": "unknown:xyz"}
+        try:
+            await server_mod._inject_num_ctx("unknown:xyz", body)
+        finally:
+            if original_registry is not None:
+                server_mod._registry = original_registry
+            else:
+                del server_mod._registry
+        # No options block created when there's nothing to set.
+        assert body.get("options", {}).get("num_ctx") is None
+
+    async def test_skips_when_model_empty(self):
+        body: dict = {}
+        await server_mod._inject_num_ctx("", body)
+        assert "options" not in body or "num_ctx" not in body["options"]
+
+    async def test_skips_when_options_not_dict(self):
+        """Defensive: client sent something weird as options. Don't touch it."""
+        body: dict = {"model": "m", "options": "not a dict"}
+        await server_mod._inject_num_ctx("m", body)
+        assert body["options"] == "not a dict"
+
+    async def test_skips_when_registry_unset(self):
+        """Tests that bypass lifespan don't crash the helper."""
+        # Capture and remove _registry entirely.
+        original_registry = getattr(server_mod, "_registry", None)
+        if hasattr(server_mod, "_registry"):
+            del server_mod._registry
+        body: dict = {"model": "m"}
+        try:
+            await server_mod._inject_num_ctx("m", body)
+        finally:
+            if original_registry is not None:
+                server_mod._registry = original_registry
+        # No injection happened.
+        assert "num_ctx" not in body.get("options", {})
+
+
+# ---------------------------------------------------------------------------
 # lifespan
 # ---------------------------------------------------------------------------
 
@@ -692,6 +823,10 @@ class TestRouteHandlers:
         server_mod._config = MarshalConfig()
         server_mod._memory = _mock_memory()
         server_mod._scheduler = _mock_scheduler()
+        # _registry must be set explicitly — TestLifespan patches the
+        # ModelRegistry class and leaves a MagicMock as the module global,
+        # which would crash the num_ctx-injection helper if not reset.
+        server_mod._registry = _mock_registry()
         server_mod._started_at = time.monotonic()
 
     async def test_api_chat_handler(self):
