@@ -903,62 +903,70 @@ class TestInjectNumCtx:
     don't fit at the model's full architectural context length.
     """
 
-    async def test_injects_when_options_missing(self):
-        """No options block at all → registry max gets injected."""
+    def _set_globals(self, *, registry, config=None):
+        """Helper: install registry+config in server_mod globals.
+
+        Returns a callable that restores the previous state. Tests use
+        this in a try/finally to keep module state isolated.
+        """
+        if config is None:
+            config = MarshalConfig()
+        original_registry = getattr(server_mod, "_registry", None)
+        original_config = getattr(server_mod, "_config", None)
+        server_mod._registry = registry
+        server_mod._config = config
+
+        def restore():
+            if original_registry is not None:
+                server_mod._registry = original_registry
+            else:
+                del server_mod._registry
+            if original_config is not None:
+                server_mod._config = original_config
+            else:
+                del server_mod._config
+
+        return restore
+
+    def _qwen3_metadata(self, max_ctx=32768):
         from ollama_marshal.registry import ModelMetadata
 
-        registry = MagicMock()
-        registry.probe_metadata = AsyncMock(
-            return_value=ModelMetadata(
-                name="qwen3.5:9b-bf16",
-                architecture="qwen3",
-                max_context_length=32768,
-                num_layers=28,
-                embedding_length=3584,
-                head_count=28,
-                head_count_kv=4,
-            )
+        return ModelMetadata(
+            name="qwen3.5:9b-bf16",
+            architecture="qwen3",
+            max_context_length=max_ctx,
+            num_layers=28,
+            embedding_length=3584,
+            head_count=28,
+            head_count_kv=4,
         )
-        original_registry = getattr(server_mod, "_registry", None)
-        server_mod._registry = registry
+
+    async def test_injects_smallest_boundary_for_empty_body(self):
+        """No prompt content → only completion budget + safety = ~4352 → 8192."""
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(return_value=self._qwen3_metadata())
+        restore = self._set_globals(registry=registry)
 
         body: dict = {"model": "qwen3.5:9b-bf16"}
         try:
             await server_mod._inject_num_ctx("qwen3.5:9b-bf16", body)
         finally:
-            if original_registry is not None:
-                server_mod._registry = original_registry
-            else:
-                del server_mod._registry
+            restore()
 
-        assert body["options"]["num_ctx"] == 32768
+        # 0 prompt + 4096 completion + 256 safety = 4352, rounds up to 8192.
+        assert body["options"]["num_ctx"] == 8192
 
     async def test_preserves_existing_num_ctx(self):
         """Client-set num_ctx wins."""
-        from ollama_marshal.registry import ModelMetadata
-
         registry = MagicMock()
-        registry.probe_metadata = AsyncMock(
-            return_value=ModelMetadata(
-                name="m",
-                architecture="x",
-                max_context_length=99999,
-                num_layers=1,
-                embedding_length=1,
-                head_count=1,
-                head_count_kv=1,
-            )
-        )
-        original_registry = getattr(server_mod, "_registry", None)
-        server_mod._registry = registry
+        registry.probe_metadata = AsyncMock(return_value=self._qwen3_metadata())
+        restore = self._set_globals(registry=registry)
+
         body: dict = {"model": "m", "options": {"num_ctx": 4096}}
         try:
             await server_mod._inject_num_ctx("m", body)
         finally:
-            if original_registry is not None:
-                server_mod._registry = original_registry
-            else:
-                del server_mod._registry
+            restore()
         # Client value preserved.
         assert body["options"]["num_ctx"] == 4096
 
@@ -966,16 +974,12 @@ class TestInjectNumCtx:
         """No metadata for the model → no injection (don't break unknown models)."""
         registry = MagicMock()
         registry.probe_metadata = AsyncMock(return_value=None)
-        original_registry = getattr(server_mod, "_registry", None)
-        server_mod._registry = registry
+        restore = self._set_globals(registry=registry)
         body: dict = {"model": "unknown:xyz"}
         try:
             await server_mod._inject_num_ctx("unknown:xyz", body)
         finally:
-            if original_registry is not None:
-                server_mod._registry = original_registry
-            else:
-                del server_mod._registry
+            restore()
         # No options block created when there's nothing to set.
         assert body.get("options", {}).get("num_ctx") is None
 
@@ -1004,6 +1008,282 @@ class TestInjectNumCtx:
                 server_mod._registry = original_registry
         # No injection happened.
         assert "num_ctx" not in body.get("options", {})
+
+    async def test_skips_when_injection_disabled(self):
+        """`context.injection_enabled: false` opts out entirely."""
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(return_value=self._qwen3_metadata())
+        cfg = MarshalConfig()
+        cfg.context.injection_enabled = False
+        restore = self._set_globals(registry=registry, config=cfg)
+        body: dict = {"model": "qwen3.5:9b-bf16"}
+        try:
+            await server_mod._inject_num_ctx("qwen3.5:9b-bf16", body)
+        finally:
+            restore()
+        # Untouched — Ollama default behavior takes over.
+        assert body.get("options", {}).get("num_ctx") is None
+
+    async def test_sizes_from_chat_messages(self):
+        """Long messages drive num_ctx upward."""
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(return_value=self._qwen3_metadata())
+        restore = self._set_globals(registry=registry)
+        # ~50K chars * 0.3 = 15K prompt tokens; +4352 budget+safety ≈ 19K
+        # → rounds up to 32768.
+        long_msg = "x" * 50_000
+        body: dict = {
+            "model": "qwen3.5:9b-bf16",
+            "messages": [{"role": "user", "content": long_msg}],
+        }
+        try:
+            await server_mod._inject_num_ctx("qwen3.5:9b-bf16", body)
+        finally:
+            restore()
+        assert body["options"]["num_ctx"] == 32768
+
+    async def test_sizes_from_generate_prompt(self):
+        """`/api/generate` uses `prompt` field instead of `messages`."""
+        registry = MagicMock()
+        # Use a 262K-context model so the prompt-driven sizer isn't
+        # clamped by the model max.
+        registry.probe_metadata = AsyncMock(
+            return_value=self._qwen3_metadata(max_ctx=262144)
+        )
+        restore = self._set_globals(registry=registry)
+        body: dict = {"model": "qwen3.5:9b-bf16", "prompt": "x" * 100_000}
+        try:
+            await server_mod._inject_num_ctx("qwen3.5:9b-bf16", body)
+        finally:
+            restore()
+        # 100K * 0.3 = 30K + 4352 ≈ 35K → rounds up to 65536.
+        assert body["options"]["num_ctx"] == 65536
+
+    async def test_clamps_to_model_max_context(self):
+        """A 100K-char prompt at qwen3.5 8K-max model clamps to 8192."""
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(
+            return_value=self._qwen3_metadata(max_ctx=8192)
+        )
+        restore = self._set_globals(registry=registry)
+        body: dict = {"model": "small", "prompt": "x" * 100_000}
+        try:
+            await server_mod._inject_num_ctx("small", body)
+        finally:
+            restore()
+        assert body["options"]["num_ctx"] == 8192
+
+    async def test_program_floor_applied(self):
+        """A program profile's typical_num_ctx is a floor for short prompts."""
+        from ollama_marshal.config import ProgramContextProfile
+
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(return_value=self._qwen3_metadata())
+        cfg = MarshalConfig()
+        cfg.context.programs["ai-portfolio"] = ProgramContextProfile(
+            typical_num_ctx=16384, max_num_ctx=65536
+        )
+        restore = self._set_globals(registry=registry, config=cfg)
+        body: dict = {"model": "qwen3.5:9b-bf16", "prompt": "short"}
+        try:
+            await server_mod._inject_num_ctx(
+                "qwen3.5:9b-bf16", body, program_id="ai-portfolio"
+            )
+        finally:
+            restore()
+        # Prompt-driven would land at 8192, but the program floor lifts it to 16384.
+        assert body["options"]["num_ctx"] == 16384
+
+    async def test_program_ceiling_applied(self):
+        """A program profile's max_num_ctx is a ceiling for runaway prompts."""
+        from ollama_marshal.config import ProgramContextProfile
+
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(
+            return_value=self._qwen3_metadata(max_ctx=262144)
+        )
+        cfg = MarshalConfig()
+        cfg.context.programs["ai-email"] = ProgramContextProfile(
+            typical_num_ctx=4096, max_num_ctx=8192
+        )
+        restore = self._set_globals(registry=registry, config=cfg)
+        # 50K-char prompt would normally land at 32768 prompt-driven, but
+        # the program ceiling caps at 8192.
+        body: dict = {"model": "qwen3.5:9b-bf16", "prompt": "x" * 50_000}
+        try:
+            await server_mod._inject_num_ctx(
+                "qwen3.5:9b-bf16", body, program_id="ai-email"
+            )
+        finally:
+            restore()
+        assert body["options"]["num_ctx"] == 8192
+
+    async def test_program_without_profile_uses_prompt_driven(self):
+        """Programs not in `context.programs` get pure prompt-driven sizing."""
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(return_value=self._qwen3_metadata())
+        restore = self._set_globals(registry=registry)
+        body: dict = {"model": "qwen3.5:9b-bf16", "prompt": "short"}
+        try:
+            await server_mod._inject_num_ctx(
+                "qwen3.5:9b-bf16", body, program_id="not-configured"
+            )
+        finally:
+            restore()
+        # No floor, prompt is short → smallest practical boundary above 4352.
+        assert body["options"]["num_ctx"] == 8192
+
+    async def test_handles_openai_multimodal_content_list(self):
+        """OpenAI chat content as list-of-parts: count text parts only."""
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(return_value=self._qwen3_metadata())
+        restore = self._set_globals(registry=registry)
+        body: dict = {
+            "model": "qwen3.5:9b-bf16",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "x" * 50_000},
+                        {"type": "image_url", "image_url": {"url": "..."}},
+                    ],
+                }
+            ],
+        }
+        try:
+            await server_mod._inject_num_ctx("qwen3.5:9b-bf16", body)
+        finally:
+            restore()
+        # Same 50K text → 32768.
+        assert body["options"]["num_ctx"] == 32768
+
+
+class TestEstimatePromptTokens:
+    def test_zero_for_empty_body(self):
+        assert server_mod._estimate_prompt_tokens({}) == 0
+
+    def test_counts_string_prompt(self):
+        # 100 chars * 0.3 = 30 tokens.
+        assert server_mod._estimate_prompt_tokens({"prompt": "x" * 100}) == 30
+
+    def test_counts_chat_messages(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "abc"},      # 3
+                {"role": "assistant", "content": "defg"},  # 4
+            ],
+        }
+        # 7 chars * 0.3 = 2.
+        assert server_mod._estimate_prompt_tokens(body) == 2
+
+    def test_counts_multimodal_text_parts(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "abc"},
+                        {"type": "image_url", "image_url": {"url": "..."}},
+                    ],
+                }
+            ],
+        }
+        # 3 text chars * 0.3 = 0 (rounds via int).
+        assert server_mod._estimate_prompt_tokens(body) == 0
+
+    def test_handles_non_dict_messages(self):
+        # Defensive: malformed input shouldn't crash the estimator.
+        assert (
+            server_mod._estimate_prompt_tokens({"messages": "not a list"})
+            == 0
+        )
+
+    def test_handles_messages_with_non_dict_entries(self):
+        body = {"messages": ["not a dict", None, 42]}
+        assert server_mod._estimate_prompt_tokens(body) == 0
+
+
+class TestRoundUpToBoundary:
+    def test_below_smallest_returns_smallest(self):
+        assert server_mod._round_up_to_boundary(0) == 2048
+        assert server_mod._round_up_to_boundary(100) == 2048
+
+    def test_exact_boundary_returns_same(self):
+        assert server_mod._round_up_to_boundary(4096) == 4096
+
+    def test_one_above_boundary_jumps_up(self):
+        assert server_mod._round_up_to_boundary(4097) == 8192
+
+    def test_above_largest_returns_largest(self):
+        # Caller is expected to clamp to model max separately.
+        assert server_mod._round_up_to_boundary(10_000_000) == 262144
+
+    def test_typical_8b_chat_lands_at_16384(self):
+        # 30K-token prompt + 4096 budget + 256 safety ≈ 34K → 65536.
+        assert server_mod._round_up_to_boundary(34_000) == 65536
+
+
+class TestResolveNumCtxDecision:
+    def test_prompt_driven_mode_for_unconfigured_program(self):
+        cfg = MarshalConfig()
+        chosen, mode = server_mod._resolve_num_ctx_decision(
+            prompt_tokens=1000,
+            program_id="anything",
+            model_max_context=32768,
+            config=cfg,
+        )
+        # 1000 + 4096 + 256 = 5352 → 8192.
+        assert chosen == 8192
+        assert mode == "prompt_driven"
+
+    def test_program_floor_mode(self):
+        from ollama_marshal.config import ProgramContextProfile
+
+        cfg = MarshalConfig()
+        cfg.context.programs["p"] = ProgramContextProfile(
+            typical_num_ctx=16384, max_num_ctx=65536
+        )
+        chosen, mode = server_mod._resolve_num_ctx_decision(
+            prompt_tokens=10,
+            program_id="p",
+            model_max_context=32768,
+            config=cfg,
+        )
+        assert chosen == 16384
+        assert mode == "program_floor"
+
+    def test_program_ceiling_mode(self):
+        from ollama_marshal.config import ProgramContextProfile
+
+        cfg = MarshalConfig()
+        cfg.context.programs["p"] = ProgramContextProfile(
+            typical_num_ctx=2048, max_num_ctx=8192
+        )
+        chosen, mode = server_mod._resolve_num_ctx_decision(
+            prompt_tokens=50_000,
+            program_id="p",
+            model_max_context=262144,
+            config=cfg,
+        )
+        assert chosen == 8192
+        assert mode == "program_ceiling"
+
+    def test_model_max_clamp_overrides_everything(self):
+        from ollama_marshal.config import ProgramContextProfile
+
+        cfg = MarshalConfig()
+        cfg.context.programs["p"] = ProgramContextProfile(
+            typical_num_ctx=131072, max_num_ctx=262144
+        )
+        chosen, mode = server_mod._resolve_num_ctx_decision(
+            prompt_tokens=1000,
+            program_id="p",
+            model_max_context=8192,
+            config=cfg,
+        )
+        # Profile floor is 131K but model only supports 8K.
+        assert chosen == 8192
+        assert mode == "model_max"
 
 
 # ---------------------------------------------------------------------------

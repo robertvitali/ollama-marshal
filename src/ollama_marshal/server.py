@@ -436,41 +436,179 @@ async def _is_known_model(model: str) -> bool:
     return result
 
 
-async def _inject_num_ctx(model: str, body: dict[str, Any]) -> None:
-    """Inject `options.num_ctx = model_max_context` if the client didn't set one.
+# Power-of-2 boundaries used by the prompt-driven num_ctx sizer.
+# Rounding UP to one of these absorbs the char/4 + 20% tokenizer
+# overestimate cheaply and keeps Ollama's KV cache slot allocation on
+# friendly sizes. Last entry caps below typical model maxes (262144).
+_NUM_CTX_BOUNDARIES: tuple[int, ...] = (
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
+    262144,
+)
 
-    Without this, Ollama uses its server-side default (2048) and may
-    *silently truncate* a model's effective context window down from its
-    architectural max. That's a correctness bug for any client that
-    expects the model's full context to be available — analyses get
-    quietly worse with no error or warning.
 
-    Behavior:
-    - Probes registry metadata if not yet cached (one-shot `/api/show`,
-      ~10ms locally on first sight; cached forever after).
-    - If the client already set `options.num_ctx`, we don't override it.
-    - If metadata can't be resolved (model unknown, Ollama down), we
-      skip injection and fall back to current behavior.
+def _estimate_prompt_tokens(body: dict[str, Any]) -> int:
+    """Cheap upper-bound token estimate from request body.
+
+    char-count / 4 + 20% buffer over-estimates by 5-15% for English/code
+    and more for CJK; the round-up to power-of-2 boundary absorbs that
+    slack. Avoids the dependency on `tiktoken` or per-model tokenizers.
+
+    Reads from the three shapes Ollama accepts:
+    - `messages: [{role, content}]` — /api/chat, /v1/chat/completions
+    - `prompt: "..."`               — /api/generate, /v1/completions
+    - falls through to 0 if neither is present.
+
+    Returns:
+        Token count (int).
+    """
+    chars = 0
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str):
+                    chars += len(content)
+                elif isinstance(content, list):
+                    # OpenAI-style multimodal content: list of parts.
+                    for part in content:
+                        if isinstance(part, dict):
+                            text = part.get("text", "")
+                            if isinstance(text, str):
+                                chars += len(text)
+    prompt = body.get("prompt")
+    if isinstance(prompt, str):
+        chars += len(prompt)
+    # 1 token ≈ 4 chars + 20% buffer = chars / 4 * 1.2 = chars * 0.3
+    return int(chars * 0.3)
+
+
+def _round_up_to_boundary(value: int) -> int:
+    """Round `value` up to the next entry in `_NUM_CTX_BOUNDARIES`.
+
+    Below the smallest boundary returns the smallest. Above the largest
+    returns the largest (caller is expected to clamp to the model max).
+    """
+    for boundary in _NUM_CTX_BOUNDARIES:
+        if value <= boundary:
+            return boundary
+    return _NUM_CTX_BOUNDARIES[-1]
+
+
+def _resolve_num_ctx_decision(
+    *,
+    prompt_tokens: int,
+    program_id: str,
+    model_max_context: int,
+    config: Any,
+) -> tuple[int, str]:
+    """Compute the per-request num_ctx and the mode that produced it.
+
+    Decision tree:
+    1. Estimate need: `prompt_tokens + default_completion_budget +
+       safety_buffer_tokens`.
+    2. Round UP to the next power-of-2 boundary.
+    3. If a `ContextConfig.programs[program_id]` profile exists, clamp
+       to `[typical_num_ctx, max_num_ctx]`. The floor protects
+       tool-calling programs from a reload-stall on round 2; the
+       ceiling protects against runaway prompts.
+    4. Final clamp: `min(value, model_max_context)`.
+
+    Returns:
+        (num_ctx, mode) — `mode` is one of "prompt_driven",
+        "program_floor", "program_ceiling", "model_max" — for logging.
+    """
+    ctx_cfg = config.context
+    needed = (
+        prompt_tokens + ctx_cfg.default_completion_budget + ctx_cfg.safety_buffer_tokens
+    )
+    rounded = _round_up_to_boundary(needed)
+    chosen = rounded
+    mode = "prompt_driven"
+
+    profile = ctx_cfg.programs.get(program_id)
+    if profile is not None:
+        if chosen < profile.typical_num_ctx:
+            chosen = profile.typical_num_ctx
+            mode = "program_floor"
+        elif chosen > profile.max_num_ctx:
+            chosen = profile.max_num_ctx
+            mode = "program_ceiling"
+
+    if chosen > model_max_context:
+        chosen = model_max_context
+        mode = "model_max"
+
+    return chosen, mode
+
+
+async def _inject_num_ctx(
+    model: str, body: dict[str, Any], program_id: str = "default"
+) -> None:
+    """Inject `options.num_ctx` sized to actual prompt + program profile.
+
+    v0.4.0 behavior (replaces v0.3.0's force-to-max):
+    - Estimate prompt tokens from request body (chars/4 + 20% buffer).
+    - Add completion budget + safety; round UP to next power-of-2.
+    - Clamp to program profile's [typical_num_ctx, max_num_ctx] if set.
+    - Final-clamp to model.max_context_length.
+
+    The result is the smallest num_ctx that still fits the actual prompt,
+    so Ollama doesn't pre-allocate KV cache for the full architectural
+    window on every request. v0.4.0 reload-on-need (Dim 4) handles the
+    case where a request actually NEEDS more context than the model
+    currently has allocated.
+
+    Skipped when:
+    - Model name is empty.
+    - Client already set `options.num_ctx` (their value wins).
+    - `options` is set to a non-dict value.
+    - Registry metadata isn't available (model unknown, Ollama down).
+    - `context.injection_enabled` is False (opt-out).
     """
     if not model:
         return
     options = body.setdefault("options", {})
     if not isinstance(options, dict):
-        # Client sent something weird as `options`; don't touch it.
         return
     if "num_ctx" in options:
-        # Client knows what it wants. Respect it.
         return
-    # Registry may not yet be initialized (e.g. in unit tests that don't
-    # exercise the full lifespan). Bail silently in that case.
+
+    config = globals().get("_config")
+    if config is None or not config.context.injection_enabled:
+        return
+
     registry = globals().get("_registry")
     if registry is None:
         return
-    # probe_metadata is idempotent — returns the cached entry if present.
     meta = await registry.probe_metadata(model)
     if meta is None:
         return
-    options["num_ctx"] = meta.max_context_length
+
+    prompt_tokens = _estimate_prompt_tokens(body)
+    chosen, mode = _resolve_num_ctx_decision(
+        prompt_tokens=prompt_tokens,
+        program_id=program_id,
+        model_max_context=meta.max_context_length,
+        config=config,
+    )
+    options["num_ctx"] = chosen
+    logger.debug(
+        "server.num_ctx_decision",
+        model=model,
+        program=program_id,
+        prompt_tokens=prompt_tokens,
+        completion_budget=config.context.default_completion_budget,
+        chosen=chosen,
+        mode=mode,
+        model_max=meta.max_context_length,
+    )
 
 
 def _parse_retry_max_header(request: Request) -> int | None:
@@ -565,13 +703,11 @@ async def _enqueue_inference(
     # the remaining calls sequentially.
     _record_burst_hint(request, program_id, model)
 
-    # Stop Ollama from silently shrinking num_ctx to fit its slot budget.
-    # Skip embeddings — they use input_length not generation context, so
-    # forcing model_max_context wastes KV cache without preventing
-    # truncation (embedding workloads aren't bitten by the bug this fix
-    # addresses).
+    # Size num_ctx to actual prompt need + program profile (Dim 1).
+    # Skip embeddings — they don't generate, so KV cache pre-allocation
+    # is irrelevant.
     if endpoint not in ("/api/embeddings", "/v1/embeddings"):
-        await _inject_num_ctx(model, body)
+        await _inject_num_ctx(model, body, program_id)
 
     envelope = RequestEnvelope(
         model=model,
@@ -698,7 +834,7 @@ async def _enqueue_and_wait(
     # rarely set num_ctx explicitly so they're the most likely to be
     # bitten by Ollama's silent context truncation. Skip embeddings.
     if endpoint not in ("/api/embeddings", "/v1/embeddings"):
-        await _inject_num_ctx(model, ollama_body)
+        await _inject_num_ctx(model, ollama_body, program_id)
 
     envelope = RequestEnvelope(
         model=model,

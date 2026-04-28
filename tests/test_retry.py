@@ -15,7 +15,6 @@ from ollama_marshal.retry import (
     call_with_retry,
 )
 
-
 # ---------------------------------------------------------------------------
 # call_with_retry — exception paths
 # ---------------------------------------------------------------------------
@@ -133,7 +132,7 @@ class TestCallWithRetryNonRetryableExceptions:
     async def test_value_error_reraises_immediately(self):
         # Non-network errors must NOT be retried — bug in our code.
         func = AsyncMock(side_effect=ValueError("bug"))
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="bug"):
             await call_with_retry(
                 func,
                 max_attempts=3,
@@ -326,7 +325,7 @@ class TestRetryConstants:
     def test_retryable_status_codes_include_502_503_504(self):
         # Documented behavior — pin the set so a refactor can't quietly
         # add 500 or 429 (those have different semantics).
-        assert RETRYABLE_STATUS_CODES == frozenset({502, 503, 504})
+        assert frozenset({502, 503, 504}) == RETRYABLE_STATUS_CODES
 
     def test_safe_excs_only_connection_errors(self):
         # Anything in SAFE means "Ollama hadn't received the request yet."

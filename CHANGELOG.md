@@ -36,6 +36,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counters** on `SchedulerMetrics`. Persisted across restarts in
   `metrics.json`. `unexpected_unloads` is wired by Surface C2 later
   in this release.
+- **Per-program context profiles** (`context.programs.<id>`) with
+  `typical_num_ctx` (floor) and `max_num_ctx` (ceiling). Lets a
+  tool-calling program declare "round 1's allocation must already
+  fit round 5's growth" without exposing every program to the
+  pessimal max-context allocation.
+
+### Changed
+
+- **BEHAVIOR CHANGE: dynamic `num_ctx` sizing.** v0.3.0 injected
+  `num_ctx = model_max_context` unconditionally — a 4B model with a
+  262K context window would pre-allocate ~17 GB of KV cache per slot
+  on every request, causing Ollama to thrash co-resident models. v0.4.0
+  estimates prompt tokens (chars/4 + 20% buffer), adds the completion
+  budget + safety buffer, rounds up to a power-of-2 boundary
+  (2K…262K), clamps to the program's profile if set, then to the
+  model's max. **Marshal NEVER silently truncates a real prompt** —
+  when a request needs more context than the model has allocated,
+  marshal will reload the model at the larger size (Surface C1 Dim 4,
+  shipping in this release). To restore v0.2.x behavior (Ollama
+  default + silent truncation), set `context.injection_enabled:
+  false`.
 
 ## [0.3.0] - 2026-04-28
 

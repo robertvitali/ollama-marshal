@@ -117,3 +117,44 @@ retry:
   retry_read_timeouts: false       # MARSHAL_RETRY_READ_TIMEOUTS — when true, also retry
                                     # ReadTimeout (risk of re-execution). Embeddings
                                     # endpoints opt in automatically regardless of this flag.
+
+# Dynamic num_ctx injection (default ON).
+# v0.3.0 forced num_ctx = model_max_context, which made Ollama pre-allocate
+# KV cache for the full architectural window even on a 100-token prompt
+# (a 70 GB allocation on a 4B model with 262K context). v0.4.0 sizes
+# num_ctx to actual prompt + completion budget, rounded up to a power-of-2
+# boundary, then clamped to per-program [typical, max] if a profile exists,
+# and finally to the model's max_context_length.
+#
+# Marshal NEVER silently truncates a real prompt. When a request needs
+# more context than the model's currently-allocated slot size, marshal
+# triggers a reload at the larger size (Surface C1 Dim 4).
+#
+# Set injection_enabled: false to opt out and fall back to Ollama's
+# default behavior (with its silent-truncation bug).
+context:
+  injection_enabled: true                # MARSHAL_CONTEXT_INJECTION_ENABLED
+  default_completion_budget: 4096        # MARSHAL_CONTEXT_DEFAULT_COMPLETION_BUDGET
+                                          # — tokens reserved for the response when the
+                                          # client doesn't set options.num_predict.
+  safety_buffer_tokens: 256              # MARSHAL_CONTEXT_SAFETY_BUFFER_TOKENS
+                                          # — extra tokens to absorb tokenizer overestimate.
+
+  # Per-program profiles keyed by X-Program-ID header value. Programs
+  # without a profile get pure prompt-driven sizing.
+  #   typical_num_ctx — FLOOR. Tool-calling programs benefit from this so
+  #     round 2 doesn't trigger a reload. Set to typical context the
+  #     program actually uses after a few rounds.
+  #   max_num_ctx — CEILING. Defensive against runaway prompts.
+  programs: {}
+  # Example:
+  # programs:
+  #   ai-portfolio-rebalance:
+  #     typical_num_ctx: 16384            # tool-calling rounds grow over time
+  #     max_num_ctx: 65536
+  #   projectfreethink-government-analysis:
+  #     typical_num_ctx: 32768            # long bills
+  #     max_num_ctx: 131072
+  #   ai-email-triage:
+  #     typical_num_ctx: 4096             # short prompts, K-vote
+  #     max_num_ctx: 8192
