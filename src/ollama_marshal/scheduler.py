@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -174,9 +178,21 @@ class InflightTracker:
         return sem
 
 
+# Bumped on schema-breaking changes to the persisted metrics file. On a
+# mismatch we log a warning and start fresh — better than crashing.
+_METRICS_SCHEMA_VERSION = 1
+
+
 @dataclass
 class SchedulerMetrics:
     """Tracks scheduler performance metrics.
+
+    Counters are LIFETIME (not per-process) when persistence is enabled.
+    On startup, marshal reads the on-disk snapshot and seeds these
+    counters; on shutdown and every 60s during runtime, the snapshot is
+    rewritten. The dashboard's `Δ since dashboard started` view computes
+    a baseline at first poll, so its delta math is unaffected by the
+    reseeding.
 
     Attributes:
         requests_served: Total requests forwarded to Ollama.
@@ -198,6 +214,97 @@ class SchedulerMetrics:
         if self.requests_served == 0:
             return 0.0
         return self.total_wait_ms / self.requests_served
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """Serializable snapshot for `~/.ollama-marshal/metrics.json`.
+
+        `started_at` is intentionally NOT persisted — it's a monotonic
+        reference point that's only meaningful within the current
+        process lifetime.
+        """
+        return {
+            "schema_version": _METRICS_SCHEMA_VERSION,
+            "saved_at": datetime.now(UTC).isoformat(),
+            "requests_served": self.requests_served,
+            "model_swaps": self.model_swaps,
+            "evictions": self.evictions,
+            "total_wait_ms": float(self.total_wait_ms),
+        }
+
+    @classmethod
+    def from_json_dict(cls, data: dict[str, Any]) -> SchedulerMetrics:
+        """Reconstruct from on-disk snapshot, validating schema version.
+
+        Raises ValueError on schema mismatch so callers can log and fall
+        back to a fresh metrics object instead of silently using stale
+        or differently-shaped state.
+        """
+        version = data.get("schema_version")
+        if version != _METRICS_SCHEMA_VERSION:
+            raise ValueError(
+                f"metrics schema version {version!r} != expected "
+                f"{_METRICS_SCHEMA_VERSION}"
+            )
+        return cls(
+            requests_served=int(data.get("requests_served", 0)),
+            model_swaps=int(data.get("model_swaps", 0)),
+            evictions=int(data.get("evictions", 0)),
+            total_wait_ms=float(data.get("total_wait_ms", 0.0)),
+            # started_at is intentionally fresh — current process clock.
+        )
+
+    def save_to(self, path: Path) -> None:
+        """Write the JSON snapshot to disk. Best-effort.
+
+        Creates parent dir if missing. Logs (not raises) on I/O error so
+        a transient disk hiccup never crashes the proxy.
+        """
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(self.to_json_dict(), indent=2) + "\n"
+            path.write_text(payload)
+        except OSError as exc:
+            logger.warning(
+                "scheduler.metrics_save_failed",
+                path=str(path),
+                error=str(exc) or repr(exc),
+                error_type=type(exc).__name__,
+            )
+
+    @classmethod
+    def load_from(cls, path: Path) -> SchedulerMetrics:
+        """Load the JSON snapshot, falling back to fresh on any failure.
+
+        Failures handled (each logs a warning and returns a fresh
+        SchedulerMetrics):
+        - File doesn't exist (first run, expected)
+        - File unreadable / corrupt JSON
+        - Schema version mismatch
+        - Wrong types in fields
+        """
+        if not path.exists():
+            return cls()
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "scheduler.metrics_load_corrupt",
+                path=str(path),
+                error=str(exc) or repr(exc),
+            )
+            return cls()
+        if not isinstance(data, dict):
+            logger.warning("scheduler.metrics_load_wrong_shape", path=str(path))
+            return cls()
+        try:
+            return cls.from_json_dict(data)
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "scheduler.metrics_schema_mismatch",
+                path=str(path),
+                error=str(exc),
+            )
+            return cls()
 
 
 class Scheduler:

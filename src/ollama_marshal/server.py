@@ -6,6 +6,7 @@ import asyncio
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import psutil
@@ -27,8 +28,17 @@ from ollama_marshal.openai_compat import (
 )
 from ollama_marshal.queue import ModelQueues, RequestEnvelope
 from ollama_marshal.registry import ModelRegistry
-from ollama_marshal.scheduler import Scheduler
+from ollama_marshal.scheduler import Scheduler, SchedulerMetrics
 from ollama_marshal.stream import forward_passthrough
+
+# Where lifetime metrics survive across restarts. Same dir pattern as
+# `model_sizes.json`. Override via `app.state.metrics_path` for tests.
+_DEFAULT_METRICS_PATH = Path.home() / ".ollama-marshal" / "metrics.json"
+
+# How often the background task rewrites the metrics snapshot. Trades
+# off freshness against disk wear; 60s loses at most a minute of
+# counters on a hard crash, which is acceptable for lifetime metrics.
+_METRICS_PERSIST_INTERVAL_S = 60.0
 
 logger = structlog.get_logger()
 
@@ -66,11 +76,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         config=_config,
     )
 
+    # Restore lifetime metrics from disk so counters (requests_served,
+    # model_swaps, evictions, total_wait_ms) survive restarts. Falls
+    # back to fresh on any failure (logs a warning).
+    metrics_path = getattr(app.state, "metrics_path", _DEFAULT_METRICS_PATH)
+    restored = SchedulerMetrics.load_from(metrics_path)
+    # Preserve the freshly-set started_at; only seed the persisted counters.
+    _scheduler.metrics.requests_served = restored.requests_served
+    _scheduler.metrics.model_swaps = restored.model_swaps
+    _scheduler.metrics.evictions = restored.evictions
+    _scheduler.metrics.total_wait_ms = restored.total_wait_ms
+    if restored.requests_served or restored.model_swaps or restored.evictions:
+        logger.info(
+            "server.metrics_restored",
+            path=str(metrics_path),
+            requests_served=restored.requests_served,
+            model_swaps=restored.model_swaps,
+            evictions=restored.evictions,
+        )
+
     # Start background tasks
     await _memory.start_polling()
     await _registry.initialize()
     asyncio.create_task(_registry.benchmark_unknown())
     await _scheduler.start()
+
+    # Periodically snapshot metrics to disk so a hard crash loses at
+    # most _METRICS_PERSIST_INTERVAL_S of counter data.
+    metrics_persister = asyncio.create_task(_persist_metrics_loop(metrics_path))
 
     logger.info(
         "server.started",
@@ -79,6 +112,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     yield
+
+    # Stop the background persister cleanly before final save below.
+    metrics_persister.cancel()
+    try:
+        await metrics_persister
+    except asyncio.CancelledError:
+        pass
 
     # Shutdown — drain BEFORE stopping the scheduler so requests
     # can still be processed during the drain phase
@@ -101,7 +141,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info("server.unloading_models", models=loaded)
             await _lifecycle.unload_all(loaded)
 
+    # Final metrics snapshot — captures any counter changes from drain
+    # phase plus any work that happened after the last periodic write.
+    _scheduler.metrics.save_to(metrics_path)
+    logger.info("server.metrics_persisted", path=str(metrics_path))
+
     logger.info("server.stopped")
+
+
+async def _persist_metrics_loop(path: Path) -> None:
+    """Background task: rewrite metrics snapshot every N seconds."""
+    while True:
+        try:
+            await asyncio.sleep(_METRICS_PERSIST_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+        sched = globals().get("_scheduler")
+        if sched is not None and hasattr(sched, "metrics"):
+            sched.metrics.save_to(path)
 
 
 def create_app(config: MarshalConfig | None = None) -> FastAPI:

@@ -894,6 +894,83 @@ class TestLifespan:
 
             lifecycle.unload_all.assert_not_called()
 
+    async def test_lifespan_restores_metrics_from_disk(self, tmp_path):
+        """Lifespan reads metrics.json on startup and seeds counters."""
+        import json
+
+        metrics_path = tmp_path / "metrics.json"
+        metrics_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "saved_at": "2026-04-28T03:00:00+00:00",
+                    "requests_served": 100,
+                    "model_swaps": 5,
+                    "evictions": 2,
+                    "total_wait_ms": 12345.6,
+                }
+            )
+        )
+
+        config = MarshalConfig()
+        app = create_app(config)
+        app.state.metrics_path = metrics_path  # override for this test
+
+        memory, registry, lifecycle, scheduler, queues = _make_mock_components()
+        # Real-shape metrics object so the lifespan can mutate fields.
+        from ollama_marshal.scheduler import SchedulerMetrics as RealMetrics
+
+        scheduler.metrics = RealMetrics()
+
+        with (
+            patch("ollama_marshal.server.MemoryManager", return_value=memory),
+            patch("ollama_marshal.server.ModelRegistry", return_value=registry),
+            patch(
+                "ollama_marshal.server.ModelLifecycle",
+                return_value=lifecycle,
+            ),
+            patch("ollama_marshal.server.Scheduler", return_value=scheduler),
+            patch("ollama_marshal.server.ModelQueues", return_value=queues),
+        ):
+            async with server_mod.lifespan(app):
+                # Counters seeded from disk.
+                assert scheduler.metrics.requests_served == 100
+                assert scheduler.metrics.model_swaps == 5
+                assert scheduler.metrics.evictions == 2
+                assert scheduler.metrics.total_wait_ms == 12345.6
+
+        # Final snapshot was rewritten at shutdown.
+        on_disk = json.loads(metrics_path.read_text())
+        assert on_disk["requests_served"] == 100
+        assert on_disk["schema_version"] == 1
+
+    async def test_lifespan_starts_with_fresh_metrics_when_no_file(self, tmp_path):
+        """No metrics.json on disk → counters start at zero, no error."""
+        config = MarshalConfig()
+        app = create_app(config)
+        app.state.metrics_path = tmp_path / "fresh.json"
+
+        memory, registry, lifecycle, scheduler, queues = _make_mock_components()
+        from ollama_marshal.scheduler import SchedulerMetrics as RealMetrics
+
+        scheduler.metrics = RealMetrics()
+
+        with (
+            patch("ollama_marshal.server.MemoryManager", return_value=memory),
+            patch("ollama_marshal.server.ModelRegistry", return_value=registry),
+            patch(
+                "ollama_marshal.server.ModelLifecycle",
+                return_value=lifecycle,
+            ),
+            patch("ollama_marshal.server.Scheduler", return_value=scheduler),
+            patch("ollama_marshal.server.ModelQueues", return_value=queues),
+        ):
+            async with server_mod.lifespan(app):
+                assert scheduler.metrics.requests_served == 0
+
+        # Final shutdown save creates the file.
+        assert (tmp_path / "fresh.json").exists()
+
 
 # ---------------------------------------------------------------------------
 # Route handler bodies via direct invocation

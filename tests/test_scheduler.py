@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from ollama_marshal.config import MarshalConfig, Priority, ProgramConfig
@@ -102,6 +104,72 @@ class TestSchedulerMetrics:
         m = SchedulerMetrics()
         after = time.monotonic()
         assert before <= m.started_at <= after
+
+
+# ---------------------------------------------------------------------------
+# SchedulerMetrics persistence
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerMetricsPersistence:
+    def test_save_and_load_roundtrip(self, tmp_path):
+        path = tmp_path / "metrics.json"
+        m = SchedulerMetrics(
+            requests_served=42, model_swaps=7, evictions=3, total_wait_ms=12345.6
+        )
+        m.save_to(path)
+        loaded = SchedulerMetrics.load_from(path)
+        assert loaded.requests_served == 42
+        assert loaded.model_swaps == 7
+        assert loaded.evictions == 3
+        assert loaded.total_wait_ms == 12345.6
+
+    def test_load_missing_file_returns_fresh(self, tmp_path):
+        loaded = SchedulerMetrics.load_from(tmp_path / "nonexistent.json")
+        assert loaded.requests_served == 0
+        assert loaded.model_swaps == 0
+
+    def test_load_corrupt_json_returns_fresh(self, tmp_path):
+        path = tmp_path / "metrics.json"
+        path.write_text("not valid json {{{")
+        loaded = SchedulerMetrics.load_from(path)
+        assert loaded.requests_served == 0
+
+    def test_load_wrong_shape_returns_fresh(self, tmp_path):
+        path = tmp_path / "metrics.json"
+        path.write_text(json.dumps([1, 2, 3]))  # list, not dict
+        loaded = SchedulerMetrics.load_from(path)
+        assert loaded.requests_served == 0
+
+    def test_load_schema_version_mismatch_returns_fresh(self, tmp_path):
+        # Old or future schema version — refuse to load and start fresh.
+        path = tmp_path / "metrics.json"
+        path.write_text(json.dumps({"schema_version": 999, "requests_served": 99}))
+        loaded = SchedulerMetrics.load_from(path)
+        assert loaded.requests_served == 0  # fresh, didn't trust the data
+
+    def test_save_creates_parent_dirs(self, tmp_path):
+        path = tmp_path / "deep" / "nested" / "metrics.json"
+        SchedulerMetrics(requests_served=5).save_to(path)
+        assert path.exists()
+        assert json.loads(path.read_text())["requests_served"] == 5
+
+    def test_save_io_error_logs_not_raises(self, tmp_path, monkeypatch):
+        # Simulate a disk-full or permission-denied scenario.
+        path = tmp_path / "metrics.json"
+
+        def boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "write_text", boom)
+        # Must not raise — best-effort persistence.
+        SchedulerMetrics(requests_served=1).save_to(path)
+
+    def test_to_json_dict_omits_started_at(self):
+        # started_at is process-local, never persisted.
+        d = SchedulerMetrics(started_at=999.0).to_json_dict()
+        assert "started_at" not in d
+        assert "schema_version" in d
 
 
 # ---------------------------------------------------------------------------
