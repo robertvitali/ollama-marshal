@@ -106,12 +106,17 @@ otherwise.
   unload + preload, then let the next tick dispatch against the new
   larger slot.
 - **CRITICAL: client-supplied `options.num_ctx` is now clamped to
-  the model's max.** Without this, a request with
+  the model's max — UNCONDITIONALLY.** Without this, a request with
   `options.num_ctx: 999_999_999` triggered reload-on-need, failed
   preload, infinite-looped the scheduler, and unboundedly grew
   `metrics.reload_count`. One bad request would brick the proxy for
-  everyone. Non-positive client values are dropped (fall through to
-  prompt-driven sizing).
+  everyone. The clamp is a trust-boundary safety check, not part of
+  prompt-driven sizing — it runs whether or not
+  `context.injection_enabled` is true. Operators who opt out of
+  prompt-driven sizing (`injection_enabled: false`) are still
+  protected. Non-positive client values are dropped: when injection
+  is enabled they fall through to prompt-driven sizing; when
+  disabled the request goes out with no `num_ctx` (Ollama default).
 - **CRITICAL: failed-preload-after-unload no longer leaves the
   scheduler unable to detect oversized requests.** When unload
   succeeds but preload fails, `_allocated_num_ctx` is now written
