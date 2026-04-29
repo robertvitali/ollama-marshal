@@ -156,48 +156,37 @@ removed, update or delete the reference in the same PR.
 - Drain-before-evict for normal priority (no mid-batch model unloading)
 - Graceful shutdown must respect the configured mode (drain vs immediate)
 
-## Workflow File Discipline
+## Code Review — Local Only
 
-**Never include changes to `.github/workflows/claude-review.yml` or
-`.github/workflows/claude-security.yml` in a feature branch.**
+This repo previously used `anthropics/claude-code-action@v1` for
+automated Claude reviews on every PR. Both `claude-review.yml` and
+`claude-security.yml` workflows have been **removed** (v0.5.0), along
+with the `CLAUDE_API_KEY` secret, to control Anthropic API costs.
 
-The `anthropics/claude-code-action@v1` token exchange rejects any PR
-where those workflow files differ from `main` — it's an anti-tamper
-safety check that prevents an attacker from opening a PR with a
-modified workflow that would exfiltrate `secrets.CLAUDE_API_KEY`.
-The error: *"Workflow validation failed. The workflow file must exist
-and have identical content to the version on the repository's default
-branch."* Every feature PR that bundles a workflow tweak with
-substantive code silently fails its review check.
+**Current review path** — local only:
 
-**The discipline:**
+1. **`/review`** (gstack skill) — multi-specialist adversarial review
+   of the working diff. Runs ruff + mypy + pytest, dispatches
+   testing/maintainability/security/performance specialists, captures
+   ~24 review categories. This caught 3 P0/P1 correctness bugs the
+   CI bot missed on PR #6 — empirically the strongest path.
+2. **`/codex`** (gstack skill) — cross-model second opinion via
+   OpenAI Codex CLI. Useful for high-stakes PRs where you want
+   independent ground truth. Requires `codex` CLI installed.
+3. **`/cso`** (gstack skill) — security audit, OWASP-style.
+4. **`pre-commit`** — fast checks on every commit (ruff check,
+   ruff format, mypy strict, pre-commit-hooks). Add `pytest` via
+   `pre-push` if you want test coverage on push (see
+   `.pre-commit-config.yaml`).
 
-1. Workflow edits ride on a dedicated `chore/ci-*` branch straight
-   to `main`. One file, one commit, no other changes.
-2. After that lands, feature branches inherit the new workflow via
-   `git fetch origin main && git rebase origin/main`.
-3. The `guard-workflow-changes` CI job blocks PRs from non-`chore/ci-*`
-   branches that modify these files.
-
-## Claude Review Workflows — Manual Trigger Only
-
-As of v0.5.0, both Claude review workflows are **manual-trigger only**
-to control Anthropic API costs:
-
-- **`claude-review.yml`** — triggers on `workflow_dispatch` (Run
-  workflow button in Actions UI, takes a PR number input) OR on
-  `issue_comment` containing `@claude` (comment "@claude" on a PR to
-  request review).
-- **`claude-security.yml`** — `workflow_dispatch` only.
-
-The `pull_request` trigger has been removed from both. Default PR CI
-runs only `guard-workflow-changes`, `lint`, and the test matrix — all
-free. Local `/review` (the gstack skill) is the recommended bulk
-reviewer; reach for the cloud workflows when you specifically want a
-second opinion on a tricky PR.
-
-This rule applies ONLY to the Claude workflows. Editing `ci.yml` on a
-feature branch is fine — there's no token-exchange validator on it.
+**Workflow file discipline** still applies for any future cloud review
+tooling: changes to security-sensitive workflows (anything that
+references a secret) ride on a dedicated `chore/ci-*` branch straight
+to `main` — one file, one commit, no other changes. Feature branches
+inherit via `git fetch origin main && git rebase origin/main`. The
+`guard-workflow-changes` CI job remains as defense-in-depth: it
+blocks feature PRs from re-adding any `claude-*.yml` file unless on
+a `chore/ci-*` branch.
 
 ## Versioning
 
@@ -237,7 +226,9 @@ commit, and the commit gets tagged `vX.Y.Z`.
 
 ## Bright-line Bug Patterns
 
-The Claude PR review action flags these aggressively — these are
+The local `/review` skill flags these aggressively (the
+`anthropics/claude-code-action@v1` PR-review path was removed in
+v0.5.0 — see "Code Review — Local Only" above). These are
 project-specific anti-patterns we want caught every time, no
 false-positive concerns:
 

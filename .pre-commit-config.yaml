@@ -31,3 +31,17 @@ repos:
         types: [python]
         args: [--strict, src/]
         pass_filenames: false
+
+      # Run the unit test suite on push (NOT every commit — keeps
+      # commits fast). The integration test suite is excluded since
+      # it requires a running Ollama; run `make test-integration`
+      # locally before opening a PR.
+      #
+      # Install push hooks via: `pre-commit install --hook-type pre-push`
+      - id: pytest-unit
+        name: pytest (unit tests, on push)
+        entry: pytest tests/ --ignore=tests/integration -q --no-cov
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]
