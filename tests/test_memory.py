@@ -748,6 +748,87 @@ class TestNeedsReload:
         manager.record_allocated_num_ctx("llama3:latest", 8192)
         assert manager.needs_reload("llama3:latest", 16384) is True
 
+    def test_zero_allocation_is_sentinel_always_needs_reload(self):
+        # Allocation==0 is the post-failed-preload sentinel. The model
+        # is loaded but we don't know what slot Ollama actually has.
+        # `needs_reload` must return True regardless of requested size
+        # so the scheduler tries to reload again instead of silently
+        # dispatching against an unknown slot.
+        manager = _make_manager()
+        manager._loaded_models = {
+            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
+        }
+        manager.record_allocated_num_ctx("llama3:latest", 0)
+        assert manager.needs_reload("llama3:latest", 1024) is True
+        assert manager.needs_reload("llama3:latest", 65536) is True
+
+
+class TestUpdateFromPsShapeRobustness:
+    """Defensive parsing of /api/ps response.
+
+    /api/ps comes from a process we don't fully control (Ollama, or a
+    proxy in front of it). A malformed entry must NOT crash the poll
+    loop. A crash-then-broad-except would leave _loaded_models stale,
+    silently turning unexpected_unload detection into a false negative
+    on the very signal Surface C2 was meant to catch.
+    """
+
+    def test_models_not_a_list_treated_as_empty(self):
+        manager = _make_manager()
+        manager._loaded_models = {
+            "x:1": LoadedModel(name="x:1", size_vram=1),
+        }
+        manager._update_from_ps({"models": "not a list"})
+        assert manager.get_loaded_models() == {}
+
+    def test_models_is_none_treated_as_empty(self):
+        manager = _make_manager()
+        manager._update_from_ps({"models": None})
+        assert manager.get_loaded_models() == {}
+
+    def test_non_dict_entries_skipped(self):
+        manager = _make_manager()
+        manager._update_from_ps(
+            {
+                "models": [
+                    "string-not-dict",
+                    None,
+                    42,
+                    {"name": "valid:1", "size_vram": 1000},
+                ]
+            }
+        )
+        loaded = manager.get_loaded_models()
+        assert list(loaded) == ["valid:1"]
+
+    def test_missing_name_skipped(self):
+        manager = _make_manager()
+        manager._update_from_ps(
+            {"models": [{"size_vram": 1000}, {"name": "valid:1", "size_vram": 1}]}
+        )
+        loaded = manager.get_loaded_models()
+        assert list(loaded) == ["valid:1"]
+
+    def test_non_string_name_skipped(self):
+        manager = _make_manager()
+        manager._update_from_ps(
+            {
+                "models": [
+                    {"name": 12345, "size_vram": 1},
+                    {"name": "ok:1", "size_vram": 1},
+                ]
+            }
+        )
+        loaded = manager.get_loaded_models()
+        assert list(loaded) == ["ok:1"]
+
+    def test_garbage_size_vram_defaults_to_zero(self):
+        manager = _make_manager()
+        manager._update_from_ps(
+            {"models": [{"name": "x:1", "size_vram": "not-a-number"}]}
+        )
+        assert manager.get_loaded_models()["x:1"].size_vram == 0
+
 
 # ---------------------------------------------------------------------------
 # Unexpected-unload detection (Surface C2)

@@ -406,6 +406,36 @@ def _register_routes(app: FastAPI) -> None:
         )
 
 
+# Allowed character set for `X-Program-ID`. Restricting to a-zA-Z0-9
+# plus a few punctuation chars prevents log injection (a value
+# containing newlines or ANSI escapes corrupts structlog console
+# output) and key-bytes amplification (an adversarial client cycling
+# 10MB header values would otherwise inflate burst-hint dicts,
+# `_active_programs`, and audit.jsonl by 10MB per distinct value).
+_PROGRAM_ID_ALLOWED = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+)
+# Cap on `X-Program-ID` length. 64 chars is more than enough for any
+# legitimate program name. Longer values are truncated rather than
+# rejected so a typo'd suffix doesn't surface as a fail-fast 400.
+_PROGRAM_ID_MAX_LEN = 64
+
+
+def _normalize_program_id(raw: str | None) -> str:
+    """Sanitize a client-supplied `X-Program-ID` header value.
+
+    Returns "default" for None/empty/all-disallowed input so downstream
+    code paths see a stable identifier without special-casing.
+    Otherwise: keep allowed chars only, truncate to `_PROGRAM_ID_MAX_LEN`.
+    """
+    if not raw:
+        return "default"
+    cleaned = "".join(c for c in raw if c in _PROGRAM_ID_ALLOWED)
+    if not cleaned:
+        return "default"
+    return cleaned[:_PROGRAM_ID_MAX_LEN]
+
+
 def _record_burst_hint(request: Request, program_id: str, model: str) -> None:
     """Read the optional X-Burst-Size header and forward to scheduler.
 
@@ -578,7 +608,8 @@ async def _inject_num_ctx(
 
     Skipped when:
     - Model name is empty.
-    - Client already set `options.num_ctx` (their value wins).
+    - Client already set `options.num_ctx` (their value wins, but is
+      clamped to the model's max — see clamp logic below).
     - `options` is set to a non-dict value.
     - Registry metadata isn't available (model unknown, Ollama down).
     - `context.injection_enabled` is False (opt-out).
@@ -587,8 +618,6 @@ async def _inject_num_ctx(
         return
     options = body.setdefault("options", {})
     if not isinstance(options, dict):
-        return
-    if "num_ctx" in options:
         return
 
     config = globals().get("_config")
@@ -601,6 +630,32 @@ async def _inject_num_ctx(
     meta = await registry.probe_metadata(model)
     if meta is None:
         return
+
+    # Trust boundary: a client-supplied `options.num_ctx` is honored
+    # but ALWAYS clamped to the model's max and rejected if non-positive.
+    # Without this clamp, an adversarial or buggy client sending
+    # `num_ctx: 999_999_999` would trigger reload-on-need, fail
+    # preload, infinite-loop the scheduler, and unboundedly grow
+    # `metrics.reload_count`. One bad request would brick the proxy
+    # for everyone sharing the model.
+    client_value = options.get("num_ctx")
+    if client_value is not None:
+        if not isinstance(client_value, int) or client_value <= 0:
+            # Drop a malformed client value and fall through to
+            # prompt-driven sizing below, same as if it were absent.
+            options.pop("num_ctx", None)
+        else:
+            clamped = min(client_value, meta.max_context_length)
+            if clamped != client_value:
+                logger.info(
+                    "server.num_ctx_clamped",
+                    model=model,
+                    program=program_id,
+                    requested=client_value,
+                    clamped_to=clamped,
+                )
+            options["num_ctx"] = clamped
+            return
 
     prompt_tokens = _estimate_prompt_tokens(body)
     chosen, mode = _resolve_num_ctx_decision(
@@ -689,7 +744,7 @@ async def _enqueue_inference(
     """
     model = body.get("model", "")
     stream = body.get("stream", False)
-    program_id = request.headers.get("x-program-id", "default")
+    program_id = _normalize_program_id(request.headers.get("x-program-id"))
     timeout_s = _resolve_timeout(request)
 
     # Fail-fast on unknown models. Without this, marshal would let the
@@ -814,7 +869,7 @@ async def _enqueue_and_wait(
     Returns:
         Parsed response dict, or a Response for streaming/errors.
     """
-    program_id = request.headers.get("x-program-id", "default")
+    program_id = _normalize_program_id(request.headers.get("x-program-id"))
     timeout_s = _resolve_timeout(request)
 
     # Same fail-fast unknown-model check as _enqueue_inference. OpenAI

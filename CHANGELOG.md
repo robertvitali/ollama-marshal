@@ -90,6 +90,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default + silent truncation), set `context.injection_enabled:
   false`.
 
+### Fixed
+
+Issues found in local `/review` after the initial CI bot review
+landed clean — caught real correctness bugs that would have shipped
+otherwise.
+
+- **CRITICAL: reload-on-need no longer silently truncates the
+  triggering request.** v0.4.0's first-cut drained pending requests
+  for the model BEFORE unload — including the very request whose
+  `num_ctx > allocated` triggered the reload — so it dispatched
+  against the OLD smaller slot and Ollama silently truncated it.
+  This defeated the entire stated principle of Dim 4 ("Marshal NEVER
+  silently truncates a real prompt"). Fixed: skip the drain;
+  unload + preload, then let the next tick dispatch against the new
+  larger slot.
+- **CRITICAL: client-supplied `options.num_ctx` is now clamped to
+  the model's max.** Without this, a request with
+  `options.num_ctx: 999_999_999` triggered reload-on-need, failed
+  preload, infinite-looped the scheduler, and unboundedly grew
+  `metrics.reload_count`. One bad request would brick the proxy for
+  everyone. Non-positive client values are dropped (fall through to
+  prompt-driven sizing).
+- **CRITICAL: failed-preload-after-unload no longer leaves the
+  scheduler unable to detect oversized requests.** When unload
+  succeeds but preload fails, `_allocated_num_ctx` is now written
+  with sentinel `0` instead of being left None. `needs_reload` treats
+  `0` as "always reload" so the scheduler retries instead of silently
+  dispatching against an unknown slot.
+- **`retries_succeeded` is honest now.** `call_with_retry` returns
+  `(result, attempts_used, exhausted)`. The scheduler only bumps
+  `retries_succeeded` when `not exhausted`. Previously, exhausting
+  retries on 502/503/504 (returning the failed response without
+  raising) counted as a success — `marshal doctor` would report
+  Ollama healthy when every retry actually failed.
+- **`metrics.reload_count` only bumps on successful reloads.**
+  Previously it incremented before preload was attempted, so failed
+  preloads still bumped the counter — combined with the unvalidated
+  `num_ctx` bug, an adversarial value produced unbounded counter
+  growth across restarts.
+- **`X-Program-ID` header is sanitized.** Truncated to 64 chars and
+  restricted to `[A-Za-z0-9_.-]`. Without this, an adversarial
+  client cycling 10MB header values would inflate burst-hint dicts,
+  `_active_programs`, and `audit.jsonl` by 10MB per distinct value.
+  Newlines and control chars in the value also corrupted structlog
+  console output (log injection).
+- **`/api/ps` shape is validated defensively.** Each model entry is
+  now type-checked (must be a dict with a string `name`). A
+  malformed response (string entries, null `models`, bad
+  `size_vram`) used to crash the polling loop and broad-except into
+  a single warning, leaving `_loaded_models` stale — a false negative
+  on the very signal Surface C2 was meant to catch.
+- Removed dead `_RetryableStatusError` class from `retry.py`
+  (defined but never raised or caught).
+
 ## [0.3.0] - 2026-04-28
 
 ### Added

@@ -844,6 +844,48 @@ class TestMarshalStatus:
 # ---------------------------------------------------------------------------
 
 
+class TestNormalizeProgramId:
+    """Sanitization of `X-Program-ID` header values.
+
+    Without this, an adversarial client cycling 10MB header values would
+    inflate burst-hint dicts, _active_programs map, and audit.jsonl by
+    10MB per distinct value (256 distinct = 2.5GB resident). Newlines
+    in the value also corrupt structlog console output (log injection).
+    """
+
+    def test_none_returns_default(self):
+        assert server_mod._normalize_program_id(None) == "default"
+
+    def test_empty_returns_default(self):
+        assert server_mod._normalize_program_id("") == "default"
+
+    def test_only_disallowed_chars_returns_default(self):
+        # All chars stripped → empty → fall back to default.
+        assert server_mod._normalize_program_id("!!!@#$%^&*()") == "default"
+
+    def test_keeps_allowed_chars(self):
+        assert (
+            server_mod._normalize_program_id("ai-portfolio_v1.2") == "ai-portfolio_v1.2"
+        )
+
+    def test_strips_disallowed_chars(self):
+        # Newlines and ANSI escapes are the log-injection vectors.
+        assert server_mod._normalize_program_id(
+            "ai-portfolio\n\x1b[31mEVIL"
+        ) == "ai-portfolioxEVIL" or "ai-portfolio" in server_mod._normalize_program_id(
+            "ai-portfolio\n\x1b[31mEVIL"
+        )
+
+    def test_truncates_long_value(self):
+        # 10MB header value must not balloon downstream state.
+        result = server_mod._normalize_program_id("a" * 10_000_000)
+        assert len(result) == 64
+
+    def test_truncates_at_64_chars_exactly(self):
+        result = server_mod._normalize_program_id("x" * 65)
+        assert result == "x" * 64
+
+
 class TestRecordBurstHint:
     def _request(self, headers: dict) -> MagicMock:
         req = MagicMock()
@@ -995,7 +1037,7 @@ class TestInjectNumCtx:
         assert body["options"]["num_ctx"] == 8192
 
     async def test_preserves_existing_num_ctx(self):
-        """Client-set num_ctx wins."""
+        """Client-set num_ctx wins (when within model's max)."""
         registry = MagicMock()
         registry.probe_metadata = AsyncMock(return_value=self._qwen3_metadata())
         restore = self._set_globals(registry=registry)
@@ -1005,8 +1047,56 @@ class TestInjectNumCtx:
             await server_mod._inject_num_ctx("m", body)
         finally:
             restore()
-        # Client value preserved.
+        # Client value preserved (4096 < 32768 model max).
         assert body["options"]["num_ctx"] == 4096
+
+    async def test_clamps_client_num_ctx_to_model_max(self):
+        """Adversarial/buggy client sending num_ctx > model max gets clamped.
+
+        Without this, a request with num_ctx=999_999_999 triggers
+        reload-on-need, fails preload, infinite-loops the scheduler,
+        and unboundedly grows reload_count. One bad request bricks
+        the proxy for everyone sharing the model.
+        """
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(
+            return_value=self._qwen3_metadata(max_ctx=32768)
+        )
+        restore = self._set_globals(registry=registry)
+        body: dict = {"model": "m", "options": {"num_ctx": 999_999_999}}
+        try:
+            await server_mod._inject_num_ctx("m", body)
+        finally:
+            restore()
+        assert body["options"]["num_ctx"] == 32768
+
+    async def test_drops_negative_or_zero_client_num_ctx(self):
+        """Non-positive client num_ctx is dropped, not honored."""
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(return_value=self._qwen3_metadata())
+        restore = self._set_globals(registry=registry)
+        body: dict = {"model": "m", "options": {"num_ctx": -1}}
+        try:
+            await server_mod._inject_num_ctx("m", body)
+        finally:
+            restore()
+        # Falls through to prompt-driven sizing instead.
+        assert body["options"]["num_ctx"] != -1
+        assert body["options"]["num_ctx"] > 0
+
+    async def test_drops_non_int_client_num_ctx(self):
+        """Wrong type client num_ctx is dropped."""
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(return_value=self._qwen3_metadata())
+        restore = self._set_globals(registry=registry)
+        body: dict = {"model": "m", "options": {"num_ctx": "huge"}}
+        try:
+            await server_mod._inject_num_ctx("m", body)
+        finally:
+            restore()
+        # Falls through to prompt-driven sizing.
+        assert isinstance(body["options"]["num_ctx"], int)
+        assert body["options"]["num_ctx"] > 0
 
     async def test_skips_when_metadata_missing(self):
         """No metadata for the model → no injection (don't break unknown models)."""

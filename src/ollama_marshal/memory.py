@@ -154,12 +154,30 @@ class MemoryManager:
             ps_data: Parsed JSON from /api/ps.
         """
         new_loaded: dict[str, LoadedModel] = {}
-        for m in ps_data.get("models", []):
+        # /api/ps comes from a process we don't control (Ollama, or a
+        # proxy in front of it). Validate shape defensively: a single
+        # malformed entry must not crash the polling loop, since a
+        # crash-then-broad-except would leave _loaded_models stale and
+        # silently turn unexpected_unloads detection into a false
+        # negative on the very signal Surface C2 was meant to catch.
+        models_raw = ps_data.get("models")
+        if not isinstance(models_raw, list):
+            models_raw = []
+        for m in models_raw:
+            if not isinstance(m, dict):
+                continue
             name = m.get("name", "")
+            if not isinstance(name, str) or not name:
+                continue
+            try:
+                size_vram = int(m.get("size_vram", 0))
+            except (TypeError, ValueError):
+                size_vram = 0
+            expires_at = m.get("expires_at", "")
+            if not isinstance(expires_at, str):
+                expires_at = ""
             new_loaded[name] = LoadedModel(
-                name=name,
-                size_vram=int(m.get("size_vram", 0)),
-                expires_at=m.get("expires_at", ""),
+                name=name, size_vram=size_vram, expires_at=expires_at
             )
 
         # Log changes
@@ -295,20 +313,26 @@ class MemoryManager:
     def needs_reload(self, model: str, requested_num_ctx: int) -> bool:
         """Check if `requested_num_ctx` exceeds what the model has allocated.
 
-        A True result means the scheduler must drain the model's pending
-        requests, unload, and preload it again at a larger num_ctx
-        before serving the next request. False means the request fits
-        and can dispatch immediately.
+        A True result means the scheduler must unload + preload the
+        model at a larger num_ctx before serving the next request.
+        False means the request fits and can dispatch immediately.
 
         Returns False if the model isn't loaded yet (the upcoming
         preload will use the right size) or if no allocation has been
-        recorded (defensive — can't tell, so don't block).
+        recorded — except: a recorded allocation of 0 is a SENTINEL
+        meaning "previous reload's preload failed, we don't actually
+        know what slot Ollama has." In that case always return True so
+        the scheduler tries again rather than silently dispatching
+        against an unknown slot size.
         """
         if model not in self._loaded_models:
             return False
         current = self._allocated_num_ctx.get(model)
         if current is None:
             return False
+        if current == 0:
+            # Sentinel: prior reload failed mid-flight. Always reload.
+            return True
         return requested_num_ctx > current
 
     def mark_intended_unload(self, model: str) -> None:

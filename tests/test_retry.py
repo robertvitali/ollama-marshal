@@ -25,7 +25,7 @@ class TestCallWithRetrySafeExceptions:
 
     async def test_succeeds_on_first_attempt(self):
         func = AsyncMock(return_value=_ok_response())
-        result, attempts = await call_with_retry(
+        result, attempts, _exhausted = await call_with_retry(
             func,
             max_attempts=3,
             base_delay_s=0.001,
@@ -45,7 +45,7 @@ class TestCallWithRetrySafeExceptions:
                 _ok_response(),
             ]
         )
-        result, attempts = await call_with_retry(
+        result, attempts, _exhausted = await call_with_retry(
             func,
             max_attempts=3,
             base_delay_s=0.001,
@@ -64,7 +64,7 @@ class TestCallWithRetrySafeExceptions:
                 _ok_response(),
             ]
         )
-        result, attempts = await call_with_retry(
+        result, attempts, _exhausted = await call_with_retry(
             func,
             max_attempts=3,
             base_delay_s=0.001,
@@ -116,7 +116,7 @@ class TestCallWithRetryReadTimeouts:
         func = AsyncMock(
             side_effect=[httpx.ReadTimeout("slow"), _ok_response()],
         )
-        result, attempts = await call_with_retry(
+        result, attempts, _exhausted = await call_with_retry(
             func,
             max_attempts=3,
             base_delay_s=0.001,
@@ -158,7 +158,7 @@ class TestCallWithRetryStatusCodes:
                 _ok_response(),
             ]
         )
-        result, attempts = await call_with_retry(
+        result, attempts, _exhausted = await call_with_retry(
             func,
             max_attempts=3,
             base_delay_s=0.001,
@@ -172,7 +172,7 @@ class TestCallWithRetryStatusCodes:
     async def test_does_not_retry_on_4xx(self):
         # 400 / 404 are client errors — not transient.
         func = AsyncMock(return_value=_resp(404))
-        result, attempts = await call_with_retry(
+        result, attempts, _exhausted = await call_with_retry(
             func,
             max_attempts=3,
             base_delay_s=0.001,
@@ -188,7 +188,7 @@ class TestCallWithRetryStatusCodes:
         # 500 is server error but NOT one of our retryable codes —
         # could be a real bug in Ollama, not a transient hiccup.
         func = AsyncMock(return_value=_resp(500))
-        result, attempts = await call_with_retry(
+        result, attempts, _exhausted = await call_with_retry(
             func,
             max_attempts=3,
             base_delay_s=0.001,
@@ -202,8 +202,10 @@ class TestCallWithRetryStatusCodes:
     async def test_returns_failed_response_after_exhausting_retries(self):
         # All retries returned 503 → caller still gets the response,
         # not an exception (lets them surface the underlying status).
+        # `exhausted=True` lets metrics distinguish this from a real
+        # success.
         func = AsyncMock(return_value=_resp(503))
-        result, attempts = await call_with_retry(
+        result, attempts, exhausted = await call_with_retry(
             func,
             max_attempts=2,
             base_delay_s=0.001,
@@ -212,8 +214,37 @@ class TestCallWithRetryStatusCodes:
             request_id="t",
         )
         assert attempts == 2
+        assert exhausted is True
         assert result.status_code == 503
         assert func.call_count == 2
+
+    async def test_successful_status_retry_not_exhausted(self):
+        # 503 then 200 → succeeded on retry, NOT exhausted.
+        func = AsyncMock(side_effect=[_resp(503), _ok_response()])
+        result, attempts, exhausted = await call_with_retry(
+            func,
+            max_attempts=3,
+            base_delay_s=0.001,
+            max_delay_s=0.01,
+            retry_read_timeouts=False,
+            request_id="t",
+        )
+        assert attempts == 2
+        assert exhausted is False
+        assert result.status_code == 200
+
+    async def test_first_attempt_success_not_exhausted(self):
+        func = AsyncMock(return_value=_ok_response())
+        _result, attempts, exhausted = await call_with_retry(
+            func,
+            max_attempts=3,
+            base_delay_s=0.001,
+            max_delay_s=0.01,
+            retry_read_timeouts=False,
+            request_id="t",
+        )
+        assert attempts == 1
+        assert exhausted is False
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +260,7 @@ class TestCallWithRetryStreaming:
             yield b"chunk-1"
 
         func = AsyncMock(return_value=fake_stream())
-        result, attempts = await call_with_retry(
+        result, attempts, _exhausted = await call_with_retry(
             func,
             max_attempts=3,
             base_delay_s=0.001,

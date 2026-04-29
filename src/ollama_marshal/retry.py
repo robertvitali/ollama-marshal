@@ -54,18 +54,6 @@ UNSAFE_RETRY_EXCEPTIONS: tuple[type[Exception], ...] = (
 T = TypeVar("T")
 
 
-class _RetryableStatusError(Exception):
-    """Internal sentinel raised when a non-streaming response has a retryable status.
-
-    Lets us reuse the same retry loop for HTTP-status retries and
-    exception-based retries.
-    """
-
-    def __init__(self, status_code: int) -> None:
-        super().__init__(f"retryable status {status_code}")
-        self.status_code = status_code
-
-
 async def call_with_retry(
     func: Callable[..., Awaitable[T]],
     *args: Any,
@@ -75,7 +63,7 @@ async def call_with_retry(
     retry_read_timeouts: bool,
     request_id: str,
     **kwargs: Any,
-) -> tuple[T, int]:
+) -> tuple[T, int, bool]:
     """Invoke `func(*args, **kwargs)` with retry on transient failures.
 
     Streaming responses (callable returns an `AsyncIterator`) are returned
@@ -100,15 +88,21 @@ async def call_with_retry(
         **kwargs: Keyword args forwarded to `func`.
 
     Returns:
-        `(result, attempts_used)` — `result` is whatever `func`
-        returned on the first successful attempt; `attempts_used` is the
-        attempt number that succeeded (1 = first try, no retry used;
-        2 = succeeded on first retry; etc.). Lets the caller record
-        retry metrics cleanly.
+        `(result, attempts_used, exhausted)` — `result` is whatever
+        `func` returned; `attempts_used` is the attempt number on which
+        the function returned (1 = first try, no retry used). `exhausted`
+        is True when the final attempt returned a retryable HTTP status
+        (502/503/504) — the caller still gets the failed response so it
+        can surface the underlying status, but `exhausted=True` lets
+        metrics distinguish "retry saved us" from "retry exhausted but
+        the result is still a failure." When an exception path exhausts,
+        the helper raises (so this tuple is never produced) — exception
+        callers should not see `exhausted=True`.
 
     Raises:
-        The last exception or HTTP-status error after attempts are
-        exhausted.
+        The last exception after retryable-exception attempts are
+        exhausted. Status-code exhaustion does NOT raise; check the
+        `exhausted` flag in the return tuple instead.
     """
     if max_attempts < 1:
         msg = f"max_attempts must be >= 1, got {max_attempts}"
@@ -146,9 +140,9 @@ async def call_with_retry(
             continue
 
         # Streaming results are async iterators — return immediately,
-        # never retry.
+        # never retry. Streaming success is by definition not exhausted.
         if isinstance(result, AsyncIterator):
-            return result, attempt
+            return result, attempt, False
 
         # Non-streaming: inspect status code.
         if (
@@ -165,7 +159,9 @@ async def call_with_retry(
                 )
                 # Caller still gets the failed response, not an exception
                 # — they can decide whether to surface it or transform.
-                return result, attempt
+                # exhausted=True signals "retry budget burned, this is
+                # NOT a successful retry" so metrics stay honest.
+                return result, attempt, True
             delay = _backoff_delay(attempt, base_delay_s, max_delay_s)
             logger.info(
                 "retry.status_failed",
@@ -185,7 +181,7 @@ async def call_with_retry(
                 request_id=request_id,
                 attempts_used=attempt,
             )
-        return result, attempt
+        return result, attempt, False
 
     # Unreachable: loop body always returns or raises in the final
     # iteration. Keep mypy happy.

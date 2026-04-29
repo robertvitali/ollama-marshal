@@ -1012,7 +1012,7 @@ class TestForwardSingleRetry:
     async def test_retry_path_records_metrics_on_success(self, mock_retry):
         # Helper succeeded on attempt 3 → 2 retries attempted, 1 succeeded.
         sentinel = MagicMock()
-        mock_retry.return_value = (sentinel, 3)
+        mock_retry.return_value = (sentinel, 3, False)
         sched = _make_scheduler()
 
         env = _make_envelope()
@@ -1023,9 +1023,24 @@ class TestForwardSingleRetry:
         assert env.response is sentinel
 
     @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_exhausted_status_does_not_count_as_succeeded(self, mock_retry):
+        # All attempts returned 503 → caller still gets the response,
+        # but `exhausted=True` means we should NOT count this as a
+        # successful retry. Critical for `marshal doctor` correctness.
+        mock_retry.return_value = (MagicMock(), 3, True)
+        sched = _make_scheduler()
+
+        env = _make_envelope()
+        await sched._forward_single(env)
+
+        assert sched.metrics.retries_attempted == 2
+        # The key assertion — exhausted retries are NOT successes.
+        assert sched.metrics.retries_succeeded == 0
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
     async def test_retry_path_no_metrics_on_first_attempt(self, mock_retry):
         # attempts_used=1 → no retry happened, no counters move.
-        mock_retry.return_value = (MagicMock(), 1)
+        mock_retry.return_value = (MagicMock(), 1, False)
         sched = _make_scheduler()
 
         await sched._forward_single(_make_envelope())
@@ -1090,7 +1105,7 @@ class TestForwardSingleRetry:
     async def test_embeddings_endpoint_enables_read_timeout_retry(self, mock_retry):
         # /api/embeddings is idempotent — the helper is invoked with
         # retry_read_timeouts=True even when the global config is False.
-        mock_retry.return_value = (MagicMock(), 1)
+        mock_retry.return_value = (MagicMock(), 1, False)
         cfg = _make_config(**{"retry.read_timeouts": False})
         sched = _make_scheduler(config=cfg)
 
@@ -1101,7 +1116,7 @@ class TestForwardSingleRetry:
 
     @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
     async def test_chat_endpoint_does_not_force_read_timeout_retry(self, mock_retry):
-        mock_retry.return_value = (MagicMock(), 1)
+        mock_retry.return_value = (MagicMock(), 1, False)
         cfg = _make_config(**{"retry.read_timeouts": False})
         sched = _make_scheduler(config=cfg)
 
@@ -1198,7 +1213,14 @@ class TestEnsureModelLoadedReloadOnNeed:
         lifecycle.unload.assert_not_called()
         assert sched.metrics.reload_count == 0
 
-    async def test_reload_drains_unloads_preloads_and_records(self):
+    async def test_reload_does_not_drain_pending_via_old_slot(self):
+        # Critical correctness test: the request whose num_ctx > allocated
+        # is what TRIGGERED the reload. If we drained pending before
+        # unload, that request would dispatch via the OLD smaller slot
+        # and Ollama would silently truncate it. The whole point of
+        # Surface C1 Dim 4 is to NEVER silently truncate. So the reload
+        # path MUST NOT call _process_batch — pending requests stay
+        # queued and dispatch on the next tick against the new slot.
         memory = MagicMock()
         memory.is_loaded.return_value = True
         memory.needs_reload.return_value = True
@@ -1217,7 +1239,6 @@ class TestEnsureModelLoadedReloadOnNeed:
         lifecycle.unload = AsyncMock(return_value=True)
 
         queues = ModelQueues()
-        # Add a pending request to verify drain runs.
         env = _make_envelope()
         env.request_body = {"options": {"num_ctx": 32768}}
         await queues.enqueue(env)
@@ -1232,17 +1253,53 @@ class TestEnsureModelLoadedReloadOnNeed:
             result = await sched._ensure_model_loaded("llama3:latest", num_ctx=32768)
 
         assert result is True
-        # Drain ran.
-        mock_process.assert_called_once()
+        # CRITICAL: drain MUST NOT have run.
+        mock_process.assert_not_called()
+        # Pending request remains queued for next-tick dispatch against
+        # the new (larger) slot.
+        assert await queues.pending_count("llama3:latest") == 1
         # Marshal told memory it's an intended unload.
         memory.mark_intended_unload.assert_called_with("llama3:latest")
         # Unload then preload at the bigger size.
         lifecycle.unload.assert_called_once_with("llama3:latest")
         lifecycle.preload.assert_called_once_with("llama3:latest", num_ctx=32768)
-        # Allocation recorded post-preload.
         memory.record_allocated_num_ctx.assert_called_with("llama3:latest", 32768)
-        # Metric bumped.
+        # Metric bumped only after preload succeeded.
         assert sched.metrics.reload_count == 1
+
+    async def test_reload_count_not_bumped_on_failed_preload(self):
+        # Reload counter should track ACTUAL reloads, not attempts.
+        # If the unload succeeds but the preload fails, the model is
+        # gone and we couldn't replace it — that's a degraded state,
+        # not a successful reload.
+        memory = MagicMock()
+        memory.is_loaded.return_value = True
+        memory.needs_reload.return_value = True
+        memory.get_allocated_num_ctx.return_value = 4096
+        memory.can_fit_model.return_value = True
+        memory.available_vram.return_value = 50 * 1024**3
+        memory.refresh = AsyncMock()
+        memory.take_unexpected_unload_count.return_value = 0
+        memory.mark_intended_unload = MagicMock()
+        memory.record_allocated_num_ctx = MagicMock()
+
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
+
+        lifecycle = MagicMock()
+        # Preload fails.
+        lifecycle.preload = AsyncMock(return_value=False)
+        lifecycle.unload = AsyncMock(return_value=True)
+
+        sched = _make_scheduler(memory=memory, registry=registry, lifecycle=lifecycle)
+        result = await sched._ensure_model_loaded("llama3:latest", num_ctx=32768)
+
+        assert result is False
+        # Counter did NOT bump on failed reload.
+        assert sched.metrics.reload_count == 0
+        # Sentinel allocation written so future calls force a fresh reload
+        # rather than silently dispatching against an unknown slot.
+        memory.record_allocated_num_ctx.assert_called_with("llama3:latest", 0)
 
 
 class TestUnexpectedUnloadsRollup:

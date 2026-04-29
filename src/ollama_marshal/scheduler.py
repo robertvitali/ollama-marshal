@@ -768,11 +768,21 @@ class Scheduler:
         Returns:
             True if the model is now loaded at the requested size.
         """
+        is_reload = False
         if self.memory.is_loaded(model):
             if num_ctx is None or not self.memory.needs_reload(model, num_ctx):
                 return True
             # Reload-on-need: existing slot is too small for an
-            # incoming request. Drain first so we don't unload mid-batch.
+            # incoming request. We do NOT drain pending requests first —
+            # the request that triggered this reload would dispatch
+            # against the OLD smaller slot and Ollama would silently
+            # truncate it, defeating the entire point of the surface
+            # ("Marshal NEVER silently truncates a real prompt"). Just
+            # unload now and let the next tick dispatch against the new
+            # larger slot. Any in-flight Ollama generations finish
+            # before keep_alive=0 takes effect — Ollama serializes
+            # requests per loaded model, so unload is queued behind
+            # them safely.
             current = self.memory.get_allocated_num_ctx(model)
             logger.info(
                 "scheduler.reload_for_num_ctx",
@@ -780,21 +790,13 @@ class Scheduler:
                 current_num_ctx=current,
                 requested_num_ctx=num_ctx,
             )
-            pending = await self.queues.pending_count(model)
-            if pending > 0:
-                batch = await self.queues.dequeue_batch(model)
-                if batch:
-                    logger.info(
-                        "scheduler.drain_before_reload",
-                        model=model,
-                        request_count=len(batch),
-                    )
-                    await self._process_batch(batch)
             self.memory.mark_intended_unload(model)
             await self.lifecycle.unload(model)
             await self.memory.refresh()
-            self.metrics.reload_count += 1
-            # Fall through to the preload path below.
+            is_reload = True
+            # Fall through to the preload path below. reload_count is
+            # bumped only on successful preload so transient failures
+            # don't unboundedly grow the persisted counter.
 
         model_size = await self.registry.get_or_estimate_size(model)
 
@@ -808,14 +810,28 @@ class Scheduler:
                     size_gb=round(model_size / (1024**3), 2),
                     available_gb=round(self.memory.available_vram() / (1024**3), 2),
                 )
+                # Failed preload after a successful unload is the worst
+                # case: model is now gone but we couldn't replace it.
+                # Mark allocation as 0 (sentinel) so future calls to
+                # `needs_reload` return True until a successful preload
+                # writes the real value, instead of "defensively"
+                # returning False (which would silently truncate).
+                if is_reload:
+                    self.memory.record_allocated_num_ctx(model, 0)
                 return False
 
         success = await self.lifecycle.preload(model, num_ctx=num_ctx)
         if success:
             self.metrics.model_swaps += 1
+            if is_reload:
+                self.metrics.reload_count += 1
             if num_ctx is not None:
                 self.memory.record_allocated_num_ctx(model, num_ctx)
             await self.memory.refresh()
+        elif is_reload:
+            # Same sentinel as above — model was unloaded then preload
+            # failed. Don't pretend we have an allocation we don't.
+            self.memory.record_allocated_num_ctx(model, 0)
         return success
 
     async def _evict_one(self, needed_for: str) -> bool:
@@ -994,7 +1010,7 @@ class Scheduler:
                 # request_id correlates retries in logs; envelope object
                 # id is unique within the process and cheap.
                 request_id = f"{envelope.model}:{id(envelope):x}"
-                result, attempts_used = await call_with_retry(
+                result, attempts_used, exhausted = await call_with_retry(
                     forward_request,
                     ollama_host=self.config.ollama.host,
                     endpoint=envelope.endpoint,
@@ -1007,13 +1023,18 @@ class Scheduler:
                     request_id=request_id,
                 )
                 if attempts_used > 1:
-                    # The helper used at least one retry that ultimately
-                    # succeeded. Both counters bump: attempted (the user
-                    # cares about retry frequency) and succeeded (the
-                    # subset that worked, vs. the ones that exhausted
-                    # and reraised — those are caught below).
+                    # The helper used at least one retry. Always count
+                    # the attempts as "attempted" so operators see retry
+                    # frequency. But only count "succeeded" when the
+                    # final attempt actually returned a healthy response
+                    # — `exhausted=True` means we burned the retry budget
+                    # on a 502/503/504 and the caller is still getting
+                    # the failure. Keeping that out of `retries_succeeded`
+                    # prevents `marshal doctor` from misreporting Ollama
+                    # health as fine when it's actually flaking.
                     self.metrics.retries_attempted += attempts_used - 1
-                    self.metrics.retries_succeeded += 1
+                    if not exhausted:
+                        self.metrics.retries_succeeded += 1
             envelope.complete(result)
             # Stamp this model as recently active so idle-eviction doesn't
             # touch it. Done on dispatch (not on completion) so a long
