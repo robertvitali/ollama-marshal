@@ -105,8 +105,10 @@ def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
 
     Test defaults that differ from production:
 
-    - ``proxy.request_timeout_s = 30`` — bounded so a stuck request
-      surfaces a fast test failure rather than hanging the suite.
+    - ``proxy.request_timeout_s = 90`` — generous enough that cold
+      first-loads on a busy machine (Ollama under memory pressure
+      while another marshal is also using it) don't surface as
+      timeouts. Bounded so stuck requests still fail.
     - ``memory.poll_interval = 1`` — speed up unexpected-unload tests.
       Real production uses 5s.
     - ``shutdown.mode = IMMEDIATE``, ``unload_models = True`` — when
@@ -119,7 +121,7 @@ def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
     """
     return MarshalConfig(
         ollama=OllamaConfig(host=DEFAULT_OLLAMA_HOST),
-        proxy=ProxyConfig(host="127.0.0.1", port=11436, request_timeout_s=30),
+        proxy=ProxyConfig(host="127.0.0.1", port=11436, request_timeout_s=90),
         memory=MemoryConfig(poll_interval=1),
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
