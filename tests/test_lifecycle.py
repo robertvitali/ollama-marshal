@@ -380,7 +380,7 @@ class TestEnsureLoaded:
             result = await lifecycle.ensure_loaded("llama3:latest", set())
 
         assert result is True
-        mock_preload.assert_awaited_once_with("llama3:latest")
+        mock_preload.assert_awaited_once_with("llama3:latest", num_ctx=None)
 
     async def test_not_loaded_preload_fails(self, lifecycle):
         with patch.object(
@@ -397,7 +397,7 @@ class TestEnsureLoaded:
             result = await lifecycle.ensure_loaded("mistral:latest", {"llama3:latest"})
 
         assert result is True
-        mock_preload.assert_awaited_once_with("mistral:latest")
+        mock_preload.assert_awaited_once_with("mistral:latest", num_ctx=None)
 
 
 # ---------------------------------------------------------------------------

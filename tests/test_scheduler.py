@@ -59,6 +59,13 @@ def _make_scheduler(
         memory.available_vram.return_value = 50 * 1024**3
         memory.get_eviction_candidates.return_value = []
         memory.refresh = AsyncMock()
+        # New v0.4.0 methods (Surface C1 Dim 4 + C2). Default to "no
+        # reload needed" / "no unexpected unloads" / "no allocation".
+        memory.needs_reload.return_value = False
+        memory.get_allocated_num_ctx.return_value = None
+        memory.take_unexpected_unload_count.return_value = 0
+        memory.mark_intended_unload = MagicMock()
+        memory.record_allocated_num_ctx = MagicMock()
     if registry is None:
         registry = MagicMock()
         registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
@@ -249,7 +256,8 @@ class TestHandleCriticalPreemption:
         ) as mock_eml:
             mock_eml.return_value = True
             await sched._handle_critical_preemption()
-            mock_eml.assert_called_once_with("critical-model")
+            # num_ctx is None because the envelope had no options.num_ctx.
+            mock_eml.assert_called_once_with("critical-model", num_ctx=None)
 
     async def test_skips_normal_priority(self):
         queues = ModelQueues()
@@ -343,7 +351,7 @@ class TestHandleUnskippableRequests:
         ) as mock_eml:
             mock_eml.return_value = True
             await sched._handle_unskippable_requests()
-            mock_eml.assert_called_once_with("llama3:latest")
+            mock_eml.assert_called_once_with("llama3:latest", num_ctx=None)
 
     async def test_skips_if_below_limit(self):
         queues = ModelQueues()
@@ -435,7 +443,7 @@ class TestBinPackModels:
 
         await sched._bin_pack_models()
 
-        lifecycle.preload.assert_called_once_with("small:latest")
+        lifecycle.preload.assert_called_once_with("small:latest", num_ctx=None)
         assert sched.metrics.model_swaps == 1
         memory.refresh.assert_called_once()
 
@@ -638,7 +646,7 @@ class TestEnsureModelLoaded:
 
         result = await sched._ensure_model_loaded("llama3:latest")
         assert result is True
-        lifecycle.preload.assert_called_once_with("llama3:latest")
+        lifecycle.preload.assert_called_once_with("llama3:latest", num_ctx=None)
         assert sched.metrics.model_swaps == 1
 
     async def test_evicts_when_needed(self):
@@ -948,6 +956,421 @@ class TestForwardSingle:
         await sched._forward_single(envelope)
 
         assert sched.active_programs_by_model() == {}
+
+
+class TestResolveRetryAttempts:
+    """Resolution precedence for the per-envelope retry budget."""
+
+    def test_streaming_always_returns_one(self):
+        sched = _make_scheduler()
+        env = _make_envelope(stream=True, retry_max_override=99)
+        assert sched._resolve_retry_attempts(env) == 1
+
+    def test_envelope_override_wins_over_config(self):
+        cfg = _make_config(**{"retry.max_attempts": 5})
+        sched = _make_scheduler(config=cfg)
+        env = _make_envelope(retry_max_override=2)
+        assert sched._resolve_retry_attempts(env) == 2
+
+    def test_envelope_override_zero_clamps_to_one(self):
+        # `X-Marshal-Retry-Max: 0` means "don't retry" — that's still
+        # one attempt, not zero.
+        sched = _make_scheduler()
+        env = _make_envelope(retry_max_override=0)
+        assert sched._resolve_retry_attempts(env) == 1
+
+    def test_uses_config_when_no_override(self):
+        cfg = _make_config(**{"retry.max_attempts": 4})
+        sched = _make_scheduler(config=cfg)
+        env = _make_envelope()
+        assert sched._resolve_retry_attempts(env) == 4
+
+    def test_disabled_config_returns_one(self):
+        cfg = _make_config(**{"retry.enabled": False, "retry.max_attempts": 5})
+        sched = _make_scheduler(config=cfg)
+        env = _make_envelope()
+        assert sched._resolve_retry_attempts(env) == 1
+
+
+class TestForwardSingleRetry:
+    """Integration: _forward_single + call_with_retry counter wiring."""
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    @patch("ollama_marshal.scheduler.forward_request", new_callable=AsyncMock)
+    async def test_no_retry_path_skips_helper(self, mock_forward, mock_retry):
+        # max_attempts=1 → don't even call call_with_retry (clearer fast path).
+        mock_forward.return_value = MagicMock()
+        cfg = _make_config(**{"retry.max_attempts": 1, "retry.enabled": True})
+        sched = _make_scheduler(config=cfg)
+
+        await sched._forward_single(_make_envelope())
+
+        mock_forward.assert_called_once()
+        mock_retry.assert_not_called()
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_retry_path_records_metrics_on_success(self, mock_retry):
+        # Helper succeeded on attempt 3 → 2 retries attempted, 1 succeeded.
+        sentinel = MagicMock()
+        mock_retry.return_value = (sentinel, 3, False)
+        sched = _make_scheduler()
+
+        env = _make_envelope()
+        await sched._forward_single(env)
+
+        assert sched.metrics.retries_attempted == 2
+        assert sched.metrics.retries_succeeded == 1
+        assert env.response is sentinel
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_exhausted_status_does_not_count_as_succeeded(self, mock_retry):
+        # All attempts returned 503 → caller still gets the response,
+        # but `exhausted=True` means we should NOT count this as a
+        # successful retry. Critical for `marshal doctor` correctness.
+        mock_retry.return_value = (MagicMock(), 3, True)
+        sched = _make_scheduler()
+
+        env = _make_envelope()
+        await sched._forward_single(env)
+
+        assert sched.metrics.retries_attempted == 2
+        # The key assertion — exhausted retries are NOT successes.
+        assert sched.metrics.retries_succeeded == 0
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_retry_path_no_metrics_on_first_attempt(self, mock_retry):
+        # attempts_used=1 → no retry happened, no counters move.
+        mock_retry.return_value = (MagicMock(), 1, False)
+        sched = _make_scheduler()
+
+        await sched._forward_single(_make_envelope())
+
+        assert sched.metrics.retries_attempted == 0
+        assert sched.metrics.retries_succeeded == 0
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_retry_exhaustion_records_attempted_only(self, mock_retry):
+        # Helper exhausted retries and reraised a RETRYABLE exception →
+        # retries_attempted bumps, retries_succeeded does NOT.
+        import httpx
+
+        mock_retry.side_effect = httpx.ConnectError("permanent")
+        cfg = _make_config(**{"retry.max_attempts": 3})
+        sched = _make_scheduler(config=cfg)
+
+        env = _make_envelope()
+        await sched._forward_single(env)
+
+        assert env.error is not None
+        assert sched.metrics.retries_attempted == 2  # max_attempts - 1
+        assert sched.metrics.retries_succeeded == 0
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_non_retryable_exception_does_not_bump_retries_attempted(
+        self, mock_retry
+    ):
+        # call_with_retry raises non-retryable exceptions on attempt 1
+        # without consuming retry budget. The metric must not bump as
+        # though all retries were used.
+        import httpx
+
+        mock_retry.side_effect = httpx.ReadTimeout("slow")  # non-retryable by default
+        cfg = _make_config(**{"retry.max_attempts": 3, "retry.read_timeouts": False})
+        sched = _make_scheduler(config=cfg)
+
+        env = _make_envelope()
+        await sched._forward_single(env)
+
+        assert env.error is not None
+        # Crucial: 0, not 2. ReadTimeout was not retried.
+        assert sched.metrics.retries_attempted == 0
+        assert sched.metrics.retries_succeeded == 0
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_unrelated_exception_does_not_bump_retries_attempted(
+        self, mock_retry
+    ):
+        # A non-network exception (e.g. our code has a bug) must also
+        # not count against retry metrics.
+        mock_retry.side_effect = ValueError("scheduler bug")
+        cfg = _make_config(**{"retry.max_attempts": 3})
+        sched = _make_scheduler(config=cfg)
+
+        env = _make_envelope()
+        await sched._forward_single(env)
+
+        assert sched.metrics.retries_attempted == 0
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_embeddings_endpoint_enables_read_timeout_retry(self, mock_retry):
+        # /api/embeddings is idempotent — the helper is invoked with
+        # retry_read_timeouts=True even when the global config is False.
+        mock_retry.return_value = (MagicMock(), 1, False)
+        cfg = _make_config(**{"retry.read_timeouts": False})
+        sched = _make_scheduler(config=cfg)
+
+        await sched._forward_single(_make_envelope(endpoint="/api/embeddings"))
+
+        kwargs = mock_retry.call_args.kwargs
+        assert kwargs["retry_read_timeouts"] is True
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    async def test_chat_endpoint_does_not_force_read_timeout_retry(self, mock_retry):
+        mock_retry.return_value = (MagicMock(), 1, False)
+        cfg = _make_config(**{"retry.read_timeouts": False})
+        sched = _make_scheduler(config=cfg)
+
+        await sched._forward_single(_make_envelope(endpoint="/api/chat"))
+
+        kwargs = mock_retry.call_args.kwargs
+        assert kwargs["retry_read_timeouts"] is False
+
+    @patch("ollama_marshal.scheduler.call_with_retry", new_callable=AsyncMock)
+    @patch("ollama_marshal.scheduler.forward_request", new_callable=AsyncMock)
+    async def test_streaming_envelope_skips_retry_helper(
+        self, mock_forward, mock_retry
+    ):
+        # Streaming requests must NEVER go through the retry helper —
+        # _resolve_retry_attempts returns 1 for stream=True, taking the
+        # fast path.
+        mock_forward.return_value = MagicMock()
+        cfg = _make_config(**{"retry.max_attempts": 5})
+        sched = _make_scheduler(config=cfg)
+
+        await sched._forward_single(_make_envelope(stream=True))
+
+        mock_forward.assert_called_once()
+        mock_retry.assert_not_called()
+
+
+class TestEnvelopeNumCtxHelpers:
+    """Helpers that read num_ctx out of envelopes for slot sizing."""
+
+    def test_envelope_num_ctx_none_when_no_options(self):
+        env = _make_envelope()
+        env.request_body = {"model": "x"}
+        assert Scheduler._envelope_num_ctx(env) is None
+
+    def test_envelope_num_ctx_none_when_options_not_dict(self):
+        env = _make_envelope()
+        env.request_body = {"options": "not a dict"}
+        assert Scheduler._envelope_num_ctx(env) is None
+
+    def test_envelope_num_ctx_extracted(self):
+        env = _make_envelope()
+        env.request_body = {"options": {"num_ctx": 16384}}
+        assert Scheduler._envelope_num_ctx(env) == 16384
+
+    def test_envelope_num_ctx_ignores_zero_or_negative(self):
+        env = _make_envelope()
+        env.request_body = {"options": {"num_ctx": 0}}
+        assert Scheduler._envelope_num_ctx(env) is None
+        env.request_body = {"options": {"num_ctx": -1}}
+        assert Scheduler._envelope_num_ctx(env) is None
+
+    async def test_max_num_ctx_for_pending_picks_largest(self):
+        queues = ModelQueues()
+        e1 = _make_envelope()
+        e1.request_body = {"options": {"num_ctx": 8192}}
+        e2 = _make_envelope()
+        e2.request_body = {"options": {"num_ctx": 32768}}
+        e3 = _make_envelope()  # no num_ctx
+        await queues.enqueue(e1)
+        await queues.enqueue(e2)
+        await queues.enqueue(e3)
+
+        sched = _make_scheduler(queues=queues)
+        assert await sched._max_num_ctx_for_pending("llama3:latest") == 32768
+
+    async def test_max_num_ctx_for_pending_returns_none_for_empty(self):
+        sched = _make_scheduler()
+        assert await sched._max_num_ctx_for_pending("nothing:queued") is None
+
+
+class TestEnsureModelLoadedReloadOnNeed:
+    """Reload-on-need: dispatch with a num_ctx > current allocation reloads."""
+
+    async def test_skips_reload_when_request_fits(self):
+        memory = MagicMock()
+        memory.is_loaded.return_value = True
+        memory.needs_reload.return_value = False
+        memory.refresh = AsyncMock()
+        memory.take_unexpected_unload_count.return_value = 0
+        memory.mark_intended_unload = MagicMock()
+        memory.record_allocated_num_ctx = MagicMock()
+
+        lifecycle = MagicMock()
+        lifecycle.preload = AsyncMock(return_value=True)
+        lifecycle.unload = AsyncMock(return_value=True)
+
+        sched = _make_scheduler(memory=memory, lifecycle=lifecycle)
+
+        result = await sched._ensure_model_loaded("llama3:latest", num_ctx=4096)
+
+        assert result is True
+        # No reload work — preload not called.
+        lifecycle.preload.assert_not_called()
+        lifecycle.unload.assert_not_called()
+        assert sched.metrics.reload_count == 0
+
+    async def test_reload_does_not_drain_pending_via_old_slot(self):
+        # Critical correctness test: the request whose num_ctx > allocated
+        # is what TRIGGERED the reload. If we drained pending before
+        # unload, that request would dispatch via the OLD smaller slot
+        # and Ollama would silently truncate it. The whole point of
+        # Surface C1 Dim 4 is to NEVER silently truncate. So the reload
+        # path MUST NOT call _process_batch — pending requests stay
+        # queued and dispatch on the next tick against the new slot.
+        memory = MagicMock()
+        memory.is_loaded.return_value = True
+        memory.needs_reload.return_value = True
+        memory.get_allocated_num_ctx.return_value = 4096
+        memory.can_fit_model.return_value = True
+        memory.refresh = AsyncMock()
+        memory.take_unexpected_unload_count.return_value = 0
+        memory.mark_intended_unload = MagicMock()
+        memory.record_allocated_num_ctx = MagicMock()
+
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
+
+        lifecycle = MagicMock()
+        lifecycle.preload = AsyncMock(return_value=True)
+        lifecycle.unload = AsyncMock(return_value=True)
+
+        queues = ModelQueues()
+        env = _make_envelope()
+        env.request_body = {"options": {"num_ctx": 32768}}
+        await queues.enqueue(env)
+
+        sched = _make_scheduler(
+            queues=queues, memory=memory, registry=registry, lifecycle=lifecycle
+        )
+
+        with patch.object(
+            sched, "_process_batch", new_callable=AsyncMock
+        ) as mock_process:
+            result = await sched._ensure_model_loaded("llama3:latest", num_ctx=32768)
+
+        assert result is True
+        # CRITICAL: drain MUST NOT have run.
+        mock_process.assert_not_called()
+        # Pending request remains queued for next-tick dispatch against
+        # the new (larger) slot.
+        assert await queues.pending_count("llama3:latest") == 1
+        # Marshal told memory it's an intended unload.
+        memory.mark_intended_unload.assert_called_with("llama3:latest")
+        # Unload then preload at the bigger size.
+        lifecycle.unload.assert_called_once_with("llama3:latest")
+        lifecycle.preload.assert_called_once_with("llama3:latest", num_ctx=32768)
+        memory.record_allocated_num_ctx.assert_called_with("llama3:latest", 32768)
+        # Metric bumped only after preload succeeded.
+        assert sched.metrics.reload_count == 1
+
+    async def test_reload_count_not_bumped_on_failed_preload(self):
+        # Reload counter should track ACTUAL reloads, not attempts.
+        # If the unload succeeds but the preload fails, the model is
+        # gone and we couldn't replace it — that's a degraded state,
+        # not a successful reload.
+        memory = MagicMock()
+        memory.is_loaded.return_value = True
+        memory.needs_reload.return_value = True
+        memory.get_allocated_num_ctx.return_value = 4096
+        memory.can_fit_model.return_value = True
+        memory.available_vram.return_value = 50 * 1024**3
+        memory.refresh = AsyncMock()
+        memory.take_unexpected_unload_count.return_value = 0
+        memory.mark_intended_unload = MagicMock()
+        memory.record_allocated_num_ctx = MagicMock()
+
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
+
+        lifecycle = MagicMock()
+        # Preload fails.
+        lifecycle.preload = AsyncMock(return_value=False)
+        lifecycle.unload = AsyncMock(return_value=True)
+
+        sched = _make_scheduler(memory=memory, registry=registry, lifecycle=lifecycle)
+        result = await sched._ensure_model_loaded("llama3:latest", num_ctx=32768)
+
+        assert result is False
+        # Counter did NOT bump on failed reload.
+        assert sched.metrics.reload_count == 0
+        # Sentinel allocation written so future calls force a fresh reload
+        # rather than silently dispatching against an unknown slot.
+        memory.record_allocated_num_ctx.assert_called_with("llama3:latest", 0)
+
+
+class TestUnexpectedUnloadsRollup:
+    async def test_tick_drains_unexpected_unloads_into_metrics(self):
+        # Memory poll loop runs in the background and accumulates a
+        # count; the scheduler tick must drain it into SchedulerMetrics
+        # so the dashboard sees one authoritative number.
+        memory = MagicMock()
+        memory.get_loaded_models.return_value = {}
+        memory.is_loaded.return_value = False
+        memory.refresh = AsyncMock()
+        memory.take_unexpected_unload_count.return_value = 3
+        memory.mark_intended_unload = MagicMock()
+        memory.record_allocated_num_ctx = MagicMock()
+
+        sched = _make_scheduler(memory=memory)
+
+        with (
+            patch.object(
+                sched, "_forward_loaded_model_requests", new_callable=AsyncMock
+            ),
+            patch.object(sched, "_handle_critical_preemption", new_callable=AsyncMock),
+            patch.object(sched, "_handle_unskippable_requests", new_callable=AsyncMock),
+            patch.object(sched, "_bin_pack_models", new_callable=AsyncMock),
+            patch.object(sched, "_idle_evict_unused_models", new_callable=AsyncMock),
+        ):
+            await sched._tick()
+
+        assert sched.metrics.unexpected_unloads == 3
+
+
+class TestSchedulerMetricsRetryFields:
+    def test_default_zero(self):
+        m = SchedulerMetrics()
+        assert m.retries_attempted == 0
+        assert m.retries_succeeded == 0
+        assert m.unexpected_unloads == 0
+        assert m.reload_count == 0
+
+    def test_serializes_new_fields(self):
+        m = SchedulerMetrics(
+            retries_attempted=5,
+            retries_succeeded=4,
+            unexpected_unloads=2,
+            reload_count=7,
+        )
+        d = m.to_json_dict()
+        assert d["retries_attempted"] == 5
+        assert d["retries_succeeded"] == 4
+        assert d["unexpected_unloads"] == 2
+        assert d["reload_count"] == 7
+
+    def test_loads_with_missing_new_fields_for_v0_3_x_snapshots(self):
+        # A v0.3.x metrics file won't have the new fields — they should
+        # default to 0 instead of raising.
+        from ollama_marshal.scheduler import _METRICS_SCHEMA_VERSION
+
+        m = SchedulerMetrics.from_json_dict(
+            {
+                "schema_version": _METRICS_SCHEMA_VERSION,
+                "requests_served": 10,
+                "model_swaps": 1,
+                "evictions": 0,
+                "total_wait_ms": 1234.0,
+            }
+        )
+        assert m.requests_served == 10
+        assert m.retries_attempted == 0
+        assert m.retries_succeeded == 0
+        assert m.unexpected_unloads == 0
+        assert m.reload_count == 0
 
 
 class TestActiveProgramsAccessor:

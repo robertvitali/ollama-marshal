@@ -353,3 +353,38 @@ class TestStopCommand:
         result = runner.invoke(app, ["stop", "--host", "http://custom:9999"])
         assert result.exit_code == 0
         assert "http://custom:9999" in result.output
+
+
+# ---------------------------------------------------------------------------
+# doctor command
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorCommand:
+    @patch("ollama_marshal.doctor.gather_report")
+    def test_doctor_runs_and_renders(self, mock_gather):
+        from ollama_marshal.doctor import DoctorReport
+
+        async def _fake(*args, **kwargs):
+            return DoctorReport(
+                total_ram_bytes=64 * 1024**3,
+                loaded_models=[],
+                all_models=[],
+                recommended_env={"OLLAMA_KV_CACHE_TYPE": "q8_0"},
+            )
+
+        mock_gather.side_effect = _fake
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0
+        assert "OLLAMA_KV_CACHE_TYPE=q8_0" in result.output
+        assert "ollama-marshal doctor" in result.output
+
+    @patch("ollama_marshal.doctor.gather_report")
+    def test_doctor_handles_http_error(self, mock_gather):
+        async def _fake(*args, **kwargs):
+            raise httpx.HTTPError("ollama down")
+
+        mock_gather.side_effect = _fake
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 1
+        assert "doctor probe failed" in result.output

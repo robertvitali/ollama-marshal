@@ -7,6 +7,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-28
+
+### Added
+
+- **Fail-fast 404 on unknown models** — `/api/chat`, `/api/generate`,
+  `/api/embeddings`, and the OpenAI-compat paths now return 404 in
+  milliseconds when the requested model isn't installed in Ollama,
+  instead of letting the request sit in the queue for up to
+  `proxy.request_timeout_s` (1h default) while marshal repeatedly
+  tries to preload a non-existent model. Response includes a
+  `Run \`ollama pull <model>\`` hint. The check is cached and
+  refreshed opportunistically (rate-limited at 5s) so a freshly-pulled
+  model is recognized within a few seconds.
+- **Marshal-side retry on transient Ollama failures** — new
+  `retry` config section (default ON, max 3 attempts). When Ollama
+  briefly flaps (daemon recycling, transient 502/503), marshal
+  absorbs the blip via in-process retry with exponential backoff +
+  full jitter, so the client never sees the failure. Conservative by
+  default: streaming requests are never retried, ReadTimeout is not
+  retried (risk of re-executing partial generation), and only
+  `ConnectError`/`ConnectTimeout` + HTTP 502/503/504 trigger retry.
+  Embeddings endpoints opt into ReadTimeout retry automatically since
+  they're idempotent.
+- **`X-Marshal-Retry-Max` header** — per-request retry override.
+  `0` disables retry on a single call (e.g. tool-calling agents that
+  want fail-fast); higher values opt into more aggressive retry for
+  known-idempotent burst workloads. Capped server-side at 10.
+- **`retries_attempted`, `retries_succeeded`, `unexpected_unloads`
+  counters** on `SchedulerMetrics`. Persisted across restarts in
+  `metrics.json`. `unexpected_unloads` is wired by Surface C2 later
+  in this release.
+- **Per-program context profiles** (`context.programs.<id>`) with
+  `typical_num_ctx` (floor) and `max_num_ctx` (ceiling). Lets a
+  tool-calling program declare "round 1's allocation must already
+  fit round 5's growth" without exposing every program to the
+  pessimal max-context allocation.
+- **Load-time slot management + reload-on-need** (Surface C1 Dim 4).
+  `lifecycle.preload(model, num_ctx=N)` now passes `options.num_ctx`
+  to Ollama at load time so KV cache slots are allocated at the
+  right size. The scheduler tracks `_allocated_num_ctx_per_model`
+  and, before dispatching any envelope whose computed `num_ctx`
+  exceeds the current allocation, drains pending requests for that
+  model, unloads, and preloads at the larger size. New
+  `reload_count` metric on `SchedulerMetrics` (persisted) lets the
+  dashboard surface frequent-reload warnings.
+- **Detection of Ollama-side memory-pressure evictions** (Surface
+  C2). When marshal observes a model leave `/api/ps` without having
+  called `lifecycle.unload()` itself, it logs
+  `memory.unexpected_unload` (warning) and increments the
+  `unexpected_unloads` counter on `SchedulerMetrics`. Persistent
+  non-zero values indicate Ollama-side memory tuning is needed
+  (e.g. lower `OLLAMA_NUM_PARALLEL`, set
+  `OLLAMA_KV_CACHE_TYPE=q8_0`). The `marshal doctor` CLI (next)
+  surfaces specific recommendations.
+- **`marshal doctor` CLI subcommand** (Surface C3). Diagnostic
+  command that reads `/api/tags`, `/api/show`, and `/api/ps`,
+  computes per-model KV cache demand, and recommends specific
+  `OLLAMA_*` env vars to set in the launchd plist or systemd unit:
+  `OLLAMA_KV_CACHE_TYPE=q8_0` (halves KV cache size),
+  `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_NUM_PARALLEL` (computed from
+  worst-case KV demand vs system RAM, capped at 4),
+  `OLLAMA_MAX_LOADED_MODELS` (computed from mean KV demand). When
+  marshal is reachable, the report includes the live
+  `unexpected_unloads` counter so the user can confirm tuning
+  worked: a non-zero value drops to 0 after applying the
+  recommendations.
+
+### Changed
+
+- **BEHAVIOR CHANGE: dynamic `num_ctx` sizing.** v0.3.0 injected
+  `num_ctx = model_max_context` unconditionally — a 4B model with a
+  262K context window would pre-allocate ~17 GB of KV cache per slot
+  on every request, causing Ollama to thrash co-resident models. v0.4.0
+  estimates prompt tokens (chars/4 + 20% buffer), adds the completion
+  budget + safety buffer, rounds up to a power-of-2 boundary
+  (2K…262K), clamps to the program's profile if set, then to the
+  model's max. **Marshal NEVER silently truncates a real prompt** —
+  when a request needs more context than the model has allocated,
+  marshal will reload the model at the larger size (Surface C1 Dim 4,
+  shipping in this release). To restore v0.2.x behavior (Ollama
+  default + silent truncation), set `context.injection_enabled:
+  false`.
+
+### Fixed
+
+Issues found in local `/review` after the initial CI bot review
+landed clean — caught real correctness bugs that would have shipped
+otherwise.
+
+- **CRITICAL: reload-on-need no longer silently truncates the
+  triggering request.** v0.4.0's first-cut drained pending requests
+  for the model BEFORE unload — including the very request whose
+  `num_ctx > allocated` triggered the reload — so it dispatched
+  against the OLD smaller slot and Ollama silently truncated it.
+  This defeated the entire stated principle of Dim 4 ("Marshal NEVER
+  silently truncates a real prompt"). Fixed: skip the drain;
+  unload + preload, then let the next tick dispatch against the new
+  larger slot.
+- **CRITICAL: client-supplied `options.num_ctx` is now clamped to
+  the model's max — UNCONDITIONALLY.** Without this, a request with
+  `options.num_ctx: 999_999_999` triggered reload-on-need, failed
+  preload, infinite-looped the scheduler, and unboundedly grew
+  `metrics.reload_count`. One bad request would brick the proxy for
+  everyone. The clamp is a trust-boundary safety check, not part of
+  prompt-driven sizing — it runs whether or not
+  `context.injection_enabled` is true. Operators who opt out of
+  prompt-driven sizing (`injection_enabled: false`) are still
+  protected. Non-positive client values are dropped: when injection
+  is enabled they fall through to prompt-driven sizing; when
+  disabled the request goes out with no `num_ctx` (Ollama default).
+- **CRITICAL: failed-preload-after-unload no longer leaves the
+  scheduler unable to detect oversized requests.** When unload
+  succeeds but preload fails, `_allocated_num_ctx` is now written
+  with sentinel `0` instead of being left None. `needs_reload` treats
+  `0` as "always reload" so the scheduler retries instead of silently
+  dispatching against an unknown slot.
+- **`retries_succeeded` is honest now.** `call_with_retry` returns
+  `(result, attempts_used, exhausted)`. The scheduler only bumps
+  `retries_succeeded` when `not exhausted`. Previously, exhausting
+  retries on 502/503/504 (returning the failed response without
+  raising) counted as a success — `marshal doctor` would report
+  Ollama healthy when every retry actually failed.
+- **`metrics.reload_count` only bumps on successful reloads.**
+  Previously it incremented before preload was attempted, so failed
+  preloads still bumped the counter — combined with the unvalidated
+  `num_ctx` bug, an adversarial value produced unbounded counter
+  growth across restarts.
+- **`X-Program-ID` header is sanitized.** Truncated to 64 chars and
+  restricted to `[A-Za-z0-9_.-]`. Without this, an adversarial
+  client cycling 10MB header values would inflate burst-hint dicts,
+  `_active_programs`, and `audit.jsonl` by 10MB per distinct value.
+  Newlines and control chars in the value also corrupted structlog
+  console output (log injection).
+- **`/api/ps` shape is validated defensively.** Each model entry is
+  now type-checked (must be a dict with a string `name`). A
+  malformed response (string entries, null `models`, bad
+  `size_vram`) used to crash the polling loop and broad-except into
+  a single warning, leaving `_loaded_models` stale — a false negative
+  on the very signal Surface C2 was meant to catch.
+- Removed dead `_RetryableStatusError` class from `retry.py`
+  (defined but never raised or caught).
+
 ## [0.3.0] - 2026-04-28
 
 ### Added

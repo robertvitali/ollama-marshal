@@ -83,6 +83,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _scheduler.metrics.model_swaps = restored.model_swaps
     _scheduler.metrics.evictions = restored.evictions
     _scheduler.metrics.total_wait_ms = restored.total_wait_ms
+    # v0.4.0 counters — also persist across restarts.
+    _scheduler.metrics.retries_attempted = restored.retries_attempted
+    _scheduler.metrics.retries_succeeded = restored.retries_succeeded
+    _scheduler.metrics.unexpected_unloads = restored.unexpected_unloads
+    _scheduler.metrics.reload_count = restored.reload_count
     if restored.requests_served or restored.model_swaps or restored.evictions:
         logger.info(
             "server.metrics_restored",
@@ -338,6 +343,12 @@ def _register_routes(app: FastAPI) -> None:
                 "model_swaps": _scheduler.metrics.model_swaps,
                 "evictions": _scheduler.metrics.evictions,
                 "average_wait_ms": round(_scheduler.metrics.average_wait_ms, 1),
+                # v0.4.0 counters — wired through to /api/marshal/status
+                # so the doctor CLI (and dashboard) can read them.
+                "retries_attempted": _scheduler.metrics.retries_attempted,
+                "retries_succeeded": _scheduler.metrics.retries_succeeded,
+                "unexpected_unloads": _scheduler.metrics.unexpected_unloads,
+                "reload_count": _scheduler.metrics.reload_count,
             },
         }
 
@@ -395,6 +406,36 @@ def _register_routes(app: FastAPI) -> None:
         )
 
 
+# Allowed character set for `X-Program-ID`. Restricting to a-zA-Z0-9
+# plus a few punctuation chars prevents log injection (a value
+# containing newlines or ANSI escapes corrupts structlog console
+# output) and key-bytes amplification (an adversarial client cycling
+# 10MB header values would otherwise inflate burst-hint dicts,
+# `_active_programs`, and audit.jsonl by 10MB per distinct value).
+_PROGRAM_ID_ALLOWED = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+)
+# Cap on `X-Program-ID` length. 64 chars is more than enough for any
+# legitimate program name. Longer values are truncated rather than
+# rejected so a typo'd suffix doesn't surface as a fail-fast 400.
+_PROGRAM_ID_MAX_LEN = 64
+
+
+def _normalize_program_id(raw: str | None) -> str:
+    """Sanitize a client-supplied `X-Program-ID` header value.
+
+    Returns "default" for None/empty/all-disallowed input so downstream
+    code paths see a stable identifier without special-casing.
+    Otherwise: keep allowed chars only, truncate to `_PROGRAM_ID_MAX_LEN`.
+    """
+    if not raw:
+        return "default"
+    cleaned = "".join(c for c in raw if c in _PROGRAM_ID_ALLOWED)
+    if not cleaned:
+        return "default"
+    return cleaned[:_PROGRAM_ID_MAX_LEN]
+
+
 def _record_burst_hint(request: Request, program_id: str, model: str) -> None:
     """Read the optional X-Burst-Size header and forward to scheduler.
 
@@ -421,41 +462,260 @@ def _record_burst_hint(request: Request, program_id: str, model: str) -> None:
     sched.burst_hints.record(program_id, model, n, max_skips)
 
 
-async def _inject_num_ctx(model: str, body: dict[str, Any]) -> None:
-    """Inject `options.num_ctx = model_max_context` if the client didn't set one.
+async def _is_known_model(model: str) -> bool:
+    """Check if `model` is installed in Ollama (defensive against missing registry).
 
-    Without this, Ollama uses its server-side default (2048) and may
-    *silently truncate* a model's effective context window down from its
-    architectural max. That's a correctness bug for any client that
-    expects the model's full context to be available — analyses get
-    quietly worse with no error or warning.
+    Wraps `_registry.is_known_model(...)` with a fallback when the
+    registry isn't initialized (test paths that bypass lifespan). In
+    that case we fail open — let the request through and let the
+    scheduler handle the missing-model error normally.
+    """
+    registry = globals().get("_registry")
+    if registry is None or not hasattr(registry, "is_known_model"):
+        return True
+    result: bool = await registry.is_known_model(model)
+    return result
 
-    Behavior:
-    - Probes registry metadata if not yet cached (one-shot `/api/show`,
-      ~10ms locally on first sight; cached forever after).
-    - If the client already set `options.num_ctx`, we don't override it.
-    - If metadata can't be resolved (model unknown, Ollama down), we
-      skip injection and fall back to current behavior.
+
+# Power-of-2 boundaries used by the prompt-driven num_ctx sizer.
+# Rounding UP to one of these absorbs the char/4 + 20% tokenizer
+# overestimate cheaply and keeps Ollama's KV cache slot allocation on
+# friendly sizes. Last entry caps below typical model maxes (262144).
+_NUM_CTX_BOUNDARIES: tuple[int, ...] = (
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
+    262144,
+)
+
+
+def _estimate_prompt_tokens(body: dict[str, Any]) -> int:
+    """Cheap upper-bound token estimate from request body.
+
+    char-count / 4 + 20% buffer over-estimates by 5-15% for English/code
+    and more for CJK; the round-up to power-of-2 boundary absorbs that
+    slack. Avoids the dependency on `tiktoken` or per-model tokenizers.
+
+    Reads from the three shapes Ollama accepts:
+    - `messages: [{role, content}]` — /api/chat, /v1/chat/completions
+    - `prompt: "..."`               — /api/generate, /v1/completions
+    - falls through to 0 if neither is present.
+
+    Returns:
+        Token count (int).
+    """
+    chars = 0
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str):
+                    chars += len(content)
+                elif isinstance(content, list):
+                    # OpenAI-style multimodal content: list of parts.
+                    for part in content:
+                        if isinstance(part, dict):
+                            text = part.get("text", "")
+                            if isinstance(text, str):
+                                chars += len(text)
+    prompt = body.get("prompt")
+    if isinstance(prompt, str):
+        chars += len(prompt)
+    # 1 token ≈ 4 chars + 20% buffer = chars / 4 * 1.2 = chars * 0.3
+    return int(chars * 0.3)
+
+
+def _round_up_to_boundary(value: int) -> int:
+    """Round `value` up to the next entry in `_NUM_CTX_BOUNDARIES`.
+
+    Below the smallest boundary returns the smallest. Above the largest
+    returns the largest (caller is expected to clamp to the model max).
+    """
+    for boundary in _NUM_CTX_BOUNDARIES:
+        if value <= boundary:
+            return boundary
+    return _NUM_CTX_BOUNDARIES[-1]
+
+
+def _resolve_num_ctx_decision(
+    *,
+    prompt_tokens: int,
+    program_id: str,
+    model_max_context: int,
+    config: Any,
+) -> tuple[int, str]:
+    """Compute the per-request num_ctx and the mode that produced it.
+
+    Decision tree:
+    1. Estimate need: `prompt_tokens + default_completion_budget +
+       safety_buffer_tokens`.
+    2. Round UP to the next power-of-2 boundary.
+    3. If a `ContextConfig.programs[program_id]` profile exists, clamp
+       to `[typical_num_ctx, max_num_ctx]`. The floor protects
+       tool-calling programs from a reload-stall on round 2; the
+       ceiling protects against runaway prompts.
+    4. Final clamp: `min(value, model_max_context)`.
+
+    Returns:
+        (num_ctx, mode) — `mode` is one of "prompt_driven",
+        "program_floor", "program_ceiling", "model_max" — for logging.
+    """
+    ctx_cfg = config.context
+    needed = (
+        prompt_tokens + ctx_cfg.default_completion_budget + ctx_cfg.safety_buffer_tokens
+    )
+    rounded = _round_up_to_boundary(needed)
+    chosen = rounded
+    mode = "prompt_driven"
+
+    profile = ctx_cfg.programs.get(program_id)
+    if profile is not None:
+        if chosen < profile.typical_num_ctx:
+            chosen = profile.typical_num_ctx
+            mode = "program_floor"
+        elif chosen > profile.max_num_ctx:
+            chosen = profile.max_num_ctx
+            mode = "program_ceiling"
+
+    if chosen > model_max_context:
+        chosen = model_max_context
+        mode = "model_max"
+
+    return chosen, mode
+
+
+async def _inject_num_ctx(
+    model: str, body: dict[str, Any], program_id: str = "default"
+) -> None:
+    """Inject `options.num_ctx` sized to actual prompt + program profile.
+
+    v0.4.0 behavior (replaces v0.3.0's force-to-max):
+    - Estimate prompt tokens from request body (chars/4 + 20% buffer).
+    - Add completion budget + safety; round UP to next power-of-2.
+    - Clamp to program profile's [typical_num_ctx, max_num_ctx] if set.
+    - Final-clamp to model.max_context_length.
+
+    The result is the smallest num_ctx that still fits the actual prompt,
+    so Ollama doesn't pre-allocate KV cache for the full architectural
+    window on every request. v0.4.0 reload-on-need (Dim 4) handles the
+    case where a request actually NEEDS more context than the model
+    currently has allocated.
+
+    Two paths:
+
+    1. **Trust-boundary clamp** runs UNCONDITIONALLY when registry
+       metadata is available. Even when prompt-driven injection is
+       disabled (`context.injection_enabled: false`), an adversarial
+       client-supplied `options.num_ctx: 999_999_999` is still clamped
+       to the model's max. Skipping this would let one bad request
+       trigger reload-on-need, fail preload, infinite-loop the
+       scheduler, and unboundedly grow `metrics.reload_count` — i.e.
+       the same DoS the v0.4.0 clamp was meant to prevent.
+    2. **Prompt-driven injection** only runs when
+       `context.injection_enabled: true` AND no client value is set.
+
+    Skipped entirely when:
+    - Model name is empty.
+    - `options` is set to a non-dict value.
+    - Registry metadata isn't available (model unknown, Ollama down).
+      Without metadata we don't know the model's max, so neither clamp
+      nor injection can run.
     """
     if not model:
         return
     options = body.setdefault("options", {})
     if not isinstance(options, dict):
-        # Client sent something weird as `options`; don't touch it.
         return
-    if "num_ctx" in options:
-        # Client knows what it wants. Respect it.
-        return
-    # Registry may not yet be initialized (e.g. in unit tests that don't
-    # exercise the full lifespan). Bail silently in that case.
+
     registry = globals().get("_registry")
     if registry is None:
         return
-    # probe_metadata is idempotent — returns the cached entry if present.
     meta = await registry.probe_metadata(model)
     if meta is None:
         return
-    options["num_ctx"] = meta.max_context_length
+
+    # Trust-boundary clamp — runs regardless of injection_enabled.
+    # An adversarial or buggy client sending num_ctx: 999_999_999
+    # must always be clamped, even when the operator has opted out
+    # of prompt-driven injection.
+    client_value = options.get("num_ctx")
+    if client_value is not None:
+        if not isinstance(client_value, int) or client_value <= 0:
+            # Drop a malformed client value. If injection is enabled,
+            # we'll fall through to prompt-driven sizing below; if
+            # disabled, the request just goes out without a num_ctx
+            # (Ollama default behavior).
+            options.pop("num_ctx", None)
+        else:
+            clamped = min(client_value, meta.max_context_length)
+            if clamped != client_value:
+                logger.info(
+                    "server.num_ctx_clamped",
+                    model=model,
+                    program=program_id,
+                    requested=client_value,
+                    clamped_to=clamped,
+                )
+            options["num_ctx"] = clamped
+            # Client value (clamped) wins — skip prompt-driven sizing.
+            return
+
+    # Prompt-driven sizing — only runs when injection is enabled.
+    config = globals().get("_config")
+    if config is None or not config.context.injection_enabled:
+        return
+
+    prompt_tokens = _estimate_prompt_tokens(body)
+    chosen, mode = _resolve_num_ctx_decision(
+        prompt_tokens=prompt_tokens,
+        program_id=program_id,
+        model_max_context=meta.max_context_length,
+        config=config,
+    )
+    options["num_ctx"] = chosen
+    logger.debug(
+        "server.num_ctx_decision",
+        model=model,
+        program=program_id,
+        prompt_tokens=prompt_tokens,
+        completion_budget=config.context.default_completion_budget,
+        chosen=chosen,
+        mode=mode,
+        model_max=meta.max_context_length,
+    )
+
+
+def _parse_retry_max_header(request: Request) -> int | None:
+    """Parse `X-Marshal-Retry-Max` header into a per-request retry budget.
+
+    Returns None when the header is absent or malformed (use config
+    default). Returns 0 when the client explicitly disables retry. Caps
+    at `retry.max_per_request_attempts` to keep an adversarial header
+    from arbitrarily extending the retry budget.
+
+    Returns:
+        None to defer to config.retry, or an int >= 0 (clamped to
+        `retry.max_per_request_attempts`, default 10).
+    """
+    hdr = request.headers.get("x-marshal-retry-max")
+    if hdr is None:
+        return None
+    try:
+        v = int(hdr)
+    except ValueError:
+        return None
+    if v < 0:
+        return 0
+    # Read the cap from config, with a defensive default for test paths
+    # that bypass lifespan (no _config global set).
+    config = globals().get("_config")
+    cap = config.retry.max_per_request_attempts if config is not None else 10
+    return min(v, cap)
 
 
 def _resolve_timeout(request: Request) -> int:
@@ -497,21 +757,41 @@ async def _enqueue_inference(
     """
     model = body.get("model", "")
     stream = body.get("stream", False)
-    program_id = request.headers.get("x-program-id", "default")
+    program_id = _normalize_program_id(request.headers.get("x-program-id"))
     timeout_s = _resolve_timeout(request)
+
+    # Fail-fast on unknown models. Without this, marshal would let the
+    # request sit in the queue for proxy.request_timeout_s (default 1h)
+    # while lifecycle.preload retries every ~2 min trying to load a
+    # model Ollama doesn't have. Better to return 404 in milliseconds
+    # so the client gets a clear, fast error.
+    if model and not await _is_known_model(model):
+        logger.warning(
+            "server.request_rejected_unknown_model",
+            model=model,
+            program=program_id,
+            endpoint=endpoint,
+        )
+        return JSONResponse(
+            {
+                "error": (
+                    f"Model {model!r} is not installed in Ollama. "
+                    f"Run `ollama pull {model}` or check the model name."
+                )
+            },
+            status_code=404,
+        )
 
     # Capture optional X-Burst-Size hint so the eviction scorer protects
     # this model across the rest of the burst even if the client submits
     # the remaining calls sequentially.
     _record_burst_hint(request, program_id, model)
 
-    # Stop Ollama from silently shrinking num_ctx to fit its slot budget.
-    # Skip embeddings — they use input_length not generation context, so
-    # forcing model_max_context wastes KV cache without preventing
-    # truncation (embedding workloads aren't bitten by the bug this fix
-    # addresses).
+    # Size num_ctx to actual prompt need + program profile (Dim 1).
+    # Skip embeddings — they don't generate, so KV cache pre-allocation
+    # is irrelevant.
     if endpoint not in ("/api/embeddings", "/v1/embeddings"):
-        await _inject_num_ctx(model, body)
+        await _inject_num_ctx(model, body, program_id)
 
     envelope = RequestEnvelope(
         model=model,
@@ -519,6 +799,7 @@ async def _enqueue_inference(
         request_body=body,
         endpoint=endpoint,
         stream=stream,
+        retry_max_override=_parse_retry_max_header(request),
     )
 
     # Defensive: a client sending `options: null` (the JSON literal, not
@@ -601,8 +882,33 @@ async def _enqueue_and_wait(
     Returns:
         Parsed response dict, or a Response for streaming/errors.
     """
-    program_id = request.headers.get("x-program-id", "default")
+    program_id = _normalize_program_id(request.headers.get("x-program-id"))
     timeout_s = _resolve_timeout(request)
+
+    # Same fail-fast unknown-model check as _enqueue_inference. OpenAI
+    # clients are especially likely to mis-name models since they
+    # share name conventions with the OpenAI catalog (e.g. "gpt-4")
+    # rather than Ollama's local-model names.
+    if model and not await _is_known_model(model):
+        logger.warning(
+            "server.request_rejected_unknown_model",
+            model=model,
+            program=program_id,
+            endpoint=endpoint,
+        )
+        return JSONResponse(
+            {
+                "error": {
+                    "message": (
+                        f"Model {model!r} is not installed in Ollama. "
+                        f"Run `ollama pull {model}` or check the model name."
+                    ),
+                    "type": "model_not_found",
+                    "code": "model_not_found",
+                }
+            },
+            status_code=404,
+        )
 
     # Capture optional burst-size hint (same semantics as the Ollama-
     # native path).
@@ -612,7 +918,7 @@ async def _enqueue_and_wait(
     # rarely set num_ctx explicitly so they're the most likely to be
     # bitten by Ollama's silent context truncation. Skip embeddings.
     if endpoint not in ("/api/embeddings", "/v1/embeddings"):
-        await _inject_num_ctx(model, ollama_body)
+        await _inject_num_ctx(model, ollama_body, program_id)
 
     envelope = RequestEnvelope(
         model=model,
@@ -620,6 +926,7 @@ async def _enqueue_and_wait(
         request_body=ollama_body,
         endpoint=endpoint,
         stream=stream,
+        retry_max_override=_parse_retry_max_header(request),
     )
 
     await _queues.enqueue(envelope)

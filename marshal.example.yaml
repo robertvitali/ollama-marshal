@@ -92,3 +92,72 @@ audit:
   max_size_mb: 100                 # MARSHAL_AUDIT_MAX_SIZE_MB — rotate the audit file
                                     # (.1, .2, ... up to 5 generations) when it exceeds
                                     # this size. 0 disables rotation.
+
+# Marshal-side retry on transient Ollama failures (default ON).
+# When Ollama briefly flaps (daemon recycling, transient 502/503), marshal
+# absorbs the blip via in-process retry so the client never sees the failure.
+#
+# Conservative by default:
+#   • Streaming requests are NEVER retried (would corrupt the byte stream).
+#   • ReadTimeout is NOT retried (Ollama may have started generating —
+#     retrying could double-bill or re-execute a tool call).
+#   • Only ConnectError/ConnectTimeout and HTTP 502/503/504 retry.
+#
+# Per-request override: clients can send `X-Marshal-Retry-Max: 0` to
+# disable retry on a single call (e.g. tool-calling agents that prefer
+# fail-fast), or a higher number for known-idempotent calls.
+retry:
+  enabled: true                    # MARSHAL_RETRY_ENABLED
+  max_attempts: 3                  # MARSHAL_RETRY_MAX_ATTEMPTS — total attempts incl. first.
+                                    # 1 = no retry, 3 = up to 2 retries. With default
+                                    # backoff, 3 attempts take ~3-5 s worst-case.
+  base_delay_s: 0.5                # MARSHAL_RETRY_BASE_DELAY_S — first-retry backoff
+                                    # before doubling. Full-jitter random in [0, base_delay_s].
+  max_delay_s: 10.0                # MARSHAL_RETRY_MAX_DELAY_S — cap on a single backoff sleep.
+  read_timeouts: false             # MARSHAL_RETRY_READ_TIMEOUTS — when true, also retry
+                                    # ReadTimeout (risk of re-execution). Embeddings
+                                    # endpoints opt in automatically regardless of this flag.
+  max_per_request_attempts: 10     # MARSHAL_RETRY_MAX_PER_REQUEST_ATTEMPTS — server-side
+                                    # cap on the X-Marshal-Retry-Max header so an
+                                    # adversarial client can't extend retry indefinitely.
+
+# Dynamic num_ctx injection (default ON).
+# v0.3.0 forced num_ctx = model_max_context, which made Ollama pre-allocate
+# KV cache for the full architectural window even on a 100-token prompt
+# (a 70 GB allocation on a 4B model with 262K context). v0.4.0 sizes
+# num_ctx to actual prompt + completion budget, rounded up to a power-of-2
+# boundary, then clamped to per-program [typical, max] if a profile exists,
+# and finally to the model's max_context_length.
+#
+# Marshal NEVER silently truncates a real prompt. When a request needs
+# more context than the model's currently-allocated slot size, marshal
+# triggers a reload at the larger size (Surface C1 Dim 4).
+#
+# Set injection_enabled: false to opt out and fall back to Ollama's
+# default behavior (with its silent-truncation bug).
+context:
+  injection_enabled: true                # MARSHAL_CONTEXT_INJECTION_ENABLED
+  default_completion_budget: 4096        # MARSHAL_CONTEXT_DEFAULT_COMPLETION_BUDGET
+                                          # — tokens reserved for the response when the
+                                          # client doesn't set options.num_predict.
+  safety_buffer_tokens: 256              # MARSHAL_CONTEXT_SAFETY_BUFFER_TOKENS
+                                          # — extra tokens to absorb tokenizer overestimate.
+
+  # Per-program profiles keyed by X-Program-ID header value. Programs
+  # without a profile get pure prompt-driven sizing.
+  #   typical_num_ctx — FLOOR. Tool-calling programs benefit from this so
+  #     round 2 doesn't trigger a reload. Set to typical context the
+  #     program actually uses after a few rounds.
+  #   max_num_ctx — CEILING. Defensive against runaway prompts.
+  programs: {}
+  # Example:
+  # programs:
+  #   ai-portfolio-rebalance:
+  #     typical_num_ctx: 16384            # tool-calling rounds grow over time
+  #     max_num_ctx: 65536
+  #   projectfreethink-government-analysis:
+  #     typical_num_ctx: 32768            # long bills
+  #     max_num_ctx: 131072
+  #   ai-email-triage:
+  #     typical_num_ctx: 4096             # short prompts, K-vote
+  #     max_num_ctx: 8192

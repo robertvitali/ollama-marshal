@@ -680,3 +680,201 @@ class TestPollLoop:
                 raised = True
 
         assert raised is True
+
+
+# ---------------------------------------------------------------------------
+# Allocated num_ctx tracking + reload-on-need (Surface C1 Dim 4)
+# ---------------------------------------------------------------------------
+
+
+class TestAllocatedNumCtx:
+    def test_initial_get_returns_none(self):
+        manager = _make_manager()
+        assert manager.get_allocated_num_ctx("any:model") is None
+
+    def test_record_and_get(self):
+        manager = _make_manager()
+        manager.record_allocated_num_ctx("llama3:latest", 16384)
+        assert manager.get_allocated_num_ctx("llama3:latest") == 16384
+
+    def test_record_overwrites(self):
+        manager = _make_manager()
+        manager.record_allocated_num_ctx("llama3:latest", 4096)
+        manager.record_allocated_num_ctx("llama3:latest", 32768)
+        assert manager.get_allocated_num_ctx("llama3:latest") == 32768
+
+    def test_unload_clears_allocation(self):
+        # An unexpected unload (Ollama-side) should drop the allocation
+        # so the next preload doesn't reuse a stale recorded num_ctx.
+        manager = _make_manager()
+        manager._loaded_models = {
+            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
+        }
+        manager.record_allocated_num_ctx("llama3:latest", 16384)
+        # Simulate /api/ps now reporting no models.
+        manager._update_from_ps({"models": []})
+        assert manager.get_allocated_num_ctx("llama3:latest") is None
+
+
+class TestNeedsReload:
+    def test_false_when_not_loaded(self):
+        # If the model isn't loaded, the upcoming preload will use the
+        # right size — no reload needed.
+        manager = _make_manager()
+        assert manager.needs_reload("not-loaded:x", 16384) is False
+
+    def test_false_when_no_allocation_recorded(self):
+        # Defensive: we can't tell, so don't trigger spurious reloads.
+        manager = _make_manager()
+        manager._loaded_models = {
+            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
+        }
+        assert manager.needs_reload("llama3:latest", 16384) is False
+
+    def test_false_when_requested_fits(self):
+        manager = _make_manager()
+        manager._loaded_models = {
+            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
+        }
+        manager.record_allocated_num_ctx("llama3:latest", 32768)
+        assert manager.needs_reload("llama3:latest", 16384) is False
+        assert manager.needs_reload("llama3:latest", 32768) is False
+
+    def test_true_when_requested_exceeds(self):
+        manager = _make_manager()
+        manager._loaded_models = {
+            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
+        }
+        manager.record_allocated_num_ctx("llama3:latest", 8192)
+        assert manager.needs_reload("llama3:latest", 16384) is True
+
+    def test_zero_allocation_is_sentinel_always_needs_reload(self):
+        # Allocation==0 is the post-failed-preload sentinel. The model
+        # is loaded but we don't know what slot Ollama actually has.
+        # `needs_reload` must return True regardless of requested size
+        # so the scheduler tries to reload again instead of silently
+        # dispatching against an unknown slot.
+        manager = _make_manager()
+        manager._loaded_models = {
+            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
+        }
+        manager.record_allocated_num_ctx("llama3:latest", 0)
+        assert manager.needs_reload("llama3:latest", 1024) is True
+        assert manager.needs_reload("llama3:latest", 65536) is True
+
+
+class TestUpdateFromPsShapeRobustness:
+    """Defensive parsing of /api/ps response.
+
+    /api/ps comes from a process we don't fully control (Ollama, or a
+    proxy in front of it). A malformed entry must NOT crash the poll
+    loop. A crash-then-broad-except would leave _loaded_models stale,
+    silently turning unexpected_unload detection into a false negative
+    on the very signal Surface C2 was meant to catch.
+    """
+
+    def test_models_not_a_list_treated_as_empty(self):
+        manager = _make_manager()
+        manager._loaded_models = {
+            "x:1": LoadedModel(name="x:1", size_vram=1),
+        }
+        manager._update_from_ps({"models": "not a list"})
+        assert manager.get_loaded_models() == {}
+
+    def test_models_is_none_treated_as_empty(self):
+        manager = _make_manager()
+        manager._update_from_ps({"models": None})
+        assert manager.get_loaded_models() == {}
+
+    def test_non_dict_entries_skipped(self):
+        manager = _make_manager()
+        manager._update_from_ps(
+            {
+                "models": [
+                    "string-not-dict",
+                    None,
+                    42,
+                    {"name": "valid:1", "size_vram": 1000},
+                ]
+            }
+        )
+        loaded = manager.get_loaded_models()
+        assert list(loaded) == ["valid:1"]
+
+    def test_missing_name_skipped(self):
+        manager = _make_manager()
+        manager._update_from_ps(
+            {"models": [{"size_vram": 1000}, {"name": "valid:1", "size_vram": 1}]}
+        )
+        loaded = manager.get_loaded_models()
+        assert list(loaded) == ["valid:1"]
+
+    def test_non_string_name_skipped(self):
+        manager = _make_manager()
+        manager._update_from_ps(
+            {
+                "models": [
+                    {"name": 12345, "size_vram": 1},
+                    {"name": "ok:1", "size_vram": 1},
+                ]
+            }
+        )
+        loaded = manager.get_loaded_models()
+        assert list(loaded) == ["ok:1"]
+
+    def test_garbage_size_vram_defaults_to_zero(self):
+        manager = _make_manager()
+        manager._update_from_ps(
+            {"models": [{"name": "x:1", "size_vram": "not-a-number"}]}
+        )
+        assert manager.get_loaded_models()["x:1"].size_vram == 0
+
+
+# ---------------------------------------------------------------------------
+# Unexpected-unload detection (Surface C2)
+# ---------------------------------------------------------------------------
+
+
+class TestUnexpectedUnloadDetection:
+    def test_intended_unload_does_not_trigger(self):
+        manager = _make_manager()
+        manager._loaded_models = {
+            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
+        }
+        manager.mark_intended_unload("llama3:latest")
+        manager._update_from_ps({"models": []})
+        assert manager.unexpected_unloads_observed == 0
+
+    def test_unexpected_unload_increments_counter(self):
+        # Marshal didn't ask for the unload — Ollama did it.
+        manager = _make_manager()
+        manager._loaded_models = {
+            "mistral:latest": LoadedModel(name="mistral:latest", size_vram=1)
+        }
+        manager._update_from_ps({"models": []})
+        assert manager.unexpected_unloads_observed == 1
+
+    def test_take_count_resets(self):
+        manager = _make_manager()
+        manager._loaded_models = {
+            "x:1": LoadedModel(name="x:1", size_vram=1),
+            "x:2": LoadedModel(name="x:2", size_vram=1),
+        }
+        manager._update_from_ps({"models": []})
+        assert manager.take_unexpected_unload_count() == 2
+        # Subsequent take returns 0 (resets on read).
+        assert manager.take_unexpected_unload_count() == 0
+
+    def test_intended_set_consumed_only_once(self):
+        # Marking intended-unload should consume the marker so a later
+        # unexpected unload of the same name still triggers.
+        manager = _make_manager()
+        manager._loaded_models = {"x:1": LoadedModel(name="x:1", size_vram=1)}
+        manager.mark_intended_unload("x:1")
+        manager._update_from_ps({"models": []})  # intended — no count
+        assert manager.unexpected_unloads_observed == 0
+
+        # Now load + unexpected-unload again; should count.
+        manager._update_from_ps({"models": [{"name": "x:1", "size_vram": 1}]})
+        manager._update_from_ps({"models": []})
+        assert manager.unexpected_unloads_observed == 1

@@ -104,8 +104,10 @@ Config discovery: --config flag → MARSHAL_CONFIG env → ./marshal.yaml
 Queued (through scheduler): /api/chat, /api/generate, /api/embeddings,
 /v1/chat/completions, /v1/completions, /v1/embeddings
 
-Pass-through (no scheduling): /api/tags, /api/ps, /api/show, /api/version,
-/api/pull, /api/delete, /api/copy
+Pass-through (no scheduling): /api/tags, /api/ps, /api/show, /api/version
+
+Blocked (return 403 — manage models via Ollama directly): /api/pull,
+/api/delete, /api/copy
 
 Local (served by proxy): /api/marshal/status, /status (alias)
 

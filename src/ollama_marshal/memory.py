@@ -66,6 +66,21 @@ class MemoryManager:
         self._loaded_models: dict[str, LoadedModel] = {}
         self._budget = self._calculate_budget()
         self._poll_task: asyncio.Task[None] | None = None
+        # Tracks the num_ctx that marshal asked Ollama to allocate when
+        # each currently-loaded model was last preloaded. Distinct from
+        # "the largest num_ctx any served request needed" — we care
+        # about what slot Ollama actually has, so reload-on-need can
+        # decide whether the next request fits without reloading.
+        self._allocated_num_ctx: dict[str, int] = {}
+        # Names that marshal explicitly unloaded itself. Observing a
+        # model leave /api/ps WITHOUT being in this set is an
+        # unexpected (Ollama-side memory-pressure) eviction. The set
+        # is consumed and cleared on the next poll cycle.
+        self._intended_unloads: set[str] = set()
+        # Counter incremented whenever the poll loop detects an
+        # unexpected unload. The scheduler reads + zeros this to roll
+        # the value into SchedulerMetrics.unexpected_unloads.
+        self.unexpected_unloads_observed: int = 0
 
     def _calculate_budget(self) -> MemoryBudget:
         """Calculate the memory budget from config and system info."""
@@ -139,12 +154,30 @@ class MemoryManager:
             ps_data: Parsed JSON from /api/ps.
         """
         new_loaded: dict[str, LoadedModel] = {}
-        for m in ps_data.get("models", []):
+        # /api/ps comes from a process we don't control (Ollama, or a
+        # proxy in front of it). Validate shape defensively: a single
+        # malformed entry must not crash the polling loop, since a
+        # crash-then-broad-except would leave _loaded_models stale and
+        # silently turn unexpected_unloads detection into a false
+        # negative on the very signal Surface C2 was meant to catch.
+        models_raw = ps_data.get("models")
+        if not isinstance(models_raw, list):
+            models_raw = []
+        for m in models_raw:
+            if not isinstance(m, dict):
+                continue
             name = m.get("name", "")
+            if not isinstance(name, str) or not name:
+                continue
+            try:
+                size_vram = int(m.get("size_vram", 0))
+            except (TypeError, ValueError):
+                size_vram = 0
+            expires_at = m.get("expires_at", "")
+            if not isinstance(expires_at, str):
+                expires_at = ""
             new_loaded[name] = LoadedModel(
-                name=name,
-                size_vram=int(m.get("size_vram", 0)),
-                expires_at=m.get("expires_at", ""),
+                name=name, size_vram=size_vram, expires_at=expires_at
             )
 
         # Log changes
@@ -154,6 +187,27 @@ class MemoryManager:
             logger.info("memory.models_loaded", models=sorted(added))
         if removed:
             logger.info("memory.models_unloaded", models=sorted(removed))
+
+        # Detect Ollama-side memory-pressure evictions: anything that
+        # disappeared without marshal having marked it for unload is
+        # an unexpected unload, signaling Ollama-side tuning is needed
+        # (e.g. lower OLLAMA_NUM_PARALLEL, q8_0 KV cache).
+        for name in removed:
+            if name in self._intended_unloads:
+                self._intended_unloads.discard(name)
+            else:
+                self.unexpected_unloads_observed += 1
+                logger.warning(
+                    "memory.unexpected_unload",
+                    model=name,
+                    reason=(
+                        "Ollama dropped this model without marshal asking. "
+                        "Run `ollama-marshal doctor` for tuning suggestions."
+                    ),
+                )
+            # Forget the allocated num_ctx for any model that's no
+            # longer loaded — its KV slots are gone.
+            self._allocated_num_ctx.pop(name, None)
 
         self._loaded_models = new_loaded
 
@@ -237,3 +291,60 @@ class MemoryManager:
     def budget(self) -> MemoryBudget:
         """Get the calculated memory budget."""
         return self._budget
+
+    # ------------------------------------------------------------------
+    # Allocated num_ctx tracking (Surface C1 Dim 4)
+    # ------------------------------------------------------------------
+
+    def record_allocated_num_ctx(self, model: str, num_ctx: int) -> None:
+        """Record what num_ctx marshal asked Ollama to allocate at preload.
+
+        Called from the scheduler immediately after a successful
+        `lifecycle.preload(model, num_ctx=N)`. Used by `needs_reload`
+        to decide if a subsequent request needs more context than the
+        current slot allocation.
+        """
+        self._allocated_num_ctx[model] = num_ctx
+
+    def get_allocated_num_ctx(self, model: str) -> int | None:
+        """Return the num_ctx marshal preloaded the model with (or None)."""
+        return self._allocated_num_ctx.get(model)
+
+    def needs_reload(self, model: str, requested_num_ctx: int) -> bool:
+        """Check if `requested_num_ctx` exceeds what the model has allocated.
+
+        A True result means the scheduler must unload + preload the
+        model at a larger num_ctx before serving the next request.
+        False means the request fits and can dispatch immediately.
+
+        Returns False if the model isn't loaded yet (the upcoming
+        preload will use the right size) or if no allocation has been
+        recorded — except: a recorded allocation of 0 is a SENTINEL
+        meaning "previous reload's preload failed, we don't actually
+        know what slot Ollama has." In that case always return True so
+        the scheduler tries again rather than silently dispatching
+        against an unknown slot size.
+        """
+        if model not in self._loaded_models:
+            return False
+        current = self._allocated_num_ctx.get(model)
+        if current is None:
+            return False
+        if current == 0:
+            # Sentinel: prior reload failed mid-flight. Always reload.
+            return True
+        return requested_num_ctx > current
+
+    def mark_intended_unload(self, model: str) -> None:
+        """Tell the poll loop that marshal is intentionally unloading `model`.
+
+        Without this, the next /api/ps poll would see the model gone
+        and wrongly count it as an unexpected (Ollama-side) eviction.
+        """
+        self._intended_unloads.add(model)
+
+    def take_unexpected_unload_count(self) -> int:
+        """Return the count of unexpected unloads since last call, then reset."""
+        n = self.unexpected_unloads_observed
+        self.unexpected_unloads_observed = 0
+        return n

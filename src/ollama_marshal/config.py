@@ -241,6 +241,157 @@ class AuditConfig(BaseModel):
     )
 
 
+class ProgramContextProfile(BaseModel):
+    """Per-program num_ctx floor and ceiling.
+
+    `typical_num_ctx` is a FLOOR: a tool-calling program's first call
+    should already get enough room for later rounds, so we don't pay
+    a reload penalty on round 2. `max_num_ctx` is a CEILING: defensive
+    against runaway prompts that would force a model reload at maximum
+    context.
+
+    If a program has no profile, its requests size to actual prompt
+    need only — no floor, no ceiling beyond the model's max.
+    """
+
+    typical_num_ctx: int = Field(
+        default=4096,
+        description=(
+            "Floor: prompt-driven sizing won't go below this for this "
+            "program. Set to the typical context the program actually "
+            "needs after a few tool-calling rounds."
+        ),
+    )
+    max_num_ctx: int = Field(
+        default=131072,
+        description=(
+            "Ceiling: clamp prompt-driven sizing to at most this. "
+            "Defensive against runaway prompts."
+        ),
+    )
+
+
+class ContextConfig(BaseModel):
+    """Dynamic `num_ctx` injection settings.
+
+    v0.3.0 injected `num_ctx = model_max_context` unconditionally,
+    which forces Ollama to pre-allocate KV cache for the full window
+    even on a 100-token prompt — a 70 GB allocation on a 4B model with
+    a 262K context window. v0.4.0 instead sizes `num_ctx` to actual
+    prompt + completion budget, rounded up to a power-of-2 boundary,
+    then clamped to `[program.typical_num_ctx, program.max_num_ctx]`
+    if a profile exists, and finally to `model.max_context_length`.
+
+    Marshal NEVER silently truncates a real prompt. When a request
+    needs more context than the model's currently-allocated slot size,
+    marshal triggers a reload at the larger size (see Surface C1
+    Dim 4). To opt out and restore Ollama's default behavior (and its
+    silent-truncation bug), set `injection_enabled: false`.
+    """
+
+    injection_enabled: bool = Field(
+        default=True,
+        description=(
+            "Inject `options.num_ctx` based on prompt size. Disable to "
+            "fall back to Ollama's default (which may silently "
+            "truncate)."
+        ),
+    )
+    default_completion_budget: int = Field(
+        default=4096,
+        description=(
+            "Tokens reserved for the model's response when the client "
+            "doesn't set `options.num_predict`. Added to the input "
+            "estimate before rounding to a power-of-2 boundary."
+        ),
+    )
+    safety_buffer_tokens: int = Field(
+        default=256,
+        description=(
+            "Extra tokens added to the prompt+completion estimate to "
+            "absorb tokenizer-overestimate inaccuracy."
+        ),
+    )
+    programs: dict[str, ProgramContextProfile] = Field(
+        default_factory=dict,
+        description=(
+            "Per-program floor/ceiling profiles keyed by `X-Program-ID` "
+            "header value. Programs without a profile get pure "
+            "prompt-driven sizing."
+        ),
+    )
+
+
+class RetryConfig(BaseModel):
+    """Marshal-side retry tuning for transient Ollama failures.
+
+    When Ollama briefly flaps (daemon recycling, transient 502/503),
+    marshal absorbs the blip via in-process retry so the client never
+    sees the failure. Retries are conservative by default:
+
+    - **Streaming requests are NEVER retried.** Once chunks have shipped,
+      we can't safely re-issue.
+    - **ReadTimeout is NOT retried** unless `read_timeouts` is enabled
+      — Ollama may have already started generating, so retrying could
+      double-bill or re-execute a tool call.
+    - Only `ConnectError`/`ConnectTimeout` and HTTP 502/503/504 retry
+      by default.
+
+    Per-request override: clients can send `X-Marshal-Retry-Max: 0` to
+    disable retry on a single request, or a higher number to opt into
+    more aggressive retry for known-idempotent calls.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable marshal-side retry on transient failures",
+    )
+    max_attempts: int = Field(
+        default=3,
+        description=(
+            "Total attempts including the first try. 1 = no retry, "
+            "3 = up to 2 retries. Bounded by total wall-clock cost: "
+            "with default backoff, 3 attempts take ~3-5s worst case."
+        ),
+    )
+    base_delay_s: float = Field(
+        default=0.5,
+        description=(
+            "First-retry backoff before doubling. Full-jitter random "
+            "in [0, base_delay_s] for first retry."
+        ),
+    )
+    max_delay_s: float = Field(
+        default=10.0,
+        description=(
+            "Cap on a single backoff sleep. Prevents pathological "
+            "geometric growth on long retry budgets."
+        ),
+    )
+    read_timeouts: bool = Field(
+        default=False,
+        description=(
+            "When True, retry on ReadTimeout (Ollama may have already "
+            "started generating — risk of re-execution). Default False. "
+            "Safe to enable for idempotent endpoints (embeddings). "
+            "Field name kept short ('read_timeouts' not "
+            "'retry_read_timeouts') so the env-var override "
+            "MARSHAL_RETRY_READ_TIMEOUTS parses correctly: the env "
+            "parser splits at the FIRST underscore, so the field name "
+            "must be the part after 'retry'."
+        ),
+    )
+    max_per_request_attempts: int = Field(
+        default=10,
+        description=(
+            "Server-side cap on the per-request `X-Marshal-Retry-Max` "
+            "header. Even an adversarial client can't extend retry "
+            "beyond this number. Default 10 — generous, but bounds the "
+            "worst-case wall-clock on a stuck request."
+        ),
+    )
+
+
 class MarshalConfig(BaseModel):
     """Root configuration for ollama-marshal."""
 
@@ -254,6 +405,8 @@ class MarshalConfig(BaseModel):
     shutdown: ShutdownConfig = Field(default_factory=ShutdownConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
+    retry: RetryConfig = Field(default_factory=RetryConfig)
+    context: ContextConfig = Field(default_factory=ContextConfig)
 
     def get_program_config(self, program_id: str) -> ProgramConfig:
         """Get config for a program, falling back to 'default'."""
@@ -326,14 +479,28 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 "burst_hint_max_live",
                 "retention_days",
                 "max_size_mb",
+                # v0.4.0: retry + context int fields
+                "max_attempts",
+                "max_per_request_attempts",
+                "default_completion_budget",
+                "safety_buffer_tokens",
             ):
                 data[section][field] = int(value)
             elif field in (
                 "burst_hint_ttl_s",
                 "metrics_persist_interval_s",
+                # v0.4.0: retry float fields
+                "base_delay_s",
+                "max_delay_s",
             ):
                 data[section][field] = float(value)
-            elif field in ("unload_models", "enabled"):
+            elif field in (
+                "unload_models",
+                "enabled",
+                # v0.4.0: retry + context bool fields
+                "read_timeouts",
+                "injection_enabled",
+            ):
                 data[section][field] = value.lower() in ("true", "1", "yes")
             else:
                 data[section][field] = value

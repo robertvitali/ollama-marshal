@@ -17,6 +17,7 @@ from ollama_marshal.lifecycle import ModelLifecycle
 from ollama_marshal.memory import MemoryManager
 from ollama_marshal.queue import ModelQueues, RequestEnvelope
 from ollama_marshal.registry import ModelRegistry
+from ollama_marshal.retry import call_with_retry
 from ollama_marshal.stream import forward_request
 
 logger = structlog.get_logger()
@@ -262,6 +263,16 @@ class SchedulerMetrics:
         model_swaps: Number of model load/unload cycles.
         evictions: Number of forced model evictions.
         total_wait_ms: Cumulative wait time across all requests.
+        retries_attempted: Times marshal retried a forward_request after
+            a transient failure. Lifetime counter.
+        retries_succeeded: Times a retried request ultimately succeeded
+            (subset of `retries_attempted`).
+        unexpected_unloads: Times marshal observed Ollama drop a loaded
+            model on its own (memory-pressure eviction). Persistent
+            non-zero values signal Ollama-side memory tuning is needed.
+        reload_count: Times marshal reloaded a model at a larger num_ctx
+            because an incoming request needed more context than the
+            current slot allocation (Surface C1 Dim 4).
         started_at: Monotonic timestamp when the scheduler started.
     """
 
@@ -269,6 +280,10 @@ class SchedulerMetrics:
     model_swaps: int = 0
     evictions: int = 0
     total_wait_ms: float = 0.0
+    retries_attempted: int = 0
+    retries_succeeded: int = 0
+    unexpected_unloads: int = 0
+    reload_count: int = 0
     started_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -292,6 +307,10 @@ class SchedulerMetrics:
             "model_swaps": self.model_swaps,
             "evictions": self.evictions,
             "total_wait_ms": float(self.total_wait_ms),
+            "retries_attempted": self.retries_attempted,
+            "retries_succeeded": self.retries_succeeded,
+            "unexpected_unloads": self.unexpected_unloads,
+            "reload_count": self.reload_count,
         }
 
     @classmethod
@@ -313,6 +332,11 @@ class SchedulerMetrics:
             model_swaps=int(data.get("model_swaps", 0)),
             evictions=int(data.get("evictions", 0)),
             total_wait_ms=float(data.get("total_wait_ms", 0.0)),
+            # New v0.4.0 fields default to 0 if loading a v0.3.x snapshot.
+            retries_attempted=int(data.get("retries_attempted", 0)),
+            retries_succeeded=int(data.get("retries_succeeded", 0)),
+            unexpected_unloads=int(data.get("unexpected_unloads", 0)),
+            reload_count=int(data.get("reload_count", 0)),
             # started_at is intentionally fresh — current process clock.
         )
 
@@ -516,6 +540,14 @@ class Scheduler:
         # never-recurring program-model pair.
         self.burst_hints.prune_expired()
 
+        # Step 7: Roll memory's observed-unexpected-unloads counter up
+        # into the persisted SchedulerMetrics. The memory poll loop ran
+        # independently in the background; we drain the count here so
+        # the dashboard sees a single authoritative number.
+        unexpected = self.memory.take_unexpected_unload_count()
+        if unexpected > 0:
+            self.metrics.unexpected_unloads += unexpected
+
     def active_programs_by_model(self) -> dict[str, list[str]]:
         """Return programs that have recently dispatched against each loaded model.
 
@@ -566,6 +598,7 @@ class Scheduler:
                 idle_s=round(idle_s, 1),
                 threshold_s=threshold_s,
             )
+            self.memory.mark_intended_unload(model_name)
             success = await self.lifecycle.unload(model_name)
             if success:
                 self.metrics.evictions += 1
@@ -576,11 +609,31 @@ class Scheduler:
             break
 
     async def _forward_loaded_model_requests(self) -> None:
-        """Forward all pending requests whose model is already loaded."""
+        """Forward all pending requests whose model is already loaded.
+
+        Also handles reload-on-need (Surface C1 Dim 4): if any pending
+        envelope for a loaded model needs more num_ctx than the model
+        currently has allocated, trigger a reload first.
+        """
         loaded = self.memory.get_loaded_models()
         for model_name in loaded:
             pending = await self.queues.pending_count(model_name)
             if pending == 0:
+                continue
+
+            # Check whether any pending envelope needs more context
+            # than the model's current slot allocation. If so, reload
+            # at the larger size before dispatching anything.
+            requested = await self._max_num_ctx_for_pending(model_name)
+            if requested is not None and self.memory.needs_reload(
+                model_name, requested
+            ):
+                # _ensure_model_loaded handles drain-before-reload +
+                # unload + reload + record_allocated_num_ctx + metric.
+                await self._ensure_model_loaded(model_name, num_ctx=requested)
+                # Skip dispatch this tick; the next tick will pick up
+                # whatever's now ready (the drain-before-reload may
+                # have already served some envelopes).
                 continue
 
             batch = await self.queues.dequeue_batch(model_name)
@@ -602,7 +655,8 @@ class Scheduler:
                 model=envelope.model,
                 program=envelope.program_id,
             )
-            await self._ensure_model_loaded(envelope.model)
+            num_ctx = await self._max_num_ctx_for_pending(envelope.model)
+            await self._ensure_model_loaded(envelope.model, num_ctx=num_ctx)
             break  # Handle one preemption per tick
 
     async def _handle_unskippable_requests(self) -> None:
@@ -620,7 +674,8 @@ class Scheduler:
                 skip_count=envelope.skip_count,
                 max_skips=max_skips,
             )
-            await self._ensure_model_loaded(envelope.model)
+            num_ctx = await self._max_num_ctx_for_pending(envelope.model)
+            await self._ensure_model_loaded(envelope.model, num_ctx=num_ctx)
             break  # Load one forced model per tick to avoid thrashing
 
     async def _bin_pack_models(self) -> None:
@@ -639,15 +694,19 @@ class Scheduler:
         for model in models_to_try:
             model_size = await self.registry.get_or_estimate_size(model)
             if self.memory.can_fit_model(model_size):
+                num_ctx = await self._max_num_ctx_for_pending(model)
                 logger.info(
                     "scheduler.bin_pack_load",
                     model=model,
                     size_gb=round(model_size / (1024**3), 2),
                     available_gb=round(self.memory.available_vram() / (1024**3), 2),
+                    num_ctx=num_ctx,
                 )
-                success = await self.lifecycle.preload(model)
+                success = await self.lifecycle.preload(model, num_ctx=num_ctx)
                 if success:
                     self.metrics.model_swaps += 1
+                    if num_ctx is not None:
+                        self.memory.record_allocated_num_ctx(model, num_ctx)
                     await self.memory.refresh()
             else:
                 skipped_models.append(model)
@@ -657,17 +716,87 @@ class Scheduler:
         for model in skipped_models:
             await self.queues.increment_skips_for_model(model)
 
-    async def _ensure_model_loaded(self, model: str) -> bool:
-        """Ensure a model is loaded, evicting others if needed.
+    @staticmethod
+    def _envelope_num_ctx(envelope: RequestEnvelope) -> int | None:
+        """Read the injected `options.num_ctx` from an envelope's request body.
+
+        Returns None when the body has no options or the value isn't an
+        int. Used to decide what slot size to preload at, and whether
+        a reload is needed before dispatch.
+        """
+        options = envelope.request_body.get("options")
+        if not isinstance(options, dict):
+            return None
+        value = options.get("num_ctx")
+        if isinstance(value, int) and value > 0:
+            return value
+        return None
+
+    async def _max_num_ctx_for_pending(self, model: str) -> int | None:
+        """Maximum injected `num_ctx` across all pending envelopes for `model`.
+
+        Used to size the initial preload so that small first-arrival
+        prompts don't get a tiny slot that gets immediately reloaded
+        when a later (larger) request dispatches.
+        """
+        pending = await self.queues.pending_for_model(model)
+        max_ctx: int | None = None
+        for env in pending:
+            n = self._envelope_num_ctx(env)
+            if n is None:
+                continue
+            if max_ctx is None or n > max_ctx:
+                max_ctx = n
+        return max_ctx
+
+    async def _ensure_model_loaded(
+        self, model: str, num_ctx: int | None = None
+    ) -> bool:
+        """Ensure a model is loaded with at least `num_ctx` slot allocation.
+
+        When `num_ctx` is set and the model is already loaded but at a
+        smaller allocated slot size, this triggers a reload-on-need:
+        drain pending requests for that model, unload it, then preload
+        at the larger size. Reload count is tracked in
+        `metrics.reload_count`.
 
         Args:
             model: The model to load.
+            num_ctx: Required minimum slot allocation; None means "any
+                allocation will do".
 
         Returns:
-            True if the model is now loaded.
+            True if the model is now loaded at the requested size.
         """
+        is_reload = False
         if self.memory.is_loaded(model):
-            return True
+            if num_ctx is None or not self.memory.needs_reload(model, num_ctx):
+                return True
+            # Reload-on-need: existing slot is too small for an
+            # incoming request. We do NOT drain pending requests first —
+            # the request that triggered this reload would dispatch
+            # against the OLD smaller slot and Ollama would silently
+            # truncate it, defeating the entire point of the surface
+            # ("Marshal NEVER silently truncates a real prompt"). Just
+            # unload now and let the next tick dispatch against the new
+            # larger slot. Any in-flight Ollama generations finish
+            # before keep_alive=0 takes effect — Ollama serializes
+            # requests per loaded model, so unload is queued behind
+            # them safely.
+            current = self.memory.get_allocated_num_ctx(model)
+            logger.info(
+                "scheduler.reload_for_num_ctx",
+                model=model,
+                current_num_ctx=current,
+                requested_num_ctx=num_ctx,
+            )
+            self.memory.mark_intended_unload(model)
+            await self.lifecycle.unload(model)
+            await self.memory.refresh()
+            is_reload = True
+            # Fall through to the preload path below. reload_count is
+            # bumped only on successful preload so transient failures
+            # don't unboundedly grow the persisted counter.
 
         model_size = await self.registry.get_or_estimate_size(model)
 
@@ -681,12 +810,28 @@ class Scheduler:
                     size_gb=round(model_size / (1024**3), 2),
                     available_gb=round(self.memory.available_vram() / (1024**3), 2),
                 )
+                # Failed preload after a successful unload is the worst
+                # case: model is now gone but we couldn't replace it.
+                # Mark allocation as 0 (sentinel) so future calls to
+                # `needs_reload` return True until a successful preload
+                # writes the real value, instead of "defensively"
+                # returning False (which would silently truncate).
+                if is_reload:
+                    self.memory.record_allocated_num_ctx(model, 0)
                 return False
 
-        success = await self.lifecycle.preload(model)
+        success = await self.lifecycle.preload(model, num_ctx=num_ctx)
         if success:
             self.metrics.model_swaps += 1
+            if is_reload:
+                self.metrics.reload_count += 1
+            if num_ctx is not None:
+                self.memory.record_allocated_num_ctx(model, num_ctx)
             await self.memory.refresh()
+        elif is_reload:
+            # Same sentinel as above — model was unloaded then preload
+            # failed. Don't pretend we have an allocation we don't.
+            self.memory.record_allocated_num_ctx(model, 0)
         return success
 
     async def _evict_one(self, needed_for: str) -> bool:
@@ -759,6 +904,7 @@ class Scheduler:
                 )
                 await self._process_batch(batch)
 
+        self.memory.mark_intended_unload(target)
         success = await self.lifecycle.unload(target)
         if success:
             self.metrics.evictions += 1
@@ -807,19 +953,88 @@ class Scheduler:
             tasks = [self._forward_single(e) for e in embeddings]
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def _resolve_retry_attempts(self, envelope: RequestEnvelope) -> int:
+        """Resolve the effective retry budget for one envelope.
+
+        Precedence (highest first):
+        1. `envelope.retry_max_override` (from `X-Marshal-Retry-Max`
+           header) — explicit per-request opt-in/out.
+        2. `config.retry.max_attempts` if `retry.enabled`.
+        3. 1 (no retry) when retry is globally disabled.
+
+        Streaming requests always resolve to 1 attempt (the retry
+        helper also short-circuits, but resolving here makes the
+        no-retry fast path explicit at the call site).
+        """
+        if envelope.stream:
+            return 1
+        if envelope.retry_max_override is not None:
+            # Clamp to >= 1 — `0` from the header means "no retries"
+            # which is still a single attempt.
+            return max(1, envelope.retry_max_override)
+        retry_cfg = self.config.retry
+        if not retry_cfg.enabled:
+            return 1
+        return retry_cfg.max_attempts
+
     async def _forward_single(self, envelope: RequestEnvelope) -> None:
         """Forward a single request to Ollama and complete the envelope.
+
+        Wraps `forward_request` in `call_with_retry` for non-streaming
+        non-idempotent calls. Streaming requests are NEVER retried (the
+        retry helper short-circuits), and `retry_max_override` on the
+        envelope can disable or extend retry per-request.
 
         Args:
             envelope: The request to forward.
         """
+        max_attempts = self._resolve_retry_attempts(envelope)
+        retry_cfg = self.config.retry
+        # Compute whether this dispatch site allows ReadTimeout retry.
+        # Embeddings are idempotent — always retryable. Other endpoints
+        # only retry ReadTimeout when the operator opts in.
+        allow_read_retry = retry_cfg.read_timeouts or envelope.endpoint in (
+            "/api/embeddings",
+            "/v1/embeddings",
+        )
         try:
-            result = await forward_request(
-                ollama_host=self.config.ollama.host,
-                endpoint=envelope.endpoint,
-                request_body=envelope.request_body,
-                stream=envelope.stream,
-            )
+            if max_attempts <= 1:
+                # No-retry fast path: single attempt, no helper overhead.
+                result = await forward_request(
+                    ollama_host=self.config.ollama.host,
+                    endpoint=envelope.endpoint,
+                    request_body=envelope.request_body,
+                    stream=envelope.stream,
+                )
+            else:
+                # request_id correlates retries in logs; envelope object
+                # id is unique within the process and cheap.
+                request_id = f"{envelope.model}:{id(envelope):x}"
+                result, attempts_used, exhausted = await call_with_retry(
+                    forward_request,
+                    ollama_host=self.config.ollama.host,
+                    endpoint=envelope.endpoint,
+                    request_body=envelope.request_body,
+                    stream=envelope.stream,
+                    max_attempts=max_attempts,
+                    base_delay_s=retry_cfg.base_delay_s,
+                    max_delay_s=retry_cfg.max_delay_s,
+                    retry_read_timeouts=allow_read_retry,
+                    request_id=request_id,
+                )
+                if attempts_used > 1:
+                    # The helper used at least one retry. Always count
+                    # the attempts as "attempted" so operators see retry
+                    # frequency. But only count "succeeded" when the
+                    # final attempt actually returned a healthy response
+                    # — `exhausted=True` means we burned the retry budget
+                    # on a 502/503/504 and the caller is still getting
+                    # the failure. Keeping that out of `retries_succeeded`
+                    # prevents `marshal doctor` from misreporting Ollama
+                    # health as fine when it's actually flaking.
+                    self.metrics.retries_attempted += attempts_used - 1
+                    if not exhausted:
+                        self.metrics.retries_succeeded += 1
             envelope.complete(result)
             # Stamp this model as recently active so idle-eviction doesn't
             # touch it. Done on dispatch (not on completion) so a long
@@ -849,6 +1064,26 @@ class Scheduler:
                 stream=envelope.stream,
             )
         except Exception as exc:
+            # When retry was active and exhausted, the helper raised the
+            # last exception — count those attempts here so the metric
+            # captures both successful-retry and exhausted-retry paths.
+            #
+            # BUT only when the exception was ACTUALLY retried: if a
+            # non-retryable exception (e.g. ReadTimeout with
+            # read_timeouts=False) propagates, call_with_retry raises it
+            # on attempt 1 without consuming any retry budget. Counting
+            # those would mark every transient ReadTimeout as
+            # "max_attempts - 1 retries used" when zero were.
+            from ollama_marshal.retry import (
+                SAFE_RETRY_EXCEPTIONS,
+                UNSAFE_RETRY_EXCEPTIONS,
+            )
+
+            retryable: tuple[type[Exception], ...] = SAFE_RETRY_EXCEPTIONS
+            if allow_read_retry:
+                retryable = retryable + UNSAFE_RETRY_EXCEPTIONS
+            if max_attempts > 1 and isinstance(exc, retryable):
+                self.metrics.retries_attempted += max_attempts - 1
             # Some httpx exception subclasses have empty str(); always include
             # the type name so the log entry is useful.
             logger.error(
