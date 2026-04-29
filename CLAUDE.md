@@ -123,11 +123,49 @@ Local (served by proxy): /api/marshal/status, /status (alias)
 ## Testing Rules
 
 - Unit tests: mock Ollama responses via httpx, target 95%+ coverage
-- Integration tests: @pytest.mark.integration, require running Ollama
+- Integration tests: live under `tests/integration/`, MUST use the
+  `integration` pytest marker, MUST never run in default `make test`
+  or default CI (excluded via `--ignore=tests/integration`), MUST
+  skipif `localhost:11434` is unreachable so they fail cleanly when
+  Ollama is down
 - Never mock internal modules — only mock the Ollama HTTP boundary
 - conftest.py has shared fixtures for all Ollama API responses
 - Use `pytest` fixtures over `setUp`/`tearDown`; `@pytest.mark.parametrize`
   over loops; `pytest-asyncio` for async tests
+
+### Integration suite layout (v0.5.0+)
+
+- `tests/integration/conftest.py` — shared fixtures (`marshal_app`,
+  `marshal_config`, `tmp_marshal_paths`) and a `make_test_app(cfg,
+  paths)` helper for tests that build their own MarshalConfig (so
+  registry-cache isolation isn't bypassed by inline `create_app(cfg)`
+  calls). Tests that need fault injection import the
+  `fault_proxy` async context manager directly from
+  `_fault_proxy.py` rather than as a pytest fixture.
+- `tests/integration/_fault_proxy.py` — bare `asyncio.start_server`
+  HTTP/1.1 proxy in front of Ollama. Hooks: `fail_next`,
+  `disconnect_next`, `delay_next`, `fake_response`. Used for retry
+  tests and the unexpected-unload test
+- Per-area test files: `test_smoke.py`, `test_memory_behavior.py`
+  (the main thrust — model loading/unloading correctness),
+  `test_fail_fast.py`, `test_num_ctx.py`, `test_retry.py`,
+  `test_audit.py`, `test_doctor.py`
+- **NO pytest-xdist parallelism inside `tests/integration/`** —
+  marshal uses module-level globals (`_scheduler`, `_memory`,
+  `_config`); two parallel marshal apps would stomp on each other.
+  Default pytest is serial, so no actual change needed; just don't
+  add `-n` flags
+- Test envelope priority: every test fires with
+  `X-Program-ID: integration-test` (CRITICAL priority by default).
+  The `marshal_config` fixture also defines `integration-test-normal`
+  for the few tests that specifically need normal-priority paths
+  (drain-before-evict)
+- When adding a new feature, consider whether it needs an integration
+  test (cross-component path against real Ollama) or unit test alone
+  is sufficient. Cross-component memory-handling features (anything
+  touching scheduler ↔ memory ↔ lifecycle) generally NEED integration
+  coverage — the unit suite mocks at the httpx boundary, missing
+  exactly the bug class /review caught on PR #6 (v0.4.0)
 
 ## Documentation Rules
 

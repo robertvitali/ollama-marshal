@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Integration test suite** — opt-in pytest suite under
+  `tests/integration/` (24 tests across 7 files) that validates
+  end-to-end behavior against the user's real Ollama. Runs locally
+  via `make test-integration`; never in CI. Covers memory handling
+  (preload, bin-packing, drain-before-evict, slot allocation,
+  reload-on-need, failed-preload sentinel, unexpected-unload
+  detection, idle eviction), the v0.4.0 surfaces (retry, fail-fast,
+  num_ctx injection, audit log, marshal doctor), and basic smoke
+  tests. Also ships a small fault-injection HTTP proxy
+  (`tests/integration/_fault_proxy.py`) that lets tests simulate
+  Ollama failures (502/503, ConnectError, malformed responses,
+  fake `/api/ps`) without restarting the real daemon.
+- **`asgi-lifespan>=2.1.0`** dev dependency — runs FastAPI's
+  lifespan hooks from async test code without spinning up a uvicorn
+  subprocess. Required only for tests under `tests/integration/`;
+  production code never imports it.
+- **App component handles on `app.state`** — `_scheduler`,
+  `_memory`, `_registry`, `_lifecycle`, `_queues` are now stashed
+  on the FastAPI `app.state` at end of lifespan startup so
+  integration tests (and any future consumer that wants in-process
+  introspection) can read them without poking module globals.
+  Additive only; production request handlers continue using the
+  module globals as before.
+- **`pytest` pre-push hook** in `.pre-commit-config.yaml` — full
+  unit suite gates every `git push`. Integration tests are excluded
+  (they need a running Ollama). Install via the existing
+  `make install-dev` target which now runs both
+  `pre-commit install` and `pre-commit install --hook-type pre-push`.
+
+### Removed
+
+- **Claude review + security workflows** (`.github/workflows/claude-review.yml`,
+  `.github/workflows/claude-security.yml`) and the `CLAUDE_API_KEY`
+  GitHub Actions secret. Cost-control measure: the local `/review`
+  skill (gstack) catches more bugs anyway — empirically it found 3
+  P0/P1 correctness bugs the CI bot missed on PR #6. Default PR CI
+  keeps `lint`, `test (...)` matrix, and `guard-workflow-changes`
+  (defense-in-depth: blocks accidental future re-adds of the
+  workflow files unless on a `chore/ci-*` branch). Replacement
+  review path documented in CLAUDE.md.
+
 ## [0.4.0] - 2026-04-28
 
 ### Added

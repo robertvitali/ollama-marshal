@@ -51,6 +51,12 @@ dev = [
     "pre-commit>=3.7.0",
     "types-PyYAML>=6.0.0",
     "types-psutil>=5.9.0",
+    # Integration tests run marshal in-process via FastAPI's
+    # httpx.ASGITransport. asgi-lifespan's LifespanManager fires the
+    # lifespan startup/shutdown hooks (scheduler.start, memory polling,
+    # registry.initialize) the same way uvicorn would. Required only
+    # for tests under tests/integration/; production code never imports it.
+    "asgi-lifespan>=2.1.0",
 ]
 
 [project.scripts]

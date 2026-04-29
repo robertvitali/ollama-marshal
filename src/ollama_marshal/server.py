@@ -7,6 +7,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import psutil
@@ -55,11 +56,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _config = app.state.config
     _started_at = time.monotonic()
 
-    # Initialize components
+    # Initialize components. ModelRegistry's on-disk cache paths can
+    # be overridden via `app.state.registry_path` and
+    # `app.state.metadata_path` — only used by integration tests so
+    # the suite doesn't clobber the user's production-marshal registry
+    # at ~/.ollama-marshal/. Production code never sets these
+    # attributes; the registry uses its built-in defaults.
     _queues = ModelQueues()
     _memory = MemoryManager(_config)
     _registry = ModelRegistry(
         ollama_host=_config.ollama.host,
+        registry_path=getattr(app.state, "registry_path", None),
+        metadata_path=getattr(app.state, "metadata_path", None),
     )
     _lifecycle = ModelLifecycle(ollama_host=_config.ollama.host)
     _scheduler = Scheduler(
@@ -112,6 +120,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # to completion (and emit a warning on 3.12+).
     benchmark_task = asyncio.create_task(_registry.benchmark_unknown())
     await _scheduler.start()
+
+    # Expose component instances on app.state under a private,
+    # namespaced handle for integration tests (and any future consumer
+    # that wants in-process introspection without reaching into module
+    # globals). Underscore-prefixed name + SimpleNamespace wrapper
+    # signals "test-only, not part of the public app surface" — any
+    # third-party middleware or future endpoint that goes looking for
+    # `app.state._marshal_internals` is making an explicit choice to
+    # cross the encapsulation boundary, vs. accidentally bumping into
+    # the components via attribute lookup. Production request handlers
+    # continue to use the module globals (`_scheduler`, etc.) as they
+    # always have. Additive only; no behavior change.
+    #
+    # TODO: when request handlers are refactored off module globals
+    # (`_scheduler`, `_memory`, etc) and start reading components from
+    # `request.app.state` directly, promote these to a public
+    # `app.state.components` dataclass and drop the underscore prefix.
+    # That refactor unblocks safe pytest-xdist parallelism inside
+    # tests/integration/.
+    app.state._marshal_internals = SimpleNamespace(
+        scheduler=_scheduler,
+        memory=_memory,
+        registry=_registry,
+        lifecycle=_lifecycle,
+        queues=_queues,
+    )
 
     # Periodically snapshot metrics to disk so a hard crash loses at
     # most metrics_persist_interval_s of counter data.
