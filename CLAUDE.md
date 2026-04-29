@@ -179,6 +179,23 @@ substantive code silently fails its review check.
 3. The `guard-workflow-changes` CI job blocks PRs from non-`chore/ci-*`
    branches that modify these files.
 
+## Claude Review Workflows — Manual Trigger Only
+
+As of v0.5.0, both Claude review workflows are **manual-trigger only**
+to control Anthropic API costs:
+
+- **`claude-review.yml`** — triggers on `workflow_dispatch` (Run
+  workflow button in Actions UI, takes a PR number input) OR on
+  `issue_comment` containing `@claude` (comment "@claude" on a PR to
+  request review).
+- **`claude-security.yml`** — `workflow_dispatch` only.
+
+The `pull_request` trigger has been removed from both. Default PR CI
+runs only `guard-workflow-changes`, `lint`, and the test matrix — all
+free. Local `/review` (the gstack skill) is the recommended bulk
+reviewer; reach for the cloud workflows when you specifically want a
+second opinion on a tricky PR.
+
 This rule applies ONLY to the Claude workflows. Editing `ci.yml` on a
 feature branch is fine — there's no token-exchange validator on it.
 
