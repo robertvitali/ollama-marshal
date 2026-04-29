@@ -113,6 +113,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     benchmark_task = asyncio.create_task(_registry.benchmark_unknown())
     await _scheduler.start()
 
+    # Expose component instances on app.state for integration tests
+    # (and any future consumer that wants in-process introspection
+    # without reaching into module globals). Production code paths
+    # don't read these — request handlers use the module globals as
+    # they always have. Additive only; no behavior change.
+    app.state.scheduler = _scheduler
+    app.state.memory = _memory
+    app.state.registry = _registry
+    app.state.lifecycle = _lifecycle
+    app.state.queues = _queues
+
     # Periodically snapshot metrics to disk so a hard crash loses at
     # most metrics_persist_interval_s of counter data.
     metrics_persister = asyncio.create_task(
