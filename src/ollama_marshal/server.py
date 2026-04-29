@@ -606,22 +606,30 @@ async def _inject_num_ctx(
     case where a request actually NEEDS more context than the model
     currently has allocated.
 
-    Skipped when:
+    Two paths:
+
+    1. **Trust-boundary clamp** runs UNCONDITIONALLY when registry
+       metadata is available. Even when prompt-driven injection is
+       disabled (`context.injection_enabled: false`), an adversarial
+       client-supplied `options.num_ctx: 999_999_999` is still clamped
+       to the model's max. Skipping this would let one bad request
+       trigger reload-on-need, fail preload, infinite-loop the
+       scheduler, and unboundedly grow `metrics.reload_count` — i.e.
+       the same DoS the v0.4.0 clamp was meant to prevent.
+    2. **Prompt-driven injection** only runs when
+       `context.injection_enabled: true` AND no client value is set.
+
+    Skipped entirely when:
     - Model name is empty.
-    - Client already set `options.num_ctx` (their value wins, but is
-      clamped to the model's max — see clamp logic below).
     - `options` is set to a non-dict value.
     - Registry metadata isn't available (model unknown, Ollama down).
-    - `context.injection_enabled` is False (opt-out).
+      Without metadata we don't know the model's max, so neither clamp
+      nor injection can run.
     """
     if not model:
         return
     options = body.setdefault("options", {})
     if not isinstance(options, dict):
-        return
-
-    config = globals().get("_config")
-    if config is None or not config.context.injection_enabled:
         return
 
     registry = globals().get("_registry")
@@ -631,18 +639,17 @@ async def _inject_num_ctx(
     if meta is None:
         return
 
-    # Trust boundary: a client-supplied `options.num_ctx` is honored
-    # but ALWAYS clamped to the model's max and rejected if non-positive.
-    # Without this clamp, an adversarial or buggy client sending
-    # `num_ctx: 999_999_999` would trigger reload-on-need, fail
-    # preload, infinite-loop the scheduler, and unboundedly grow
-    # `metrics.reload_count`. One bad request would brick the proxy
-    # for everyone sharing the model.
+    # Trust-boundary clamp — runs regardless of injection_enabled.
+    # An adversarial or buggy client sending num_ctx: 999_999_999
+    # must always be clamped, even when the operator has opted out
+    # of prompt-driven injection.
     client_value = options.get("num_ctx")
     if client_value is not None:
         if not isinstance(client_value, int) or client_value <= 0:
-            # Drop a malformed client value and fall through to
-            # prompt-driven sizing below, same as if it were absent.
+            # Drop a malformed client value. If injection is enabled,
+            # we'll fall through to prompt-driven sizing below; if
+            # disabled, the request just goes out without a num_ctx
+            # (Ollama default behavior).
             options.pop("num_ctx", None)
         else:
             clamped = min(client_value, meta.max_context_length)
@@ -655,7 +662,13 @@ async def _inject_num_ctx(
                     clamped_to=clamped,
                 )
             options["num_ctx"] = clamped
+            # Client value (clamped) wins — skip prompt-driven sizing.
             return
+
+    # Prompt-driven sizing — only runs when injection is enabled.
+    config = globals().get("_config")
+    if config is None or not config.context.injection_enabled:
+        return
 
     prompt_tokens = _estimate_prompt_tokens(body)
     chosen, mode = _resolve_num_ctx_decision(

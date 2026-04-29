@@ -1070,6 +1070,55 @@ class TestInjectNumCtx:
             restore()
         assert body["options"]["num_ctx"] == 32768
 
+    async def test_clamps_client_num_ctx_even_when_injection_disabled(self):
+        """REGRESSION: clamp must run even when prompt-driven injection is opt-out.
+
+        Bug caught by /review on PR #6: the early-return on
+        `injection_enabled: false` happened BEFORE the clamp logic.
+        An operator opting out of prompt-driven sizing was silently
+        re-exposing the same `num_ctx: 999_999_999` DoS the v0.4.0
+        clamp was meant to fix. The fix moves the clamp out of the
+        injection-gated branch — it's a trust boundary, not part of
+        prompt-driven sizing.
+        """
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(
+            return_value=self._qwen3_metadata(max_ctx=32768)
+        )
+        cfg = MarshalConfig()
+        cfg.context.injection_enabled = False  # the opt-out path
+        restore = self._set_globals(registry=registry, config=cfg)
+        body: dict = {"model": "m", "options": {"num_ctx": 999_999_999}}
+        try:
+            await server_mod._inject_num_ctx("m", body)
+        finally:
+            restore()
+        # The adversarial value MUST be clamped to the model's max
+        # regardless of the injection flag. Untouched would be 999_999_999.
+        assert body["options"]["num_ctx"] == 32768
+
+    async def test_drops_malformed_client_num_ctx_when_injection_disabled(self):
+        """When injection is disabled and client sends garbage, drop it cleanly.
+
+        Falls through to "no num_ctx in body" — Ollama default behavior
+        — rather than passing the garbage value through.
+        """
+        registry = MagicMock()
+        registry.probe_metadata = AsyncMock(
+            return_value=self._qwen3_metadata(max_ctx=32768)
+        )
+        cfg = MarshalConfig()
+        cfg.context.injection_enabled = False
+        restore = self._set_globals(registry=registry, config=cfg)
+        body: dict = {"model": "m", "options": {"num_ctx": -1}}
+        try:
+            await server_mod._inject_num_ctx("m", body)
+        finally:
+            restore()
+        # Malformed dropped, no prompt-driven fallback because
+        # injection is disabled.
+        assert "num_ctx" not in body["options"]
+
     async def test_drops_negative_or_zero_client_num_ctx(self):
         """Non-positive client num_ctx is dropped, not honored."""
         registry = MagicMock()
