@@ -12,4 +12,7 @@ from __future__ import annotations
 from ollama_marshal.cli import app
 
 if __name__ == "__main__":
-    app()
+    # Pin the program name so help/error text reads "ollama-marshal"
+    # rather than "__main__.py" when invoked via -m. Cosmetic but it
+    # keeps doctor output consistent across invocation paths.
+    app(prog_name="ollama-marshal")

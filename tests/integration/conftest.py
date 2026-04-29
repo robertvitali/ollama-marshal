@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
@@ -41,6 +41,9 @@ from ollama_marshal.config import (
     ShutdownMode,
 )
 from ollama_marshal.server import create_app
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
 
 # The smallest model used across the integration suite. ~1.6 GB.
 # Tests that need a different model parametrize the model name
@@ -132,7 +135,7 @@ def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
     )
 
 
-def make_test_app(cfg: MarshalConfig, tmp_marshal_paths: dict[str, Path]) -> Any:
+def make_test_app(cfg: MarshalConfig, tmp_marshal_paths: dict[str, Path]) -> FastAPI:
     """Build a marshal FastAPI app with test-isolated registry paths.
 
     Tests that need custom MarshalConfig (e.g. constrained memory budget,

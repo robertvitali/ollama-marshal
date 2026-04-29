@@ -133,11 +133,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # continue to use the module globals (`_scheduler`, etc.) as they
     # always have. Additive only; no behavior change.
     #
-    # TODO: when src/ollama_marshal/server.py request handlers are
-    # refactored off module globals onto request.app.state injection
-    # (Asana subtask "[Integration polish C]"), promote these to
-    # `app.state.components` as the canonical access path and drop
-    # the underscore prefix.
+    # TODO: when request handlers are refactored off module globals
+    # (`_scheduler`, `_memory`, etc) and start reading components from
+    # `request.app.state` directly, promote these to a public
+    # `app.state.components` dataclass and drop the underscore prefix.
+    # That refactor unblocks safe pytest-xdist parallelism inside
+    # tests/integration/.
     app.state._marshal_internals = SimpleNamespace(
         scheduler=_scheduler,
         memory=_memory,

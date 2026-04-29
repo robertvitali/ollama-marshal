@@ -42,7 +42,7 @@ import asyncio
 import json
 import re
 import socket
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -109,8 +109,13 @@ class FaultProxy:
 
     def __init__(self, upstream: str = "http://localhost:11434") -> None:
         self._upstream = upstream.rstrip("/")
-        # Path-prefix → FIFO queue of fault specs. Empty queue → pass through.
-        self._queues: dict[str, deque[_Spec]] = defaultdict(deque)
+        # Path → FIFO queue of fault specs. Empty (or missing) queue
+        # means pass-through. Plain dict + ``setdefault`` in the
+        # mutator methods rather than ``defaultdict(deque)`` so that
+        # ``_next_spec``'s ``.get()`` on a path that was never queued
+        # doesn't materialize an empty-deque entry that lingers
+        # forever.
+        self._queues: dict[str, deque[_Spec]] = {}
         self._server: asyncio.base_events.Server | None = None
         self._port: int = 0
         self._client: httpx.AsyncClient | None = None
@@ -134,19 +139,20 @@ class FaultProxy:
 
     def fail_next(self, path: str, times: int = 1, status: int = 503) -> None:
         """Queue ``times`` failures (returning ``status``) for ``path``."""
-        key = self._normalize_path(path)
+        queue = self._queues.setdefault(self._normalize_path(path), deque())
         for _ in range(times):
-            self._queues[key].append(_FailSpec(status=status))
+            queue.append(_FailSpec(status=status))
 
     def disconnect_next(self, path: str, times: int = 1) -> None:
         """Queue ``times`` socket-close-without-response events for ``path``."""
-        key = self._normalize_path(path)
+        queue = self._queues.setdefault(self._normalize_path(path), deque())
         for _ in range(times):
-            self._queues[key].append(_DisconnectSpec())
+            queue.append(_DisconnectSpec())
 
     def delay_next(self, path: str, seconds: float) -> None:
         """Sleep ``seconds`` before forwarding the next request to ``path``."""
-        self._queues[self._normalize_path(path)].append(_DelaySpec(seconds=seconds))
+        queue = self._queues.setdefault(self._normalize_path(path), deque())
+        queue.append(_DelaySpec(seconds=seconds))
 
     def fake_response(
         self, path: str, body: dict[str, Any] | bytes, times: int | None = None
@@ -156,9 +162,8 @@ class FaultProxy:
         ``times=None`` means indefinitely.
         """
         payload = json.dumps(body).encode() if isinstance(body, dict) else body
-        self._queues[self._normalize_path(path)].append(
-            _FakeSpec(body=payload, remaining=times)
-        )
+        queue = self._queues.setdefault(self._normalize_path(path), deque())
+        queue.append(_FakeSpec(body=payload, remaining=times))
 
     # -- lifecycle ----------------------------------------------------
 
@@ -194,14 +199,18 @@ class FaultProxy:
         # client. If a handler is mid-``_forward`` when the client
         # closes, its next ``self._client.stream`` call raises
         # ``RuntimeError("client has been closed.")`` — catch via
-        # cancellation instead. 5s grace before forcible cancel; that's
-        # plenty for any in-flight request to either finish naturally
-        # or surface its own error path.
+        # cancellation instead. The drain timeout gives in-flight
+        # requests a chance to finish naturally or surface their own
+        # error path. Handlers ``discard`` themselves from
+        # ``_handler_tasks`` in their ``finally`` block, so we trust
+        # that — no unconditional ``clear()`` after the gather, which
+        # would mask a real "task didn't unwind" diagnostic if it
+        # ever happens.
         if self._handler_tasks:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*self._handler_tasks, return_exceptions=True),
-                    timeout=5.0,
+                    timeout=self._HANDLER_DRAIN_TIMEOUT_S,
                 )
             except TimeoutError:
                 for task in self._handler_tasks:
@@ -209,7 +218,6 @@ class FaultProxy:
                 # Final gather absorbs CancelledError so the test
                 # doesn't see "Task exception was never retrieved".
                 await asyncio.gather(*self._handler_tasks, return_exceptions=True)
-            self._handler_tasks.clear()
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -260,6 +268,14 @@ class FaultProxy:
     # own asyncio loop logs "Task exception was never retrieved"
     # noise. Cap each read at 30s so the handler unwinds cleanly.
     _READ_TIMEOUT_S = 30.0
+
+    # Grace period for in-flight handler tasks during ``_stop``. Long
+    # enough that any naturally-completing request (a fast pass-through
+    # to /api/version, a queued fault, etc) finishes without forced
+    # cancel; short enough that a stuck handler doesn't pin teardown
+    # for a noticeable wall-clock time. 5s comfortably covers all
+    # current test paths (median <1s, slowest <2s).
+    _HANDLER_DRAIN_TIMEOUT_S = 5.0
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -336,12 +352,24 @@ class FaultProxy:
 
             # Strict Content-Length parsing. Reject signed values
             # (``+5``, ``-1``), hex, whitespace inside the value, and
-            # any non-digit characters per RFC 7230 §3.3.2.
-            cl_raw = headers.get("content-length", "").strip()
-            if cl_raw and not _CONTENT_LENGTH_RE.match(cl_raw):
-                await self._write_error(writer, 400)
-                return
-            content_length = int(cl_raw) if cl_raw else 0
+            # any non-digit characters per RFC 7230 §3.3.2. Also
+            # reject empty-but-present headers (``Content-Length:``
+            # with whitespace-only value) which would otherwise
+            # silently default to 0 and forward a bodyless request,
+            # masking malformed-client bugs the rest of this hardening
+            # was meant to surface. Cap raw length at 20 chars (room
+            # for 16 MiB = 8 digits, leaves margin); longer values are
+            # rejected before ``int()`` runs to avoid Python's
+            # ``ValueError("Exceeds the limit (4300) for integer
+            # string conversion")`` on adversarial input.
+            if content_length_count == 1:
+                cl_raw = headers["content-length"].strip()
+                if not _CONTENT_LENGTH_RE.fullmatch(cl_raw) or len(cl_raw) > 20:
+                    await self._write_error(writer, 400)
+                    return
+                content_length = int(cl_raw)
+            else:
+                content_length = 0
             if content_length > self._MAX_BODY_BYTES:
                 await self._write_error(writer, 413)
                 return
@@ -440,9 +468,21 @@ class FaultProxy:
                     )
                 writer.write(b"\r\n")
                 started_response = True
-                async for chunk in resp.aiter_raw():
-                    writer.write(chunk)
-                    await writer.drain()
+                try:
+                    async for chunk in resp.aiter_raw():
+                        writer.write(chunk)
+                        await writer.drain()
+                except (ConnectionError, BrokenPipeError):
+                    # Client of the proxy disconnected mid-stream.
+                    # Without explicitly aclose'ing the upstream
+                    # response, httpx may keep downloading from
+                    # Ollama until its read timeout fires (5 min) —
+                    # saturating Ollama's connection pool across
+                    # many failed-mid-stream requests. Close the
+                    # response promptly so the upstream socket
+                    # returns to the pool.
+                    await resp.aclose()
+                    return
         except httpx.HTTPError:
             if started_response:
                 # Already streaming to client — closing the writer
@@ -465,7 +505,12 @@ class FaultProxy:
     async def _write_json(
         writer: asyncio.StreamWriter, status: int, body: bytes
     ) -> None:
-        reason = _REASON_PHRASES.get(status, b"OK")
+        # Reason phrase fallback: "OK" for 2xx and "Error" for any
+        # 4xx/5xx the dict doesn't cover. Without this, an unmapped
+        # 503 from a future caller would emit "HTTP/1.1 503 OK" —
+        # the same wrong-reason class Q5 was supposed to fix.
+        default = b"OK" if status < 400 else b"Error"
+        reason = _REASON_PHRASES.get(status, default)
         writer.write(f"HTTP/1.1 {status} ".encode() + reason + b"\r\n")
         writer.write(b"Connection: close\r\n")
         writer.write(b"Content-Type: application/json\r\n")
