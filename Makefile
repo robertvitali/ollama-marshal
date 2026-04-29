@@ -3,6 +3,7 @@
 install-dev:
 	uv pip install -e ".[dev]"
 	pre-commit install
+	pre-commit install --hook-type pre-push
 
 test:
 	pytest tests/ --ignore=tests/test_integration.py
