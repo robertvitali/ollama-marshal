@@ -6,10 +6,10 @@ install-dev:
 	pre-commit install --hook-type pre-push
 
 test:
-	pytest tests/ --ignore=tests/test_integration.py
+	pytest tests/ --ignore=tests/integration
 
 test-integration:
-	pytest tests/test_integration.py -m integration -v
+	pytest tests/integration/ -m integration -v
 
 lint:
 	ruff check src/ tests/

@@ -387,6 +387,50 @@ FastAPI auto-generates Swagger UI and the OpenAPI spec:
 }
 ```
 
+## Running integration tests locally (v0.5.0+)
+
+Marshal ships with an opt-in integration test suite under
+`tests/integration/` that exercises end-to-end behavior against your
+real Ollama. These tests load and unload real models, fire chat
+requests through marshal's full pipeline, and validate the v0.4.0
+surfaces (retry, fail-fast, num_ctx, audit log, marshal doctor) plus
+all of the memory-handling correctness invariants (preload tracking,
+reload-on-need, drain-before-evict, unexpected-unload detection).
+
+**Prerequisites:**
+
+```bash
+# Pull the smallest required model (≈1.6 GB)
+ollama pull qwen3.5:0.8b-bf16
+
+# Optional: also pull the bin-packing test's second model
+ollama pull qwen3.5:0.8b-q8_0
+```
+
+**Recommended: stop your running marshal first.** The integration
+tests spawn their own marshal app in-process via FastAPI's
+`ASGITransport`, but they share the same Ollama backend at
+`localhost:11434`. If your live marshal is also using Ollama, the
+test marshal's eviction logic can fight with the live marshal's
+preserved-model `keep_alive` and a few tests skip with a clear
+"stop your marshal first" message.
+
+```bash
+# Stop your running marshal (macOS launchd)
+launchctl bootout gui/$UID/com.ollama-marshal 2>/dev/null
+
+# Run the integration suite (~60-90s)
+make test-integration
+
+# Restart marshal afterwards
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.ollama-marshal.plist
+```
+
+**The integration suite never runs in default CI.** It needs a
+running Ollama with specific models pulled — neither is available
+on a stock GitHub Actions runner. The default `make test` and CI
+test job both ignore `tests/integration/`.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and
