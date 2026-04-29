@@ -1,0 +1,234 @@
+"""Shared fixtures for the integration test suite.
+
+Integration tests run a real marshal app in-process via FastAPI's
+``httpx.ASGITransport`` and ``asgi-lifespan``'s ``LifespanManager``. The
+app talks to the user's actual Ollama at ``localhost:11434``. No
+uvicorn subprocess. No mocks at the HTTP boundary.
+
+Each test gets isolated state via per-test temp directories for
+registry/audit/metrics paths. Test envelopes ride at CRITICAL priority
+by default (program_id ``integration-test``); tests that specifically
+need normal-priority behavior (e.g. drain-before-evict) opt in to
+``integration-test-normal``.
+
+If Ollama isn't reachable on :11434, every test in this directory
+SKIPs cleanly via the module-level ``pytestmark`` set in each test
+file. See ``CLAUDE.md`` Testing Rules for the integration-suite
+conventions.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+from asgi_lifespan import LifespanManager
+
+from ollama_marshal.config import (
+    AuditConfig,
+    MarshalConfig,
+    MemoryConfig,
+    OllamaConfig,
+    Priority,
+    ProgramConfig,
+    ProxyConfig,
+    SchedulerConfig,
+    ShutdownConfig,
+    ShutdownMode,
+)
+from ollama_marshal.server import create_app
+
+# The smallest model used across the integration suite. ~1.6 GB.
+# Tests that need a different model parametrize the model name
+# explicitly; this is the default for "I just need any model".
+REQUIRED_MODEL = "qwen3.5:0.8b-bf16"
+
+# Default Ollama host the suite expects to be reachable.
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+
+# Program ID conventions — tests use these via the X-Program-ID header.
+# integration-test (critical) is the default; integration-test-normal
+# is for tests of normal-priority paths (drain-before-evict, etc.).
+PROGRAM_CRITICAL = "integration-test"
+PROGRAM_NORMAL = "integration-test-normal"
+
+
+def _ollama_reachable(host: str = DEFAULT_OLLAMA_HOST, timeout: float = 1.0) -> bool:
+    """Return True if Ollama responds to /api/version at ``host``.
+
+    Used as the ``skipif`` condition on every integration test file.
+    Synchronous on purpose — pytestmark needs a value at collection
+    time, before any event loop exists.
+    """
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(f"{host}/api/version")
+            return resp.status_code == 200
+    except (httpx.HTTPError, OSError):
+        return False
+
+
+async def model_pulled(name: str, host: str = DEFAULT_OLLAMA_HOST) -> bool:
+    """Return True if ``name`` appears in /api/tags on the live Ollama."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{host}/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+            return any(m.get("name") == name for m in data.get("models", []))
+    except (httpx.HTTPError, OSError):
+        return False
+
+
+@pytest.fixture
+def tmp_marshal_paths(tmp_path: Path) -> dict[str, Path]:
+    """Per-test temp paths for registry/audit/metrics state.
+
+    Every fixture that builds a ``MarshalConfig`` reads from this so
+    nothing leaks between tests or to the user's home directory.
+    """
+    return {
+        "registry_path": tmp_path / "model_sizes.json",
+        "metadata_path": tmp_path / "model_metadata.json",
+        "audit_path": tmp_path / "audit.jsonl",
+        "metrics_path": tmp_path / "metrics.json",
+    }
+
+
+@pytest.fixture
+def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
+    """Test-tuned MarshalConfig wired to the per-test temp paths.
+
+    Test defaults that differ from production:
+
+    - ``proxy.request_timeout_s = 30`` — bounded so a stuck request
+      surfaces a fast test failure rather than hanging the suite.
+    - ``memory.poll_interval = 1`` — speed up unexpected-unload tests.
+      Real production uses 5s.
+    - ``shutdown.mode = IMMEDIATE``, ``unload_models = True`` — when
+      the lifespan tears down at end of test, every loaded model gets
+      unloaded so the next test starts cold.
+    - ``programs`` pre-populated with two profiles:
+      - ``integration-test`` → CRITICAL (default for all tests)
+      - ``integration-test-normal`` → NORMAL (opt-in for tests of
+        normal-priority paths like drain-before-evict)
+    """
+    return MarshalConfig(
+        ollama=OllamaConfig(host=DEFAULT_OLLAMA_HOST),
+        proxy=ProxyConfig(host="127.0.0.1", port=11436, request_timeout_s=30),
+        memory=MemoryConfig(poll_interval=1),
+        scheduler=SchedulerConfig(
+            metrics_path=str(tmp_marshal_paths["metrics_path"]),
+            metrics_persist_interval_s=3600,  # don't write during tests
+        ),
+        programs={
+            "default": ProgramConfig(),
+            PROGRAM_CRITICAL: ProgramConfig(priority=Priority.CRITICAL),
+            PROGRAM_NORMAL: ProgramConfig(priority=Priority.NORMAL),
+        },
+        shutdown=ShutdownConfig(
+            mode=ShutdownMode.IMMEDIATE,
+            drain_timeout=5,
+            unload_models=True,
+        ),
+        audit=AuditConfig(
+            enabled=False,
+            path=str(tmp_marshal_paths["audit_path"]),
+        ),
+    )
+
+
+@pytest.fixture
+async def marshal_app(
+    marshal_config: MarshalConfig, tmp_marshal_paths: dict[str, Path]
+) -> AsyncIterator[tuple[httpx.AsyncClient, Any]]:
+    """Run a marshal FastAPI app in-process and yield (client, app).
+
+    The app's lifespan starts the scheduler, memory poller, and
+    registry; on teardown it stops them and unloads any models marshal
+    owns (because shutdown.unload_models=True in the test config).
+
+    The yielded client is an httpx.AsyncClient bound to the app via
+    ASGITransport — no real socket. Test code uses it the same way it
+    would use a client against a live marshal:
+
+        async def test_x(marshal_app):
+            client, app = marshal_app
+            r = await client.post("/api/chat", json={...},
+                                  headers={"X-Program-ID": PROGRAM_CRITICAL})
+
+    To inspect marshal's internal state (e.g. ``_allocated_num_ctx``),
+    tests read ``app.state.scheduler``, ``app.state.memory``, and
+    ``app.state.lifecycle`` — which are stashed there during lifespan
+    startup (a small additive production change in server.py).
+
+    The registry path is also wired here via ``app.state.metrics_path``
+    + a side-channel attribute set on the registry after construction;
+    see the ``_attach_paths`` helper below.
+    """
+    app = create_app(marshal_config)
+    # The lifespan reads metrics_path from app.state.metrics_path if set,
+    # falling back to scheduler.metrics_path. We've already set the
+    # scheduler.metrics_path in marshal_config, so this is just belt-
+    # and-suspenders for any future test that needs to override.
+    app.state.metrics_path = tmp_marshal_paths["metrics_path"]
+    # Wire the registry's on-disk paths directly. The registry is
+    # constructed inside lifespan (after we've yielded control), so
+    # we use a startup-time hook via app.state.registry_paths read by
+    # a fixture-side patch. Simplest: the test config already routes
+    # all writeable state to the temp path via metrics_path; the
+    # registry's default ~/.ollama-marshal/* paths still apply but
+    # are read-only-ish and don't pollute production state for
+    # already-pulled models. If a test needs hard isolation, it
+    # patches ModelRegistry directly.
+
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        LifespanManager(app),
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
+    ):
+        yield client, app
+
+
+@pytest.fixture
+def critical_headers() -> dict[str, str]:
+    """Default headers for tests — critical priority program ID."""
+    return {"X-Program-ID": PROGRAM_CRITICAL}
+
+
+@pytest.fixture
+def normal_headers() -> dict[str, str]:
+    """Headers for tests that specifically need normal priority.
+
+    Used by drain-before-evict tests where critical priority would
+    preempt the eviction path and defeat the assertion.
+    """
+    return {"X-Program-ID": PROGRAM_NORMAL}
+
+
+async def wait_for(
+    condition: Any,
+    *,
+    timeout: float = 10.0,
+    interval: float = 0.1,
+    description: str = "condition",
+) -> None:
+    """Poll ``condition`` (a sync or async callable) until True or timeout.
+
+    Used by tests waiting on async side-effects (model loaded,
+    metric incremented, audit record written). Fails the test with a
+    clear message if the condition doesn't hold within ``timeout``.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        result = condition()
+        if asyncio.iscoroutine(result):
+            result = await result
+        if result:
+            return
+        await asyncio.sleep(interval)
+    pytest.fail(f"timed out after {timeout}s waiting for {description}")
