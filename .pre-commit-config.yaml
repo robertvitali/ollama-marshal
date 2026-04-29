@@ -16,7 +16,10 @@ repos:
       - id: debug-statements
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.5.0
+    # Pin matches the dev environment's ruff (15.x) so the hook doesn't
+    # disagree with `make lint` on rules that changed between versions
+    # (e.g. PT001 fixture parens, TC vs TCH selector renames).
+    rev: v0.15.12
     hooks:
       - id: ruff
         args: [--fix]
