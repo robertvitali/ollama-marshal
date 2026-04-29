@@ -1,8 +1,10 @@
 name: Claude Security Review
 
+# Manual-trigger only — `pull_request` was removed to stop burning
+# Anthropic API tokens on every PR. Run from the Actions UI with the
+# PR's branch name when you specifically want a security pass.
 on:
-  pull_request:
-    types: [opened, synchronize]
+  workflow_dispatch:
 
 permissions:
   contents: read

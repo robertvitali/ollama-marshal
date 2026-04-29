@@ -1,8 +1,17 @@
 name: Claude Code Review
 
+# Manual-trigger only — `pull_request` was removed to stop burning
+# Anthropic API tokens on every PR. Use one of:
+#   1. Comment `@claude` on a PR (issue_comment trigger below)
+#   2. Workflow Dispatch from the Actions UI with the PR number
+#   3. Run `/review` locally (cheaper, often more thorough — see CLAUDE.md)
 on:
-  pull_request:
-    types: [opened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+        type: string
   issue_comment:
     types: [created]
 
@@ -15,7 +24,7 @@ permissions:
 jobs:
   review:
     if: |
-      (github.event_name == 'pull_request') ||
+      (github.event_name == 'workflow_dispatch') ||
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude'))
     runs-on: ubuntu-latest
     steps:
@@ -45,7 +54,7 @@ jobs:
           show_full_output: true
           prompt: |
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR NUMBER: ${{ github.event.inputs.pr_number || github.event.issue.number }}
 
             Review this PR against CLAUDE.md (the project's living rulebook).
             Focus your review on:
