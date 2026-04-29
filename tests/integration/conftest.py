@@ -168,25 +168,18 @@ async def marshal_app(
     ``app.state.lifecycle`` — which are stashed there during lifespan
     startup (a small additive production change in server.py).
 
-    The registry path is also wired here via ``app.state.metrics_path``
-    + a side-channel attribute set on the registry after construction;
-    see the ``_attach_paths`` helper below.
+    Registry/metrics paths are wired through ``app.state.*`` attributes
+    that the lifespan reads at startup. Without this, the test marshal
+    would write to ``~/.ollama-marshal/model_sizes.json`` and clobber
+    the user's production-marshal registry cache.
     """
     app = create_app(marshal_config)
-    # The lifespan reads metrics_path from app.state.metrics_path if set,
-    # falling back to scheduler.metrics_path. We've already set the
-    # scheduler.metrics_path in marshal_config, so this is just belt-
-    # and-suspenders for any future test that needs to override.
     app.state.metrics_path = tmp_marshal_paths["metrics_path"]
-    # Wire the registry's on-disk paths directly. The registry is
-    # constructed inside lifespan (after we've yielded control), so
-    # we use a startup-time hook via app.state.registry_paths read by
-    # a fixture-side patch. Simplest: the test config already routes
-    # all writeable state to the temp path via metrics_path; the
-    # registry's default ~/.ollama-marshal/* paths still apply but
-    # are read-only-ish and don't pollute production state for
-    # already-pulled models. If a test needs hard isolation, it
-    # patches ModelRegistry directly.
+    # Isolate the on-disk registry caches per test (regression fix from
+    # the v0.5.0 /review — without this, integration tests pollute the
+    # user's production-marshal cache at ~/.ollama-marshal/).
+    app.state.registry_path = tmp_marshal_paths["registry_path"]
+    app.state.metadata_path = tmp_marshal_paths["metadata_path"]
 
     transport = httpx.ASGITransport(app=app)
     async with (

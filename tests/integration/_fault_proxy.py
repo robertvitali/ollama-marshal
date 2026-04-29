@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import socket
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -102,6 +101,7 @@ class FaultProxy:
         self._queues: dict[str, deque[_Spec]] = defaultdict(deque)
         self._server: asyncio.base_events.Server | None = None
         self._port: int = 0
+        self._client: httpx.AsyncClient | None = None
 
     # -- public API ---------------------------------------------------
 
@@ -140,22 +140,28 @@ class FaultProxy:
     # -- lifecycle ----------------------------------------------------
 
     async def _start(self) -> None:
-        """Bind to an ephemeral port and start accepting connections."""
-        # Reserve a free port. We bind, read, close, then start the
-        # asyncio server on the same port. Tiny race window but
-        # acceptable for test infrastructure.
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            self._port = sock.getsockname()[1]
-        self._server = await asyncio.start_server(
-            self._handle_client, "127.0.0.1", self._port
-        )
+        """Bind to an ephemeral port and start accepting connections.
+
+        Atomic: ``start_server(port=0)`` lets the OS pick a free port,
+        then we read it back from the bound socket. No bind/close/rebind
+        race window where another process could steal the port.
+        """
+        self._server = await asyncio.start_server(self._handle_client, "127.0.0.1", 0)
+        # `sockets[0]` always exists for a listening server.
+        self._port = self._server.sockets[0].getsockname()[1]
+        # Single shared upstream client — pooled connections, much
+        # faster than opening a new TCP session per forwarded request
+        # (matters for retry tests that fire 99 sequential requests).
+        self._client = httpx.AsyncClient(timeout=300)
 
     async def _stop(self) -> None:
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     # -- request handling --------------------------------------------
 
@@ -189,17 +195,29 @@ class FaultProxy:
             return spec
         return None
 
+    # Cap on request body size. 16 MiB is plenty for /api/chat
+    # message arrays even at huge num_ctx; rejects malformed
+    # Content-Length values that would otherwise OOM-allocate.
+    _MAX_BODY_BYTES = 16 * 1024 * 1024
+
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        """Per-connection handler. One request → one response → close."""
+        """Per-connection handler. One request → one response → close.
+
+        Catches malformed-request exceptions silently to keep test
+        output clean (asyncio's "Task exception was never retrieved"
+        noise from `IncompleteReadError`/`UnicodeDecodeError`/
+        `ValueError` would otherwise pollute every test run with a
+        slightly-misbehaving client).
+        """
         try:
             request_line = await reader.readline()
             if not request_line:
                 return
             try:
                 method, path, _version = request_line.decode().split(" ", 2)
-            except ValueError:
+            except (ValueError, UnicodeDecodeError):
                 return
 
             # Read headers until empty line.
@@ -208,12 +226,26 @@ class FaultProxy:
                 line = await reader.readline()
                 if not line or line in (b"\r\n", b"\n"):
                     break
-                key, _, val = line.decode().partition(":")
+                try:
+                    key, _, val = line.decode().partition(":")
+                except UnicodeDecodeError:
+                    return
                 headers[key.strip().lower()] = val.strip()
 
-            # Read body if Content-Length is set.
-            content_length = int(headers.get("content-length", "0") or "0")
-            body = await reader.readexactly(content_length) if content_length else b""
+            # Read body if Content-Length is set. Cap to prevent OOM on
+            # malformed/adversarial Content-Length headers.
+            try:
+                content_length = int(headers.get("content-length", "0") or "0")
+            except ValueError:
+                return
+            if content_length < 0 or content_length > self._MAX_BODY_BYTES:
+                return
+            try:
+                body = (
+                    await reader.readexactly(content_length) if content_length else b""
+                )
+            except asyncio.IncompleteReadError:
+                return
 
             spec = self._next_spec(path)
             if spec is None:
@@ -229,6 +261,9 @@ class FaultProxy:
                 await self._forward(method, path, headers, body, writer)
             elif isinstance(spec, _FakeSpec):
                 await self._write_json(writer, 200, spec.body)
+        except (ConnectionError, BrokenPipeError):
+            # Client closed mid-handler. Nothing actionable; stay quiet.
+            pass
         finally:
             try:
                 writer.close()
@@ -246,21 +281,37 @@ class FaultProxy:
     ) -> None:
         """Pass through to the real Ollama and stream the response back."""
         url = f"{self._upstream}{path}"
-        # Drop hop-by-hop headers + host (httpx sets its own).
-        forward_headers = {
-            k: v
-            for k, v in headers.items()
-            if k not in ("host", "content-length", "connection")
+        # Drop hop-by-hop headers + host (httpx sets its own). The
+        # full hop-by-hop list per RFC 7230 §6.1 — leaking these from
+        # client to upstream can break keep-alive negotiation.
+        hop_by_hop = {
+            "host",
+            "content-length",
+            "connection",
+            "transfer-encoding",
+            "upgrade",
+            "proxy-connection",
+            "te",
+            "keep-alive",
+            "trailer",
         }
+        forward_headers = {k: v for k, v in headers.items() if k not in hop_by_hop}
         try:
-            async with (
-                httpx.AsyncClient(timeout=300) as client,
-                client.stream(
-                    method, url, headers=forward_headers, content=body
-                ) as resp,
-            ):
+            assert self._client is not None, "fault proxy not started"
+            async with self._client.stream(
+                method, url, headers=forward_headers, content=body
+            ) as resp:
                 # Write status line + headers (close-delimited body).
-                writer.write(f"HTTP/1.1 {resp.status_code} OK\r\n".encode())
+                # Use the upstream's actual reason phrase rather than
+                # a stock "OK" — a forwarded 503 should read
+                # "HTTP/1.1 503 Service Unavailable", not
+                # "HTTP/1.1 503 OK". Some lenient parsers tolerate
+                # the wrong reason but it can mask retry-test bugs.
+                reason = (
+                    resp.reason_phrase
+                    or _REASON_PHRASES.get(resp.status_code, b"OK").decode()
+                )
+                writer.write(f"HTTP/1.1 {resp.status_code} {reason}\r\n".encode())
                 writer.write(b"Connection: close\r\n")
                 # Forward content-type so client parses correctly.
                 if "content-type" in resp.headers:

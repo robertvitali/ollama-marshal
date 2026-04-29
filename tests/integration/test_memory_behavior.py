@@ -482,10 +482,37 @@ async def test_failed_preload_writes_sentinel_allocation(marshal_app, cleanup_mo
     — the proxy can't easily distinguish unload's POST /api/generate
     from preload's POST /api/generate by path alone. This is a
     targeted test of the scheduler's defensive sentinel logic.
+
+    NOTE: this test deliberately patches an internal of the scheduler's
+    lifecycle handle. Unlike the unit-suite Bright-line #1 rule (which
+    bans mocking ``ollama_marshal.*`` to test the logic of the thing
+    being mocked), here we are injecting a controlled failure at the
+    Ollama HTTP boundary — the scheduler's code under test is
+    ``_ensure_model_loaded``, which calls preload. It's the
+    scheduler's response to the failure we care about, not preload
+    itself. The fault proxy's path-prefix matching can't distinguish
+    ``unload`` (POST /api/generate with keep_alive=0) from ``preload``
+    (POST /api/generate with options.num_ctx) cleanly, so this is the
+    honest abstraction.
     """
     client, app = marshal_app
     cleanup_models.append(REQUIRED_MODEL)
     scheduler = app.state.scheduler
+
+    # Start cold: unload any prior load (from a previous test's
+    # marshal instance) via direct Ollama call so this test's marshal
+    # is the one that records the initial allocation.
+    async with httpx.AsyncClient(timeout=10.0) as direct:
+        await direct.post(
+            f"{DEFAULT_OLLAMA_HOST}/api/generate",
+            json={"model": REQUIRED_MODEL, "prompt": "", "keep_alive": "0"},
+        )
+    # Wait for memory to observe the unload before continuing.
+    await wait_for(
+        lambda: not app.state.memory.is_loaded(REQUIRED_MODEL),
+        timeout=10,
+        description="initial cold state",
+    )
 
     # Initial load at a small slot.
     await _trigger_load(client, REQUIRED_MODEL, num_ctx=4096)
