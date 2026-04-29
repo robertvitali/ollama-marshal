@@ -31,13 +31,13 @@ from ollama_marshal.config import (
     ShutdownConfig,
     ShutdownMode,
 )
-from ollama_marshal.server import create_app
 from tests.integration._fault_proxy import fault_proxy
 from tests.integration.conftest import (
     DEFAULT_OLLAMA_HOST,
     PROGRAM_CRITICAL,
     REQUIRED_MODEL,
     _ollama_reachable,
+    make_test_app,
 )
 
 pytestmark = [
@@ -101,7 +101,7 @@ def _read_jsonl(path) -> list[dict]:
 async def test_request_served_events_recorded(tmp_marshal_paths):
     """5 successful requests → 5 ``request.served`` records with correct fields."""
     cfg = _build_config(tmp_paths=tmp_marshal_paths, ollama_host=DEFAULT_OLLAMA_HOST)
-    app = create_app(cfg)
+    app = make_test_app(cfg, tmp_marshal_paths)
     transport = httpx.ASGITransport(app=app)
     async with (
         LifespanManager(app),
@@ -141,7 +141,7 @@ async def test_no_prompt_content_in_audit_records(tmp_marshal_paths):
     refactor.
     """
     cfg = _build_config(tmp_paths=tmp_marshal_paths, ollama_host=DEFAULT_OLLAMA_HOST)
-    app = create_app(cfg)
+    app = make_test_app(cfg, tmp_marshal_paths)
     transport = httpx.ASGITransport(app=app)
     async with (
         LifespanManager(app),
@@ -177,7 +177,7 @@ async def test_request_failed_event_on_error(tmp_marshal_paths):
         # Disable retry so the disconnect surfaces as a request.failed
         # event without retry budget changing anything.
         cfg.retry = RetryConfig(enabled=False)
-        app = create_app(cfg)
+        app = make_test_app(cfg, tmp_marshal_paths)
         transport = httpx.ASGITransport(app=app)
         async with (
             LifespanManager(app),
@@ -192,8 +192,15 @@ async def test_request_failed_event_on_error(tmp_marshal_paths):
                 "options": {"num_predict": 4},
             }
             resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=10)
-            # Disconnect → marshal surfaces as 502 (proxy_error).
-            assert resp.status_code in (502, 504)
+            # Disconnect → marshal surfaces as 502 Bad Gateway. (Not 504,
+            # which would imply a timeout — the connection actually
+            # FAILED here, so 502 is the right code. /review tightened
+            # this from `in (502, 504)` to exact 502 to catch any
+            # future bug where marshal returns 504 for a hard
+            # disconnect.)
+            assert resp.status_code == 502, (
+                f"expected 502 for disconnect, got {resp.status_code}"
+            )
             await asyncio.sleep(0.5)
 
     records = _read_jsonl(tmp_marshal_paths["audit_path"])

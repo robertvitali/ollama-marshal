@@ -3,7 +3,7 @@
 Validates that marshal's num_ctx injection actually flows through to
 Ollama's slot allocation. We can't easily peek at what marshal sent
 on the wire, but we can read the resulting allocated slot via
-``app.state.memory.get_allocated_num_ctx(model)`` — that's the value
+``app.state._marshal_internals.memory.get_allocated_num_ctx(model)`` — that's the value
 marshal told ``lifecycle.preload`` to use, which is the value Ollama
 allocated.
 """
@@ -80,11 +80,16 @@ async def test_short_prompt_gets_smallest_boundary(marshal_app):
     client, app = marshal_app
     await _fire_chat(client, prompt="hi")
     await wait_for(
-        lambda: app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL) is not None,
+        lambda: (
+            app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL)
+            is not None
+        ),
         timeout=15,
         description="allocation recorded",
     )
-    allocated = app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL)
+    allocated = app.state._marshal_internals.memory.get_allocated_num_ctx(
+        REQUIRED_MODEL
+    )
     assert allocated == 8192, (
         f"expected 8192 for short prompt, got {allocated}. "
         f"Verify _resolve_num_ctx_decision rounds prompt+budget+safety "
@@ -102,11 +107,16 @@ async def test_long_prompt_gets_larger_boundary(marshal_app):
     client, app = marshal_app
     await _fire_chat(client, prompt="x" * 50_000)
     await wait_for(
-        lambda: app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL) is not None,
+        lambda: (
+            app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL)
+            is not None
+        ),
         timeout=15,
         description="allocation recorded",
     )
-    allocated = app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL)
+    allocated = app.state._marshal_internals.memory.get_allocated_num_ctx(
+        REQUIRED_MODEL
+    )
     assert allocated == 32768, f"expected 32768 for 50K-char prompt, got {allocated}"
 
 
@@ -123,20 +133,26 @@ async def test_client_num_ctx_clamped_to_model_max(marshal_app):
     # should bring 999_999_999 down to 262144.
     await _fire_chat(client, prompt="hi", num_ctx=999_999_999)
     await wait_for(
-        lambda: app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL) is not None,
+        lambda: (
+            app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL)
+            is not None
+        ),
         timeout=30,
         description="allocation recorded after clamp",
     )
-    allocated = app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL)
+    allocated = app.state._marshal_internals.memory.get_allocated_num_ctx(
+        REQUIRED_MODEL
+    )
     # Must be <= model max, NOT the absurd input value.
-    meta = app.state.registry.get_metadata(REQUIRED_MODEL)
+    meta = app.state._marshal_internals.registry.get_metadata(REQUIRED_MODEL)
     assert meta is not None, "registry never probed model metadata"
     assert allocated == meta.max_context_length, (
         f"expected clamp to model max ({meta.max_context_length}), "
         f"got {allocated}. The trust-boundary clamp didn't fire."
     )
     # And no reload loop — reload_count should be 0 or 1, NOT growing.
-    assert app.state.scheduler.metrics.reload_count <= 1, (
-        f"reload_count grew to {app.state.scheduler.metrics.reload_count} "
+    reload_count = app.state._marshal_internals.scheduler.metrics.reload_count
+    assert reload_count <= 1, (
+        f"reload_count grew to {reload_count} "
         f"— suggests the clamp failed and we entered a reload loop."
     )

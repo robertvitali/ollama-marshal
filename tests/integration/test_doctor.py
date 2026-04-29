@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 
 import httpx
 import pytest
@@ -32,6 +33,11 @@ def test_doctor_cli_produces_recommendations():
     - Output mentions OLLAMA_FLASH_ATTENTION=1 (always-on recommendation)
     - Output mentions OLLAMA_NUM_PARALLEL=<n> (computed)
     - "Models installed: N" matches the actual /api/tags count
+
+    Uses ``sys.executable -m ollama_marshal`` rather than the
+    PATH-installed ``ollama-marshal`` so the test always exercises the
+    branch's code, not whatever stale CLI happens to be installed
+    system-wide. (Caught by /codex review on PR #9.)
     """
     # Get the actual model count for cross-checking.
     with httpx.Client(timeout=5.0) as client:
@@ -39,16 +45,8 @@ def test_doctor_cli_produces_recommendations():
         resp.raise_for_status()
         actual_count = len(resp.json().get("models", []))
 
-    # Find the absolute path to ollama-marshal in this venv (avoids
-    # shell PATH lookup, which ruff S607 flags as risky for portability).
-    import shutil
-
-    marshal_bin = shutil.which("ollama-marshal")
-    assert marshal_bin is not None, (
-        "ollama-marshal CLI not on PATH; install with `make install-dev`"
-    )
-    result = subprocess.run(  # noqa: S603 — fully-resolved path, hardcoded args
-        [marshal_bin, "doctor"],
+    result = subprocess.run(
+        [sys.executable, "-m", "ollama_marshal", "doctor"],
         capture_output=True,
         text=True,
         timeout=120,

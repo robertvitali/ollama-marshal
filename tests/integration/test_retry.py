@@ -27,12 +27,12 @@ from ollama_marshal.config import (
     ShutdownConfig,
     ShutdownMode,
 )
-from ollama_marshal.server import create_app
 from tests.integration._fault_proxy import fault_proxy
 from tests.integration.conftest import (
     PROGRAM_CRITICAL,
     REQUIRED_MODEL,
     _ollama_reachable,
+    make_test_app,
 )
 
 pytestmark = [
@@ -101,7 +101,7 @@ async def test_connect_error_retry_succeeds(tmp_marshal_paths):
         cfg = _build_marshal_config(
             proxy_url=proxy.url, tmp_paths=tmp_marshal_paths, max_attempts=3
         )
-        app = create_app(cfg)
+        app = make_test_app(cfg, tmp_marshal_paths)
         transport = httpx.ASGITransport(app=app)
         async with (
             LifespanManager(app),
@@ -117,7 +117,7 @@ async def test_connect_error_retry_succeeds(tmp_marshal_paths):
             }
             resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=120)
             assert resp.status_code == 200, resp.text
-            metrics = app.state.scheduler.metrics
+            metrics = app.state._marshal_internals.scheduler.metrics
             # At least 1 retry attempted (the disconnect). Could be more
             # if Ollama itself glitched, but ≥1 is the assertion.
             assert metrics.retries_attempted >= 1, (
@@ -145,7 +145,7 @@ async def test_503_exhausted_not_counted_as_success(tmp_marshal_paths):
         cfg = _build_marshal_config(
             proxy_url=proxy.url, tmp_paths=tmp_marshal_paths, max_attempts=3
         )
-        app = create_app(cfg)
+        app = make_test_app(cfg, tmp_marshal_paths)
         transport = httpx.ASGITransport(app=app)
         async with (
             LifespanManager(app),
@@ -162,7 +162,7 @@ async def test_503_exhausted_not_counted_as_success(tmp_marshal_paths):
             resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=120)
             # Marshal forwards the 503 to the client unchanged.
             assert resp.status_code == 503
-            metrics = app.state.scheduler.metrics
+            metrics = app.state._marshal_internals.scheduler.metrics
             # 2 retries attempted (max_attempts - 1).
             assert metrics.retries_attempted == 2, (
                 f"expected 2 retries attempted, got {metrics.retries_attempted}"
@@ -192,7 +192,7 @@ async def test_x_marshal_retry_max_zero_disables_retry(tmp_marshal_paths):
         cfg = _build_marshal_config(
             proxy_url=proxy.url, tmp_paths=tmp_marshal_paths, max_attempts=3
         )
-        app = create_app(cfg)
+        app = make_test_app(cfg, tmp_marshal_paths)
         transport = httpx.ASGITransport(app=app)
         async with (
             LifespanManager(app),
@@ -214,7 +214,7 @@ async def test_x_marshal_retry_max_zero_disables_retry(tmp_marshal_paths):
             assert resp.status_code == 503, (
                 f"expected 503 surfaced unchanged; got {resp.status_code}: {resp.text}"
             )
-            metrics = app.state.scheduler.metrics
+            metrics = app.state._marshal_internals.scheduler.metrics
             # No retries attempted — header overrode the config default.
             assert metrics.retries_attempted == 0, (
                 f"expected 0 retries with header override, "

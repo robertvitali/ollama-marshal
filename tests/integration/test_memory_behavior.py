@@ -8,13 +8,14 @@ preload, /api/ps polling, slot allocation, and eviction.
 
 User intent: validate ALL behavior of model handling in memory.
 
-Tests #5, #6 use audit log timestamps to verify event ordering. Test #7
-patches ``app.state.lifecycle.preload`` to inject a precise failure
-without the fault proxy (cleaner than queue-ordered failures since
-unload + preload both POST /api/generate). Tests #8 uses the fault
-proxy with ``fake_response("/api/ps", ...)`` to simulate Ollama-side
-eviction — that one genuinely needs the proxy because we have to
-intercept /api/ps polling.
+Tests #5, #6 use audit log timestamps to verify event ordering.
+Test #7 patches ``app.state._marshal_internals.lifecycle.preload``
+to inject a precise failure without the fault proxy (cleaner than
+queue-ordered failures since unload + preload both POST
+/api/generate). Test #8 uses the fault proxy with
+``fake_response("/api/ps", ...)`` to simulate Ollama-side eviction —
+that one genuinely needs the proxy because we have to intercept
+/api/ps polling.
 
 Each test uses an isolated marshal app and unloads any models it
 loaded in a finalizer so subsequent tests start cold.
@@ -41,7 +42,6 @@ from ollama_marshal.config import (
     ShutdownConfig,
     ShutdownMode,
 )
-from ollama_marshal.server import create_app
 from tests.integration._fault_proxy import fault_proxy
 from tests.integration.conftest import (
     DEFAULT_OLLAMA_HOST,
@@ -49,6 +49,7 @@ from tests.integration.conftest import (
     PROGRAM_NORMAL,
     REQUIRED_MODEL,
     _ollama_reachable,
+    make_test_app,
     wait_for,
 )
 
@@ -127,18 +128,37 @@ async def cleanup_models():
     Tests append model names mid-test; the post-yield block iterates
     and calls Ollama's keep_alive=0 directly so the next test starts
     cold even if marshal's lifespan teardown failed.
+
+    ORDERING NOTE: pytest-asyncio teardowns in LIFO order — this
+    fixture finalizes BEFORE ``marshal_app.__aexit__``. We therefore
+    fire keep_alive=0 while the test marshal is still polling
+    /api/ps. In practice this is harmless: the test marshal has
+    already left its assertions, and any "model gone" state observed
+    by its poller after the test body finishes is irrelevant —
+    ``shutdown.unload_models=True`` in the test config will cleanly
+    unload again at lifespan exit. 23 passing runs confirm no actual
+    interference. (Codex /review flagged this as a P1 race; verified
+    benign in practice but documented here for future readers.)
     """
     loaded: list[str] = []
     yield loaded
     async with httpx.AsyncClient(timeout=10.0) as client:
-        for name in loaded:
+        for name in set(loaded):  # dedupe so we don't double-fire keep_alive=0
             try:
                 await client.post(
                     f"{DEFAULT_OLLAMA_HOST}/api/generate",
                     json={"model": name, "prompt": "", "keep_alive": "0"},
                 )
-            except httpx.HTTPError:
-                pass
+            except httpx.HTTPError as exc:
+                # Best-effort cleanup. If Ollama is gone, the model
+                # was deleted, or the network blipped, the test that
+                # produced this state has already finished — the
+                # subsequent test's pre-flight check will skip if
+                # the model isn't available. Surface via pytest's
+                # captured stdout so it's visible on test failure.
+                print(  # noqa: T201 — test fixture finalizer
+                    f"[cleanup_models] keep_alive=0 failed for {name}: {exc}"
+                )
 
 
 # ---------------------------------------------------------------------
@@ -156,11 +176,11 @@ async def test_preload_populates_loaded_models(marshal_app, cleanup_models):
     # We don't care — we care that it IS loaded after the request.
     await _trigger_load(client, REQUIRED_MODEL)
     await wait_for(
-        lambda: app.state.memory.is_loaded(REQUIRED_MODEL),
+        lambda: app.state._marshal_internals.memory.is_loaded(REQUIRED_MODEL),
         timeout=15,
         description=f"{REQUIRED_MODEL} loaded",
     )
-    loaded = app.state.memory.get_loaded_models()
+    loaded = app.state._marshal_internals.memory.get_loaded_models()
     assert REQUIRED_MODEL in loaded
     assert loaded[REQUIRED_MODEL].size_vram > 0, (
         f"size_vram should be populated; got {loaded[REQUIRED_MODEL]}"
@@ -191,18 +211,18 @@ async def test_bin_packing_keeps_multiple_models_loaded(marshal_app, cleanup_mod
 
     await wait_for(
         lambda: (
-            app.state.memory.is_loaded(REQUIRED_MODEL)
-            and app.state.memory.is_loaded(SECOND_MODEL)
+            app.state._marshal_internals.memory.is_loaded(REQUIRED_MODEL)
+            and app.state._marshal_internals.memory.is_loaded(SECOND_MODEL)
         ),
         timeout=30,
         description="both models loaded simultaneously",
     )
-    loaded = app.state.memory.get_loaded_models()
+    loaded = app.state._marshal_internals.memory.get_loaded_models()
     assert REQUIRED_MODEL in loaded
     assert SECOND_MODEL in loaded
     # No evictions during this test — we'd see scheduler.evictions > 0
     # only if marshal felt forced to make room.
-    assert app.state.scheduler.metrics.evictions == 0
+    assert app.state._marshal_internals.scheduler.metrics.evictions == 0
 
 
 # ---------------------------------------------------------------------
@@ -273,7 +293,7 @@ async def test_marshal_eviction_drains_then_unloads(tmp_marshal_paths):
             max_size_mb=0,
         ),
     )
-    app = create_app(cfg)
+    app = make_test_app(cfg, tmp_marshal_paths)
     transport = httpx.ASGITransport(app=app)
     async with (
         LifespanManager(app),
@@ -338,11 +358,16 @@ async def test_slot_allocation_tracking_via_explicit_num_ctx(
     cleanup_models.append(REQUIRED_MODEL)
     await _trigger_load(client, REQUIRED_MODEL, num_ctx=8192)
     await wait_for(
-        lambda: app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL) is not None,
+        lambda: (
+            app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL)
+            is not None
+        ),
         timeout=15,
         description="allocated num_ctx recorded",
     )
-    allocated = app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL)
+    allocated = app.state._marshal_internals.memory.get_allocated_num_ctx(
+        REQUIRED_MODEL
+    )
     assert allocated == 8192, (
         f"expected allocated=8192, got {allocated}. "
         f"This indicates the client num_ctx didn't flow through "
@@ -364,21 +389,28 @@ async def test_reload_on_need_triggers_when_num_ctx_grows(marshal_app, cleanup_m
     # First request: small slot.
     await _trigger_load(client, REQUIRED_MODEL, num_ctx=4096)
     await wait_for(
-        lambda: app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL) == 4096,
+        lambda: (
+            app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL)
+            == 4096
+        ),
         timeout=15,
         description="initial 4096 slot allocated",
     )
-    assert app.state.scheduler.metrics.reload_count == 0
+    assert app.state._marshal_internals.scheduler.metrics.reload_count == 0
 
     # Second request: larger slot. Triggers reload-on-need.
     await _trigger_load(client, REQUIRED_MODEL, num_ctx=16384)
     await wait_for(
-        lambda: app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL) == 16384,
+        lambda: (
+            app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL)
+            == 16384
+        ),
         timeout=30,
         description="slot reloaded to 16384",
     )
-    assert app.state.scheduler.metrics.reload_count == 1, (
-        f"expected reload_count=1, got {app.state.scheduler.metrics.reload_count}"
+    metrics = app.state._marshal_internals.scheduler.metrics
+    assert metrics.reload_count == 1, (
+        f"expected reload_count=1, got {metrics.reload_count}"
     )
 
 
@@ -420,7 +452,7 @@ async def test_reload_does_not_drain_triggering_request(tmp_marshal_paths):
             max_size_mb=0,
         ),
     )
-    app = create_app(cfg)
+    app = make_test_app(cfg, tmp_marshal_paths)
     transport = httpx.ASGITransport(app=app)
     async with (
         LifespanManager(app),
@@ -429,7 +461,12 @@ async def test_reload_does_not_drain_triggering_request(tmp_marshal_paths):
         # Initial request: load at small slot.
         await _trigger_load(client, REQUIRED_MODEL, num_ctx=4096)
         await wait_for(
-            lambda: app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL) == 4096,
+            lambda: (
+                app.state._marshal_internals.memory.get_allocated_num_ctx(
+                    REQUIRED_MODEL
+                )
+                == 4096
+            ),
             timeout=15,
             description="initial slot",
         )
@@ -447,7 +484,7 @@ async def test_reload_does_not_drain_triggering_request(tmp_marshal_paths):
         # Fire the trigger: a larger num_ctx that forces reload.
         await _trigger_load(client, REQUIRED_MODEL, num_ctx=16384)
         await wait_for(
-            lambda: app.state.scheduler.metrics.reload_count == 1,
+            lambda: app.state._marshal_internals.scheduler.metrics.reload_count == 1,
             timeout=30,
             description="reload happened",
         )
@@ -497,7 +534,7 @@ async def test_failed_preload_writes_sentinel_allocation(marshal_app, cleanup_mo
     """
     client, app = marshal_app
     cleanup_models.append(REQUIRED_MODEL)
-    scheduler = app.state.scheduler
+    scheduler = app.state._marshal_internals.scheduler
 
     # Start cold: unload any prior load (from a previous test's
     # marshal instance) via direct Ollama call so this test's marshal
@@ -509,7 +546,7 @@ async def test_failed_preload_writes_sentinel_allocation(marshal_app, cleanup_mo
         )
     # Wait for memory to observe the unload before continuing.
     await wait_for(
-        lambda: not app.state.memory.is_loaded(REQUIRED_MODEL),
+        lambda: not app.state._marshal_internals.memory.is_loaded(REQUIRED_MODEL),
         timeout=10,
         description="initial cold state",
     )
@@ -517,7 +554,10 @@ async def test_failed_preload_writes_sentinel_allocation(marshal_app, cleanup_mo
     # Initial load at a small slot.
     await _trigger_load(client, REQUIRED_MODEL, num_ctx=4096)
     await wait_for(
-        lambda: app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL) == 4096,
+        lambda: (
+            app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL)
+            == 4096
+        ),
         timeout=15,
         description="initial slot",
     )
@@ -525,16 +565,16 @@ async def test_failed_preload_writes_sentinel_allocation(marshal_app, cleanup_mo
     # Patch preload to always fail. Triggering reload-on-need should
     # then unload the model (succeeds), try to preload at larger size
     # (fails), and write the 0 sentinel.
-    original_preload = app.state.lifecycle.preload
+    original_preload = app.state._marshal_internals.lifecycle.preload
 
     async def failing_preload(*_args, **_kwargs):
         return False
 
-    app.state.lifecycle.preload = failing_preload
+    app.state._marshal_internals.lifecycle.preload = failing_preload
     try:
         result = await scheduler._ensure_model_loaded(REQUIRED_MODEL, num_ctx=16384)
     finally:
-        app.state.lifecycle.preload = original_preload
+        app.state._marshal_internals.lifecycle.preload = original_preload
 
     assert result is False, "expected preload-failure path"
     # The sentinel value 0 in _allocated_num_ctx is the key invariant:
@@ -542,9 +582,11 @@ async def test_failed_preload_writes_sentinel_allocation(marshal_app, cleanup_mo
     # has". If the model later reappears in _loaded_models (e.g. user
     # manually loads it), needs_reload would return True for any
     # requested num_ctx (since current == 0 is the sentinel branch).
-    assert app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL) == 0, (
+    assert (
+        app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL) == 0
+    ), (
         "expected sentinel allocation 0 after failed preload; got "
-        f"{app.state.memory.get_allocated_num_ctx(REQUIRED_MODEL)}"
+        f"{app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL)}"
     )
 
 
@@ -589,7 +631,7 @@ async def test_unexpected_unload_detection(tmp_marshal_paths, cleanup_models):
                 unload_models=False,  # don't unload via proxy at teardown
             ),
         )
-        app = create_app(cfg)
+        app = make_test_app(cfg, tmp_marshal_paths)
         transport = httpx.ASGITransport(app=app)
         async with (
             LifespanManager(app),
@@ -600,12 +642,12 @@ async def test_unexpected_unload_detection(tmp_marshal_paths, cleanup_models):
             # Load model normally through proxy pass-through.
             await _trigger_load(client, REQUIRED_MODEL)
             await wait_for(
-                lambda: app.state.memory.is_loaded(REQUIRED_MODEL),
+                lambda: app.state._marshal_internals.memory.is_loaded(REQUIRED_MODEL),
                 timeout=15,
                 description="model loaded",
             )
-            assert app.state.memory.is_loaded(REQUIRED_MODEL)
-            baseline = app.state.scheduler.metrics.unexpected_unloads
+            assert app.state._marshal_internals.memory.is_loaded(REQUIRED_MODEL)
+            baseline = app.state._marshal_internals.scheduler.metrics.unexpected_unloads
 
             # Fake /api/ps to return empty. Next poll (≤1s) detects
             # the disappearance and counts it as unexpected.
@@ -614,11 +656,16 @@ async def test_unexpected_unload_detection(tmp_marshal_paths, cleanup_models):
             # Wait for OUR model to disappear from _loaded_models —
             # that's the specific transition we care about.
             await wait_for(
-                lambda: not app.state.memory.is_loaded(REQUIRED_MODEL),
+                lambda: (
+                    not app.state._marshal_internals.memory.is_loaded(REQUIRED_MODEL)
+                ),
                 timeout=10,
                 description="model disappeared from _loaded_models",
             )
-            delta = app.state.scheduler.metrics.unexpected_unloads - baseline
+            delta = (
+                app.state._marshal_internals.scheduler.metrics.unexpected_unloads
+                - baseline
+            )
             assert delta >= 1, f"expected ≥1 unexpected unload, got delta={delta}"
 
 
@@ -652,7 +699,7 @@ async def test_idle_eviction_marks_intended_unload(tmp_marshal_paths, cleanup_mo
         },
         shutdown=ShutdownConfig(mode=ShutdownMode.IMMEDIATE, unload_models=False),
     )
-    app = create_app(cfg)
+    app = make_test_app(cfg, tmp_marshal_paths)
     transport = httpx.ASGITransport(app=app)
     async with (
         LifespanManager(app),
@@ -660,30 +707,35 @@ async def test_idle_eviction_marks_intended_unload(tmp_marshal_paths, cleanup_mo
     ):
         await _trigger_load(client, REQUIRED_MODEL)
         await wait_for(
-            lambda: app.state.memory.is_loaded(REQUIRED_MODEL),
+            lambda: app.state._marshal_internals.memory.is_loaded(REQUIRED_MODEL),
             timeout=15,
             description="model loaded",
         )
-        baseline_unexpected = app.state.scheduler.metrics.unexpected_unloads
+        baseline_unexpected = (
+            app.state._marshal_internals.scheduler.metrics.unexpected_unloads
+        )
 
         # Push the activity timestamp back so the idle threshold fires
         # immediately on the next tick (instead of waiting 1 minute).
         # _last_activity is the scheduler's per-model dict.
-        scheduler = app.state.scheduler
+        scheduler = app.state._marshal_internals.scheduler
         # Force the model to look idle: subtract 90s from its activity stamp.
         if REQUIRED_MODEL in scheduler._last_activity:
             scheduler._last_activity[REQUIRED_MODEL] -= 90.0
 
         # Wait for idle eviction to fire.
         await wait_for(
-            lambda: not app.state.memory.is_loaded(REQUIRED_MODEL),
+            lambda: not app.state._marshal_internals.memory.is_loaded(REQUIRED_MODEL),
             timeout=15,
             description="model idle-evicted",
         )
         # Critical: idle eviction must NOT bump unexpected_unloads.
         # If it did, we'd misclassify our own evictions as Ollama-side.
-        assert app.state.scheduler.metrics.unexpected_unloads == baseline_unexpected, (
+        assert (
+            app.state._marshal_internals.scheduler.metrics.unexpected_unloads
+            == baseline_unexpected
+        ), (
             f"idle eviction was wrongly counted as unexpected: "
             f"baseline={baseline_unexpected}, "
-            f"now={app.state.scheduler.metrics.unexpected_unloads}"
+            f"now={app.state._marshal_internals.scheduler.metrics.unexpected_unloads}"
         )

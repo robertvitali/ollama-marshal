@@ -136,8 +136,12 @@ Local (served by proxy): /api/marshal/status, /status (alias)
 ### Integration suite layout (v0.5.0+)
 
 - `tests/integration/conftest.py` — shared fixtures (`marshal_app`,
-  `marshal_config`, `tmp_marshal_paths`, `fault_proxy`,
-  `cleanup_models`)
+  `marshal_config`, `tmp_marshal_paths`) and a `make_test_app(cfg,
+  paths)` helper for tests that build their own MarshalConfig (so
+  registry-cache isolation isn't bypassed by inline `create_app(cfg)`
+  calls). Tests that need fault injection import the
+  `fault_proxy` async context manager directly from
+  `_fault_proxy.py` rather than as a pytest fixture.
 - `tests/integration/_fault_proxy.py` — bare `asyncio.start_server`
   HTTP/1.1 proxy in front of Ollama. Hooks: `fail_next`,
   `disconnect_next`, `delay_next`, `fake_response`. Used for retry

@@ -72,18 +72,6 @@ def _ollama_reachable(host: str = DEFAULT_OLLAMA_HOST, timeout: float = 1.0) -> 
         return False
 
 
-async def model_pulled(name: str, host: str = DEFAULT_OLLAMA_HOST) -> bool:
-    """Return True if ``name`` appears in /api/tags on the live Ollama."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{host}/api/tags")
-            resp.raise_for_status()
-            data = resp.json()
-            return any(m.get("name") == name for m in data.get("models", []))
-    except (httpx.HTTPError, OSError):
-        return False
-
-
 @pytest.fixture
 def tmp_marshal_paths(tmp_path: Path) -> dict[str, Path]:
     """Per-test temp paths for registry/audit/metrics state.
@@ -144,6 +132,27 @@ def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
     )
 
 
+def make_test_app(cfg: MarshalConfig, tmp_marshal_paths: dict[str, Path]) -> Any:
+    """Build a marshal FastAPI app with test-isolated registry paths.
+
+    Tests that need custom MarshalConfig (e.g. constrained memory budget,
+    audit enabled, idle eviction interval) build their own ``cfg`` and
+    pass it here. Without this helper, an inline ``create_app(cfg)``
+    call would skip the ``app.state.registry_path/metadata_path``
+    overrides and the ModelRegistry would fall back to its default
+    on-disk cache at ``~/.ollama-marshal/`` — clobbering the user's
+    production-marshal registry.
+
+    Sets the same per-test path overrides the ``marshal_app`` fixture
+    sets, so tests using either path get identical isolation.
+    """
+    app = create_app(cfg)
+    app.state.metrics_path = tmp_marshal_paths["metrics_path"]
+    app.state.registry_path = tmp_marshal_paths["registry_path"]
+    app.state.metadata_path = tmp_marshal_paths["metadata_path"]
+    return app
+
+
 @pytest.fixture
 async def marshal_app(
     marshal_config: MarshalConfig, tmp_marshal_paths: dict[str, Path]
@@ -164,22 +173,19 @@ async def marshal_app(
                                   headers={"X-Program-ID": PROGRAM_CRITICAL})
 
     To inspect marshal's internal state (e.g. ``_allocated_num_ctx``),
-    tests read ``app.state.scheduler``, ``app.state.memory``, and
-    ``app.state.lifecycle`` — which are stashed there during lifespan
-    startup (a small additive production change in server.py).
+    tests read ``app.state._marshal_internals.scheduler``,
+    ``.memory``, ``.registry``, ``.lifecycle``, ``.queues`` —
+    a SimpleNamespace stashed there at the end of lifespan startup
+    (small additive production change in server.py). The underscore
+    prefix signals "test-only — not part of the public app surface";
+    production request handlers continue using module globals.
 
     Registry/metrics paths are wired through ``app.state.*`` attributes
     that the lifespan reads at startup. Without this, the test marshal
     would write to ``~/.ollama-marshal/model_sizes.json`` and clobber
     the user's production-marshal registry cache.
     """
-    app = create_app(marshal_config)
-    app.state.metrics_path = tmp_marshal_paths["metrics_path"]
-    # Isolate the on-disk registry caches per test (regression fix from
-    # the v0.5.0 /review — without this, integration tests pollute the
-    # user's production-marshal cache at ~/.ollama-marshal/).
-    app.state.registry_path = tmp_marshal_paths["registry_path"]
-    app.state.metadata_path = tmp_marshal_paths["metadata_path"]
+    app = make_test_app(marshal_config, tmp_marshal_paths)
 
     transport = httpx.ASGITransport(app=app)
     async with (
@@ -187,40 +193,6 @@ async def marshal_app(
         httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
     ):
         yield client, app
-
-
-@pytest.fixture
-async def fault_proxy() -> AsyncIterator[Any]:
-    """Async fixture wrapping ``_fault_proxy.fault_proxy`` for tests.
-
-    Tests use it like::
-
-        async def test_x(fault_proxy):
-            fault_proxy.fail_next("/api/generate", times=1, status=503)
-            ...
-
-    See ``_fault_proxy.py`` for the full hook API.
-    """
-    from tests.integration._fault_proxy import fault_proxy as _fp
-
-    async with _fp() as proxy:
-        yield proxy
-
-
-@pytest.fixture
-def critical_headers() -> dict[str, str]:
-    """Default headers for tests — critical priority program ID."""
-    return {"X-Program-ID": PROGRAM_CRITICAL}
-
-
-@pytest.fixture
-def normal_headers() -> dict[str, str]:
-    """Headers for tests that specifically need normal priority.
-
-    Used by drain-before-evict tests where critical priority would
-    preempt the eviction path and defeat the assertion.
-    """
-    return {"X-Program-ID": PROGRAM_NORMAL}
 
 
 async def wait_for(
@@ -236,8 +208,9 @@ async def wait_for(
     metric incremented, audit record written). Fails the test with a
     clear message if the condition doesn't hold within ``timeout``.
     """
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
         result = condition()
         if asyncio.iscoroutine(result):
             result = await result

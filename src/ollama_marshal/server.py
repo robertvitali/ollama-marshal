@@ -7,6 +7,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import psutil
@@ -120,16 +121,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     benchmark_task = asyncio.create_task(_registry.benchmark_unknown())
     await _scheduler.start()
 
-    # Expose component instances on app.state for integration tests
-    # (and any future consumer that wants in-process introspection
-    # without reaching into module globals). Production code paths
-    # don't read these — request handlers use the module globals as
-    # they always have. Additive only; no behavior change.
-    app.state.scheduler = _scheduler
-    app.state.memory = _memory
-    app.state.registry = _registry
-    app.state.lifecycle = _lifecycle
-    app.state.queues = _queues
+    # Expose component instances on app.state under a private,
+    # namespaced handle for integration tests (and any future consumer
+    # that wants in-process introspection without reaching into module
+    # globals). Underscore-prefixed name + SimpleNamespace wrapper
+    # signals "test-only, not part of the public app surface" — any
+    # third-party middleware or future endpoint that goes looking for
+    # `app.state._marshal_internals` is making an explicit choice to
+    # cross the encapsulation boundary, vs. accidentally bumping into
+    # the components via attribute lookup. Production request handlers
+    # continue to use the module globals (`_scheduler`, etc.) as they
+    # always have. Additive only; no behavior change.
+    #
+    # TODO: when src/ollama_marshal/server.py request handlers are
+    # refactored off module globals onto request.app.state injection
+    # (Asana subtask "[Integration polish C]"), promote these to
+    # `app.state.components` as the canonical access path and drop
+    # the underscore prefix.
+    app.state._marshal_internals = SimpleNamespace(
+        scheduler=_scheduler,
+        memory=_memory,
+        registry=_registry,
+        lifecycle=_lifecycle,
+        queues=_queues,
+    )
 
     # Periodically snapshot metrics to disk so a hard crash loses at
     # most metrics_persist_interval_s of counter data.
