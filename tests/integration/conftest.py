@@ -195,6 +195,24 @@ async def marshal_app(
 
 
 @pytest.fixture
+async def fault_proxy() -> AsyncIterator[Any]:
+    """Async fixture wrapping ``_fault_proxy.fault_proxy`` for tests.
+
+    Tests use it like::
+
+        async def test_x(fault_proxy):
+            fault_proxy.fail_next("/api/generate", times=1, status=503)
+            ...
+
+    See ``_fault_proxy.py`` for the full hook API.
+    """
+    from tests.integration._fault_proxy import fault_proxy as _fp
+
+    async with _fp() as proxy:
+        yield proxy
+
+
+@pytest.fixture
 def critical_headers() -> dict[str, str]:
     """Default headers for tests — critical priority program ID."""
     return {"X-Program-ID": PROGRAM_CRITICAL}
