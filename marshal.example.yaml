@@ -3,9 +3,35 @@
 # Every value can be overridden via environment variables with the MARSHAL_ prefix.
 # Example: MARSHAL_PROXY_PORT=11435, MARSHAL_MEMORY_SAFETY_MARGIN=4GB
 
-# Ollama connection
+# Ollama connection — single-instance (legacy form, fully supported).
 ollama:
   host: "http://localhost:11434"    # MARSHAL_OLLAMA_HOST
+
+# Multi-instance Ollama (optional, v0.5.0+).
+#
+# When set, marshal routes requests across multiple Ollama instances
+# at different KV cache precisions as memory-pressure failover. If
+# loading a big model + big num_ctx on the primary (f16) instance
+# would require evicting active work, marshal routes to the q8_0
+# instance INSTEAD of summarizing or trimming the prompt.
+#
+# Single-instance setups (the default) can leave this commented out.
+# When uncommented and non-empty, takes precedence over the legacy
+# ``ollama.host`` above. See README "Multi-instance setup" for the
+# launchd plist walkthrough.
+#
+# instances:
+#   - url: "http://localhost:11434"
+#     kv_cache_type: f16            # must match OLLAMA_KV_CACHE_TYPE env
+#     tier_label: primary           # canonical: primary | fallback | last_resort
+#
+#   - url: "http://localhost:11444"
+#     kv_cache_type: q8_0
+#     tier_label: fallback
+#
+#   - url: "http://localhost:11454"
+#     kv_cache_type: q4_0
+#     tier_label: last_resort
 
 # Proxy settings
 proxy:

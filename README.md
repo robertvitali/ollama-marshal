@@ -387,6 +387,121 @@ FastAPI auto-generates Swagger UI and the OpenAPI spec:
 }
 ```
 
+## Multi-instance setup (optional, v0.5.0+)
+
+Marshal supports routing across multiple Ollama instances running at
+different KV cache precisions. The intended use case is **memory
+pressure failover**: when loading a big model + big `num_ctx` on the
+primary instance would require evicting active work, marshal routes
+the request to a smaller-precision instance instead of summarizing
+or trimming the prompt.
+
+This is **opt-in** — single-instance setups (the default) need no
+changes; existing v0.4.0 configs continue to work unchanged.
+
+### Why bother?
+
+The KV cache (the per-slot state every loaded model allocates,
+proportional to `num_ctx`) dominates VRAM for big-context requests.
+At `f16` (full precision, the default) the cache is ~2x larger than
+at `q8_0`, ~4x larger than at `q4_0`. Running a smaller-precision
+instance alongside the primary lets marshal hand off pressured
+requests without dropping context. Quality cost: q8_0 is usually
+invisible on chat workloads; q4_0 is more visible on long-context
+reasoning.
+
+### Setup walkthrough (macOS, launchd)
+
+This assumes you already have one Ollama instance running at
+`http://localhost:11434` with `OLLAMA_KV_CACHE_TYPE=f16` (the default
+`com.user.ollama-serve.plist` setup). We're adding a second instance
+on port 11444 with `q8_0`, optionally a third on 11454 with `q4_0`.
+
+1. **Copy the existing plist for the q8 instance:**
+
+    ```bash
+    cp ~/Library/LaunchAgents/com.user.ollama-serve.plist \
+       ~/Library/LaunchAgents/com.user.ollama-serve-q8.plist
+    ```
+
+2. **Edit the q8 plist:**
+    - Change `<string>com.user.ollama-serve</string>` →
+      `<string>com.user.ollama-serve-q8</string>` (Label key)
+    - Change `<key>OLLAMA_KV_CACHE_TYPE</key>\n<string>f16</string>`
+      → `<string>q8_0</string>`
+    - Add `<key>OLLAMA_HOST</key>\n<string>127.0.0.1:11444</string>`
+      to the EnvironmentVariables dict
+    - Change StandardErrorPath / StandardOutPath log paths so the
+      two instances don't fight over the same log file (e.g.
+      `/opt/homebrew/var/log/ollama-q8.log`)
+
+3. **Bootstrap it:**
+
+    ```bash
+    launchctl bootstrap gui/$UID \
+      ~/Library/LaunchAgents/com.user.ollama-serve-q8.plist
+    curl -s http://localhost:11444/api/version  # should respond
+    ```
+
+4. **Optional: repeat for q4 on port 11454** with
+   `OLLAMA_KV_CACHE_TYPE=q4_0` and a new `com.user.ollama-serve-q4`
+   label.
+
+5. **Update `~/.ollama-marshal/marshal.yaml`** to declare the
+   instances:
+
+    ```yaml
+    # Replace the legacy singular form:
+    #   ollama:
+    #     host: "http://localhost:11434"
+    # with the explicit list form:
+    instances:
+      - url: "http://localhost:11434"
+        kv_cache_type: f16
+        tier_label: primary
+
+      - url: "http://localhost:11444"
+        kv_cache_type: q8_0
+        tier_label: fallback
+
+      # Optional last-resort tier:
+      - url: "http://localhost:11454"
+        kv_cache_type: q4_0
+        tier_label: last_resort
+    ```
+
+6. **Restart marshal:**
+
+    ```bash
+    launchctl kickstart -k gui/$UID/com.ollama-marshal
+    ```
+
+### Routing behavior
+
+Marshal walks the routing tree per-request:
+
+- **Loaded on f16 → use f16** (already-loaded wins).
+- **Loaded on q8 → use q8** (q8 is "good enough — don't pay the
+  load tax to promote").
+- **Loaded on q4 only → try to escape**: f16 if it fits without
+  evicting active work, else q8 if it strictly fits, else stay on q4.
+- **Cold start → walk top-down**: f16 if no eviction needed; else
+  q8 if it strictly fits; else q4 as last resort.
+
+### Caveats
+
+- Marshal does NOT verify the `kv_cache_type` field matches the
+  instance's actual `OLLAMA_KV_CACHE_TYPE` env var. Mismatches
+  surface as wrong fit calculations + surprising OOM. Double-check
+  each plist's env block.
+- Each instance runs its own copy of any model used in both tiers.
+  Disk storage is shared via Ollama's blob cache; VRAM is not.
+- `marshal doctor` currently reports recommendations for instance 0
+  only (not multi-instance aware in v0.5.0).
+- Failover triggers on memory pressure, NOT on instance death. If
+  the q8 instance crashes, requests routed to it will fail until
+  launchd's `KeepAlive: true` brings it back.
+
 ## Running integration tests locally (v0.5.0+)
 
 Marshal ships with an opt-in integration test suite under
