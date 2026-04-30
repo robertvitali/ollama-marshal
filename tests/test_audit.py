@@ -118,6 +118,47 @@ class TestEnabledMode:
         )
         assert record["burst_size_hint"] == 50
 
+    async def test_routing_fields_recorded(self, enabled_config):
+        # v0.5.0+: routing decision (instance_url + tier_label +
+        # routing_reason) rides along on every served/failed record so
+        # operators can correlate "why did this request run on q8?"
+        # with the memory state at that moment.
+        audit = AuditLogger(enabled_config)
+        await audit.start()
+        try:
+            await audit.record(
+                "request.served",
+                program_id="p",
+                model="m",
+                instance_url="http://localhost:11444",
+                tier_label="fallback",
+                routing_reason="primary_would_evict",
+            )
+        finally:
+            await audit.stop()
+        record = json.loads(
+            Path(enabled_config.path).read_text().strip().split("\n")[0]
+        )
+        assert record["instance_url"] == "http://localhost:11444"
+        assert record["tier_label"] == "fallback"
+        assert record["routing_reason"] == "primary_would_evict"
+
+    async def test_routing_fields_omitted_when_none(self, enabled_config):
+        # Single-instance setups don't pass routing fields — the record
+        # stays compact (no schema keys for unset fields).
+        audit = AuditLogger(enabled_config)
+        await audit.start()
+        try:
+            await audit.record("request.served", program_id="p", model="m")
+        finally:
+            await audit.stop()
+        record = json.loads(
+            Path(enabled_config.path).read_text().strip().split("\n")[0]
+        )
+        assert "instance_url" not in record
+        assert "tier_label" not in record
+        assert "routing_reason" not in record
+
     async def test_multiple_records_each_on_own_line(self, enabled_config):
         audit = AuditLogger(enabled_config)
         await audit.start()

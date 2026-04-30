@@ -1061,3 +1061,92 @@ class TestIsKnownModel:
             "mistral:latest",
         }
         assert populated_registry._known_models_last_sync > 0.0
+
+
+# ---------------------------------------------------------------------------
+# KV cache size scaling (v0.5.0+ multi-instance routing)
+# ---------------------------------------------------------------------------
+
+
+def _seed_metadata(registry, model="x:1", num_layers=4, embedding_length=4096):
+    """Stamp a small ModelMetadata so the KV-per-slot math has inputs.
+
+    With these defaults: kv_dim = 4096, kv_per_slot_at_max_ctx =
+    max_ctx * 4 layers * 4096 dim * 2 bytes * 2 (K+V)
+    = max_ctx * 65536 bytes per slot. Pairs nicely with small num_ctx
+    in the assertions below.
+    """
+    registry._metadata[model] = ModelMetadata(
+        name=model,
+        architecture="test",
+        max_context_length=1024,
+        num_layers=num_layers,
+        embedding_length=embedding_length,
+        head_count=32,
+        head_count_kv=32,
+    )
+
+
+class TestGetKvPerSlotScaled:
+    """KV slot bytes shrink with quantization."""
+
+    def test_f16_no_scaling(self, registry):
+        from ollama_marshal.config import KVCacheType
+
+        _seed_metadata(registry)
+        f16 = registry.get_kv_per_slot_scaled("x:1", KVCacheType.F16, ctx=512)
+        unscaled = registry.get_kv_per_slot("x:1", ctx=512)
+        assert f16 == unscaled
+
+    def test_q8_halves_slot_size(self, registry):
+        from ollama_marshal.config import KVCacheType
+
+        _seed_metadata(registry)
+        q8 = registry.get_kv_per_slot_scaled("x:1", KVCacheType.Q8_0, ctx=512)
+        f16 = registry.get_kv_per_slot_scaled("x:1", KVCacheType.F16, ctx=512)
+        assert q8 == f16 // 2
+
+    def test_q4_quarters_slot_size(self, registry):
+        from ollama_marshal.config import KVCacheType
+
+        _seed_metadata(registry)
+        q4 = registry.get_kv_per_slot_scaled("x:1", KVCacheType.Q4_0, ctx=512)
+        f16 = registry.get_kv_per_slot_scaled("x:1", KVCacheType.F16, ctx=512)
+        assert q4 == f16 // 4
+
+    def test_returns_none_when_metadata_missing(self, registry):
+        from ollama_marshal.config import KVCacheType
+
+        # Model never probed.
+        assert registry.get_kv_per_slot_scaled("never:probed", KVCacheType.F16) is None
+
+
+class TestGetTotalFootprint:
+    """Routing fit math = model size + KV slot at this ctx + precision."""
+
+    async def test_includes_model_size(self, registry):
+        from ollama_marshal.config import KVCacheType
+
+        _seed_metadata(registry)
+        registry._sizes["x:1"] = 4 * 1024**3
+        size = await registry.get_total_footprint("x:1", 512, KVCacheType.F16)
+        # Model size + scaled KV slot. Slot must add nonzero bytes.
+        assert size > 4 * 1024**3
+
+    async def test_smaller_on_q4_than_f16(self, registry):
+        from ollama_marshal.config import KVCacheType
+
+        _seed_metadata(registry)
+        registry._sizes["x:1"] = 4 * 1024**3
+        f16 = await registry.get_total_footprint("x:1", 1024, KVCacheType.F16)
+        q4 = await registry.get_total_footprint("x:1", 1024, KVCacheType.Q4_0)
+        assert q4 < f16
+
+    async def test_metadata_missing_returns_size_only(self, registry):
+        from ollama_marshal.config import KVCacheType
+
+        # No metadata cached; method falls back to size-only.
+        registry._sizes["x:1"] = 4 * 1024**3
+        size = await registry.get_total_footprint("x:1", 1024, KVCacheType.F16)
+        # Equal to model size (KV slot contribution falls back to 0).
+        assert size == 4 * 1024**3

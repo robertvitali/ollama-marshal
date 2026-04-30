@@ -28,7 +28,19 @@ from typing import Any
 import httpx
 import structlog
 
+from ollama_marshal.config import KVCacheType
+
 logger = structlog.get_logger()
+
+# KV cache size scales with quantization. f16 stores 2 bytes per element;
+# q8_0 stores 1 byte (~50%); q4_0 stores ~0.5 bytes (~25%). These
+# multipliers approximate the slot-size delta and are applied on top of
+# the f16-derived ``kv_per_slot_at_max_ctx`` from /api/show.
+_KV_PRECISION_MULTIPLIER: dict[KVCacheType, float] = {
+    KVCacheType.F16: 1.0,
+    KVCacheType.Q8_0: 0.5,
+    KVCacheType.Q4_0: 0.25,
+}
 
 _DEFAULT_REGISTRY_PATH = Path.home() / ".ollama-marshal" / "model_sizes.json"
 _DEFAULT_METADATA_PATH = Path.home() / ".ollama-marshal" / "model_metadata.json"
@@ -629,6 +641,62 @@ class ModelRegistry:
         return meta.kv_per_slot_at_ctx(
             ctx if ctx is not None else meta.max_context_length
         )
+
+    def get_kv_per_slot_scaled(
+        self,
+        model: str,
+        kv_cache_type: KVCacheType,
+        ctx: int | None = None,
+    ) -> int | None:
+        """KV cache bytes per slot adjusted for instance precision.
+
+        The architectural ``kv_per_slot`` from /api/show assumes the f16
+        default (2 bytes/element). When an instance is launched with a
+        smaller ``OLLAMA_KV_CACHE_TYPE`` (q8_0 or q4_0), the slot uses
+        proportionally less VRAM. This helper applies the precision
+        multiplier so routing's fit math reflects the real cost on each
+        instance.
+
+        Args:
+            model: Model name (must already have been probed).
+            kv_cache_type: Precision of the target instance.
+            ctx: Context length to compute for. Defaults to model max.
+
+        Returns:
+            Scaled bytes per slot, or None if metadata not yet cached.
+        """
+        base = self.get_kv_per_slot(model, ctx=ctx)
+        if base is None:
+            return None
+        multiplier = _KV_PRECISION_MULTIPLIER[kv_cache_type]
+        return int(base * multiplier)
+
+    async def get_total_footprint(
+        self,
+        model: str,
+        num_ctx: int,
+        kv_cache_type: KVCacheType,
+    ) -> int:
+        """Estimate total VRAM footprint of `model` at `num_ctx` on an instance.
+
+        Footprint = model weights + KV slot at this context length, with
+        the slot scaled to the instance's precision. Used by routing's
+        ``probe_fit`` to decide whether a request would actually fit on a
+        given instance without evicting work.
+
+        Args:
+            model: Model name.
+            num_ctx: Allocated context length for the slot.
+            kv_cache_type: Precision of the target instance.
+
+        Returns:
+            Estimated bytes. Falls back to model size + 0 KV when
+            metadata isn't cached (conservative — better to under-
+            estimate KV than refuse the request).
+        """
+        size = await self.get_or_estimate_size(model)
+        kv = self.get_kv_per_slot_scaled(model, kv_cache_type, ctx=num_ctx) or 0
+        return size + kv
 
     async def get_or_estimate_size(self, model: str) -> int:
         """Get model size from cache, or estimate from /api/show.

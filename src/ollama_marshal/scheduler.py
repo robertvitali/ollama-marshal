@@ -18,6 +18,13 @@ from ollama_marshal.memory import MemoryManager
 from ollama_marshal.queue import ModelQueues, RequestEnvelope
 from ollama_marshal.registry import ModelRegistry
 from ollama_marshal.retry import call_with_retry
+from ollama_marshal.routing import (
+    FitProbe,
+    RoutingDecision,
+    RoutingReason,
+    RoutingState,
+    pick_instance,
+)
 from ollama_marshal.stream import forward_request
 
 logger = structlog.get_logger()
@@ -592,14 +599,16 @@ class Scheduler:
             if pending > 0:
                 continue
 
+            instance_url = self.memory.find_instance_for(model_name)
             logger.info(
                 "scheduler.idle_evict",
                 model=model_name,
                 idle_s=round(idle_s, 1),
                 threshold_s=threshold_s,
+                instance=instance_url,
             )
-            self.memory.mark_intended_unload(model_name)
-            success = await self.lifecycle.unload(model_name)
+            self.memory.mark_intended_unload(model_name, instance_url=instance_url)
+            success = await self.lifecycle.unload(model_name, instance_url=instance_url)
             if success:
                 self.metrics.evictions += 1
                 self._last_activity.pop(model_name, None)
@@ -621,12 +630,25 @@ class Scheduler:
             if pending == 0:
                 continue
 
+            instance_url = self.memory.find_instance_for(model_name)
+            if instance_url is None:
+                # Race: poll loop unloaded the model between the
+                # ``get_loaded_models`` snapshot above and now. Skip
+                # this dispatch tick — the next tick will see the
+                # model truly absent and route through ``ensure_model_loaded``
+                # instead. Without this guard, the batch would dispatch
+                # with ``envelope.instance_url=None`` and forward_request
+                # would fall back to ``config.ollama.host`` (the
+                # primary), routing to an instance that no longer
+                # holds the model in multi-instance setups.
+                continue
+
             # Check whether any pending envelope needs more context
             # than the model's current slot allocation. If so, reload
             # at the larger size before dispatching anything.
             requested = await self._max_num_ctx_for_pending(model_name)
             if requested is not None and self.memory.needs_reload(
-                model_name, requested
+                model_name, requested, instance_url=instance_url
             ):
                 # _ensure_model_loaded handles drain-before-reload +
                 # unload + reload + record_allocated_num_ctx + metric.
@@ -638,7 +660,46 @@ class Scheduler:
 
             batch = await self.queues.dequeue_batch(model_name)
             if batch:
+                # Tag each envelope with the instance currently holding
+                # the model so forward_request hits the right upstream.
+                self._tag_batch_with_instance(batch, instance_url)
                 await self._process_batch(batch)
+
+    def _tag_batch_with_instance(
+        self,
+        batch: list[RequestEnvelope],
+        instance_url: str | None,
+    ) -> None:
+        """Stamp each envelope with the instance URL chosen at dispatch.
+
+        The scheduler tags envelopes here rather than at enqueue time
+        because routing decisions can change between enqueue and
+        dispatch (e.g. a model gets unloaded then reloaded on a
+        different tier in between). ``forward_request`` reads
+        ``envelope.instance_url`` to pick the upstream.
+
+        Populates ``tier_label`` and ``routing_reason`` too so
+        steady-state already-loaded dispatches show up in the audit log
+        with the same routing context as cold-start dispatches. For
+        these paths the routing reason is ``ALREADY_LOADED`` — the
+        model was already on the chosen instance from a previous
+        decision.
+        """
+        if instance_url is None:
+            return
+        # Look up the OllamaInstance to populate tier_label. Slow path
+        # is O(N) but N is the instance count (typically 1-3), and this
+        # runs once per batch dispatch, not per envelope.
+        tier_label: str | None = None
+        for inst in self.memory.instances:
+            if inst.url == instance_url:
+                tier_label = inst.tier_label
+                break
+        for env in batch:
+            if env.instance_url is None:
+                env.instance_url = instance_url
+                env.tier_label = tier_label
+                env.routing_reason = RoutingReason.ALREADY_LOADED.value
 
     async def _handle_critical_preemption(self) -> None:
         """Check for critical-priority requests that need preemption."""
@@ -679,7 +740,12 @@ class Scheduler:
             break  # Load one forced model per tick to avoid thrashing
 
     async def _bin_pack_models(self) -> None:
-        """Load models that fit in remaining VRAM, FIFO order."""
+        """Load models that fit in remaining VRAM, FIFO order.
+
+        Uses ``routing.pick_instance`` to choose the target tier so
+        memory-pressure failover applies to bin-packed loads too (not
+        just forced loads from ``_ensure_model_loaded``).
+        """
         all_pending = await self.queues.get_all_sorted_by_arrival()
 
         # Collect unique models not yet loaded, in arrival order
@@ -695,19 +761,33 @@ class Scheduler:
             model_size = await self.registry.get_or_estimate_size(model)
             if self.memory.can_fit_model(model_size):
                 num_ctx = await self._max_num_ctx_for_pending(model)
+                decision = await self._resolve_routing(model, num_ctx)
+                # Honor any unload_from from the decision (rare for
+                # cold-start bin-pack but possible if a stale q4 copy
+                # sits around).
+                for stale in decision.unload_from:
+                    self.memory.mark_intended_unload(model, instance_url=stale.url)
+                    await self.lifecycle.unload(model, instance_url=stale.url)
                 logger.info(
                     "scheduler.bin_pack_load",
                     model=model,
                     size_gb=round(model_size / (1024**3), 2),
                     available_gb=round(self.memory.available_vram() / (1024**3), 2),
                     num_ctx=num_ctx,
+                    instance=decision.instance.url,
+                    routing_reason=decision.reason.value,
                 )
-                success = await self.lifecycle.preload(model, num_ctx=num_ctx)
+                success = await self.lifecycle.preload(
+                    model, num_ctx=num_ctx, instance_url=decision.instance.url
+                )
                 if success:
                     self.metrics.model_swaps += 1
                     if num_ctx is not None:
-                        self.memory.record_allocated_num_ctx(model, num_ctx)
+                        self.memory.record_allocated_num_ctx(
+                            model, num_ctx, instance_url=decision.instance.url
+                        )
                     await self.memory.refresh()
+                    await self._tag_pending_with_decision(model, decision)
             else:
                 skipped_models.append(model)
 
@@ -749,16 +829,88 @@ class Scheduler:
                 max_ctx = n
         return max_ctx
 
+    async def _non_idle_models_per_instance(self) -> dict[str, set[str]]:
+        """For each instance, set of currently loaded models that are non-idle.
+
+        "Non-idle" = has pending requests in queue OR has dispatched
+        recently (active program tracking). The B-rule (avoid evicting
+        non-idle work) uses this to decide whether falling back to a
+        lower-precision instance is preferable to evicting work on the
+        primary.
+        """
+        pending = await self.queues.pending_by_model()
+        active = self._active_programs  # model -> {prog: ts}
+        result: dict[str, set[str]] = {}
+        for inst in self.memory.instances:
+            here = self.memory.get_loaded_models_on(inst.url)
+            non_idle = {
+                name
+                for name in here
+                if pending.get(name, 0) > 0 or bool(active.get(name))
+            }
+            result[inst.url] = non_idle
+        return result
+
+    async def _build_fit_probe(
+        self,
+        model: str,
+        num_ctx: int | None,
+        non_idle: dict[str, set[str]],
+    ) -> dict[str, FitProbe]:
+        """Per-instance FitProbe map keyed by ``instance.url``.
+
+        Asks ``MemoryManager.probe_fit`` for each configured instance,
+        scaling the model footprint estimate by the instance's KV
+        precision multiplier so a q4_0 instance correctly looks
+        "smaller" for fit purposes than f16.
+        """
+        probe: dict[str, FitProbe] = {}
+        for inst in self.memory.instances:
+            footprint = await self.registry.get_total_footprint(
+                model,
+                num_ctx if num_ctx is not None else 0,
+                inst.kv_cache_type,
+            )
+            probe[inst.url] = self.memory.probe_fit(
+                instance_url=inst.url,
+                model_size=footprint,
+                non_idle_loaded_on_instance=non_idle.get(inst.url, set()),
+            )
+        return probe
+
+    async def _resolve_routing(
+        self,
+        model: str,
+        num_ctx: int | None,
+    ) -> RoutingDecision:
+        """Build a routing decision for `model` based on current memory state.
+
+        Pure-function wrapper: gathers state, calls
+        ``routing.pick_instance``, returns the structured decision.
+        Caller uses the decision to drive preload (and any
+        ``unload_from`` cleanup of stale-tier copies).
+        """
+        non_idle = await self._non_idle_models_per_instance()
+        probe = await self._build_fit_probe(model, num_ctx, non_idle)
+        state = RoutingState(
+            model_name=model,
+            requested_num_ctx=num_ctx if num_ctx is not None else 0,
+            instances=self.memory.instances,
+            loaded_on=self.memory.loaded_on(),
+        )
+        return pick_instance(state, probe)
+
     async def _ensure_model_loaded(
         self, model: str, num_ctx: int | None = None
     ) -> bool:
         """Ensure a model is loaded with at least `num_ctx` slot allocation.
 
-        When `num_ctx` is set and the model is already loaded but at a
-        smaller allocated slot size, this triggers a reload-on-need:
-        drain pending requests for that model, unload it, then preload
-        at the larger size. Reload count is tracked in
-        `metrics.reload_count`.
+        Routes to the right Ollama instance (memory-pressure failover
+        across f16/q8_0/q4_0 tiers when configured). When `num_ctx` is
+        set and the model is already loaded on the chosen instance but
+        at a smaller allocated slot size, this triggers a reload-on-
+        need: unload it on that instance, then preload at the larger
+        size. Reload count is tracked in `metrics.reload_count`.
 
         Args:
             model: The model to load.
@@ -768,39 +920,48 @@ class Scheduler:
         Returns:
             True if the model is now loaded at the requested size.
         """
+        decision = await self._resolve_routing(model, num_ctx)
+        chosen_url = decision.instance.url
+
+        # Unload stale-tier copies of the same model first (e.g. a
+        # promotion off q4_0 returns ``unload_from=[q4]``). Done
+        # BEFORE the new preload so VRAM frees up first.
+        for stale in decision.unload_from:
+            self.memory.mark_intended_unload(model, instance_url=stale.url)
+            await self.lifecycle.unload(model, instance_url=stale.url)
+        if decision.unload_from:
+            await self.memory.refresh()
+
         is_reload = False
-        if self.memory.is_loaded(model):
-            if num_ctx is None or not self.memory.needs_reload(model, num_ctx):
+        if self.memory.is_loaded_on(model, chosen_url):
+            if num_ctx is None or not self.memory.needs_reload(
+                model, num_ctx, instance_url=chosen_url
+            ):
                 return True
-            # Reload-on-need: existing slot is too small for an
-            # incoming request. We do NOT drain pending requests first —
-            # the request that triggered this reload would dispatch
-            # against the OLD smaller slot and Ollama would silently
-            # truncate it, defeating the entire point of the surface
-            # ("Marshal NEVER silently truncates a real prompt"). Just
-            # unload now and let the next tick dispatch against the new
-            # larger slot. Any in-flight Ollama generations finish
-            # before keep_alive=0 takes effect — Ollama serializes
-            # requests per loaded model, so unload is queued behind
-            # them safely.
-            current = self.memory.get_allocated_num_ctx(model)
+            # Reload-on-need: existing slot on the chosen instance is
+            # too small for an incoming request. We do NOT drain
+            # pending requests first — the request that triggered this
+            # reload would dispatch against the OLD smaller slot and
+            # Ollama would silently truncate it, defeating the entire
+            # point of the surface ("Marshal NEVER silently truncates a
+            # real prompt"). Just unload now and let the next tick
+            # dispatch against the new larger slot.
+            current = self.memory.get_allocated_num_ctx(model, instance_url=chosen_url)
             logger.info(
                 "scheduler.reload_for_num_ctx",
                 model=model,
                 current_num_ctx=current,
                 requested_num_ctx=num_ctx,
+                instance=chosen_url,
             )
-            self.memory.mark_intended_unload(model)
-            await self.lifecycle.unload(model)
+            self.memory.mark_intended_unload(model, instance_url=chosen_url)
+            await self.lifecycle.unload(model, instance_url=chosen_url)
             await self.memory.refresh()
             is_reload = True
-            # Fall through to the preload path below. reload_count is
-            # bumped only on successful preload so transient failures
-            # don't unboundedly grow the persisted counter.
 
         model_size = await self.registry.get_or_estimate_size(model)
 
-        # Evict if needed
+        # Evict if needed (global budget — see MemoryManager docstring).
         while not self.memory.can_fit_model(model_size):
             evicted = await self._evict_one(model)
             if not evicted:
@@ -817,22 +978,52 @@ class Scheduler:
                 # writes the real value, instead of "defensively"
                 # returning False (which would silently truncate).
                 if is_reload:
-                    self.memory.record_allocated_num_ctx(model, 0)
+                    self.memory.record_allocated_num_ctx(
+                        model, 0, instance_url=chosen_url
+                    )
                 return False
 
-        success = await self.lifecycle.preload(model, num_ctx=num_ctx)
+        success = await self.lifecycle.preload(
+            model, num_ctx=num_ctx, instance_url=chosen_url
+        )
         if success:
             self.metrics.model_swaps += 1
             if is_reload:
                 self.metrics.reload_count += 1
             if num_ctx is not None:
-                self.memory.record_allocated_num_ctx(model, num_ctx)
+                self.memory.record_allocated_num_ctx(
+                    model, num_ctx, instance_url=chosen_url
+                )
             await self.memory.refresh()
+            # Stamp pending envelopes with the routing decision so
+            # forward_request hits the right upstream and audit log
+            # entries record the tier_label + reason.
+            await self._tag_pending_with_decision(model, decision)
         elif is_reload:
             # Same sentinel as above — model was unloaded then preload
             # failed. Don't pretend we have an allocation we don't.
-            self.memory.record_allocated_num_ctx(model, 0)
+            self.memory.record_allocated_num_ctx(model, 0, instance_url=chosen_url)
         return success
+
+    async def _tag_pending_with_decision(
+        self,
+        model: str,
+        decision: RoutingDecision,
+    ) -> None:
+        """Stamp pending envelopes for `model` with the routing decision.
+
+        Called after a successful preload so the next dispatch tick
+        sees ``envelope.instance_url`` set and ``forward_request``
+        targets the right upstream. Untagged envelopes (e.g. enqueued
+        before this preload) get the decision; envelopes already tagged
+        from a prior decision keep their original tag.
+        """
+        pending = await self.queues.pending_for_model(model)
+        for env in pending:
+            if env.instance_url is None:
+                env.instance_url = decision.instance.url
+                env.tier_label = decision.instance.tier_label
+                env.routing_reason = decision.reason.value
 
     async def _evict_one(self, needed_for: str) -> bool:
         """Evict the least valuable loaded model.
@@ -885,11 +1076,13 @@ class Scheduler:
             return False
 
         target = candidates[0]
+        target_instance = self.memory.find_instance_for(target)
         logger.info(
             "scheduler.evicting",
             model=target,
             pending=pending_counts.get(target, 0),
             needed_for=needed_for,
+            instance=target_instance,
         )
 
         # Drain pending requests for the eviction target first (drain-before-evict)
@@ -902,10 +1095,11 @@ class Scheduler:
                     model=target,
                     request_count=len(batch),
                 )
+                self._tag_batch_with_instance(batch, target_instance)
                 await self._process_batch(batch)
 
-        self.memory.mark_intended_unload(target)
-        success = await self.lifecycle.unload(target)
+        self.memory.mark_intended_unload(target, instance_url=target_instance)
+        success = await self.lifecycle.unload(target, instance_url=target_instance)
         if success:
             self.metrics.evictions += 1
             self._last_activity.pop(target, None)
@@ -997,11 +1191,19 @@ class Scheduler:
             "/api/embeddings",
             "/v1/embeddings",
         )
+        # Per-envelope upstream URL set by the routing decision. Falls
+        # back to the primary instance for legacy single-instance
+        # paths (and the v0.4.x test fixtures that don't tag envelopes).
+        ollama_host = (
+            envelope.instance_url
+            if envelope.instance_url is not None
+            else self.config.ollama.host
+        )
         try:
             if max_attempts <= 1:
                 # No-retry fast path: single attempt, no helper overhead.
                 result = await forward_request(
-                    ollama_host=self.config.ollama.host,
+                    ollama_host=ollama_host,
                     endpoint=envelope.endpoint,
                     request_body=envelope.request_body,
                     stream=envelope.stream,
@@ -1012,7 +1214,7 @@ class Scheduler:
                 request_id = f"{envelope.model}:{id(envelope):x}"
                 result, attempts_used, exhausted = await call_with_retry(
                     forward_request,
-                    ollama_host=self.config.ollama.host,
+                    ollama_host=ollama_host,
                     endpoint=envelope.endpoint,
                     request_body=envelope.request_body,
                     stream=envelope.stream,
@@ -1062,6 +1264,9 @@ class Scheduler:
                 endpoint=envelope.endpoint,
                 wait_ms=wait_ms,
                 stream=envelope.stream,
+                instance_url=envelope.instance_url,
+                tier_label=envelope.tier_label,
+                routing_reason=envelope.routing_reason,
             )
         except Exception as exc:
             # When retry was active and exhausted, the helper raised the
@@ -1100,4 +1305,7 @@ class Scheduler:
                 model=envelope.model,
                 endpoint=envelope.endpoint,
                 error_type=type(exc).__name__,
+                instance_url=envelope.instance_url,
+                tier_label=envelope.tier_label,
+                routing_reason=envelope.routing_reason,
             )

@@ -10,6 +10,29 @@ from ollama_marshal.memory import LoadedModel, MemoryBudget, MemoryManager
 
 PATCH_ASYNC_CLIENT = "ollama_marshal.memory.httpx.AsyncClient"
 
+# Primary instance URL for v0.5.0 per-instance state. Single-instance
+# setups (these tests) all use the legacy ``ollama.host`` value, which
+# the config validator backfills as ``instances[0].url``.
+_PRIMARY_URL = "http://localhost:11434"
+
+
+def _apply_ps(manager, ps_data, instance_url=_PRIMARY_URL):
+    """Call _update_from_ps with the primary instance URL.
+
+    Tests pre-v0.5.0 called ``_update_from_ps(ps_data)`` directly.
+    The per-instance API now requires the URL up front.
+    """
+    manager._update_from_ps(instance_url, ps_data)
+
+
+def _set_loaded(manager, models, instance_url=_PRIMARY_URL):
+    """Seed manager._loaded_models with a flat ``{name: LoadedModel}`` dict.
+
+    The internal structure is ``{instance_url: {name: LoadedModel}}``;
+    this helper handles the wrapping so test assertions stay readable.
+    """
+    manager._loaded_models = {instance_url: dict(models)}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -197,7 +220,7 @@ class TestUpdateFromPs:
             ("llama3:latest", 4_661_224_676),
             ("mistral:latest", 4_109_865_159),
         )
-        manager._update_from_ps(ps_data)
+        _apply_ps(manager, ps_data)
 
         loaded = manager.get_loaded_models()
         assert len(loaded) == 2
@@ -206,10 +229,12 @@ class TestUpdateFromPs:
 
     def test_replaces_previous_state(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("llama3:latest", 1000)),
         )
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("mistral:latest", 2000)),
         )
 
@@ -219,15 +244,16 @@ class TestUpdateFromPs:
 
     def test_empty_ps_clears_models(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("llama3:latest", 1000)),
         )
-        manager._update_from_ps({"models": []})
+        _apply_ps(manager, {"models": []})
         assert manager.get_loaded_models() == {}
 
     def test_no_models_key(self):
         manager = _make_manager()
-        manager._update_from_ps({})
+        _apply_ps(manager, {})
         assert manager.get_loaded_models() == {}
 
     def test_preserves_expires_at(self):
@@ -235,7 +261,7 @@ class TestUpdateFromPs:
         ps_data = _ps_response(
             ("llama3:latest", 1000, "2026-12-31T00:00:00Z"),
         )
-        manager._update_from_ps(ps_data)
+        _apply_ps(manager, ps_data)
 
         loaded = manager.get_loaded_models()
         assert loaded["llama3:latest"].expires_at == "2026-12-31T00:00:00Z"
@@ -243,7 +269,7 @@ class TestUpdateFromPs:
     def test_missing_size_vram_defaults_to_zero(self):
         manager = _make_manager()
         ps_data = {"models": [{"name": "llama3:latest"}]}
-        manager._update_from_ps(ps_data)
+        _apply_ps(manager, ps_data)
 
         loaded = manager.get_loaded_models()
         assert loaded["llama3:latest"].size_vram == 0
@@ -255,7 +281,7 @@ class TestUpdateFromPs:
                 {"name": "llama3:latest", "size_vram": 1000},
             ],
         }
-        manager._update_from_ps(ps_data)
+        _apply_ps(manager, ps_data)
 
         loaded = manager.get_loaded_models()
         assert loaded["llama3:latest"].expires_at == ""
@@ -269,7 +295,8 @@ class TestUpdateFromPs:
 class TestIsLoaded:
     def test_loaded_model(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("llama3:latest", 1000)),
         )
         assert manager.is_loaded("llama3:latest") is True
@@ -280,10 +307,11 @@ class TestIsLoaded:
 
     def test_after_unload(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("llama3:latest", 1000)),
         )
-        manager._update_from_ps({"models": []})
+        _apply_ps(manager, {"models": []})
         assert manager.is_loaded("llama3:latest") is False
 
 
@@ -294,18 +322,20 @@ class TestUsedVram:
 
     def test_single_model(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("llama3:latest", 4_000_000_000)),
         )
         assert manager.used_vram() == 4_000_000_000
 
     def test_multiple_models(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(
                 ("llama3:latest", 4_000_000_000),
                 ("mistral:latest", 3_000_000_000),
-            )
+            ),
         )
         assert manager.used_vram() == 7_000_000_000
 
@@ -319,7 +349,8 @@ class TestAvailableVram:
     def test_with_loaded_models(self):
         manager = _make_manager(total_ram="64GB")
         used = 10 * 1024**3
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("llama3:latest", used)),
         )
         expected = (64 - 4 - 2) * 1024**3 - used
@@ -348,7 +379,8 @@ class TestCanFitModel:
     def test_model_does_not_fit_after_loading(self):
         manager = _make_manager(total_ram="64GB")
         used = 55 * 1024**3
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("llama3:latest", used)),
         )
         assert manager.can_fit_model(4 * 1024**3) is False
@@ -366,12 +398,13 @@ class TestCanFitModel:
 class TestGetEvictionCandidates:
     def _setup_manager_with_models(self):
         manager = _make_manager(total_ram="64GB")
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(
                 ("llama3:latest", 4_000_000_000),
                 ("codellama:latest", 3_000_000_000),
                 ("mistral:latest", 5_000_000_000),
-            )
+            ),
         )
         return manager
 
@@ -423,11 +456,12 @@ class TestGetEvictionCandidates:
 
     def test_unknown_priority_treated_as_normal(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(
                 ("llama3:latest", 4_000_000_000),
                 ("codellama:latest", 3_000_000_000),
-            )
+            ),
         )
         priorities = {"llama3:latest": "unknown_level"}
         candidates = manager.get_eviction_candidates({}, priorities)
@@ -437,7 +471,8 @@ class TestGetEvictionCandidates:
 
     def test_missing_pending_defaults_to_zero(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("llama3:latest", 1000)),
         )
         candidates = manager.get_eviction_candidates({}, {})
@@ -470,7 +505,8 @@ class TestRefresh:
 
     async def test_refresh_http_error(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("existing:latest", 1000)),
         )
 
@@ -486,7 +522,8 @@ class TestRefresh:
 
     async def test_refresh_updates_state(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("old:latest", 1000)),
         )
 
@@ -536,7 +573,8 @@ class TestRefresh:
 class TestGetLoadedModels:
     def test_returns_copy(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             _ps_response(("llama3:latest", 1000)),
         )
         models = manager.get_loaded_models()
@@ -707,12 +745,13 @@ class TestAllocatedNumCtx:
         # An unexpected unload (Ollama-side) should drop the allocation
         # so the next preload doesn't reuse a stale recorded num_ctx.
         manager = _make_manager()
-        manager._loaded_models = {
-            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
-        }
+        _set_loaded(
+            manager,
+            {"llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)},
+        )
         manager.record_allocated_num_ctx("llama3:latest", 16384)
         # Simulate /api/ps now reporting no models.
-        manager._update_from_ps({"models": []})
+        _apply_ps(manager, {"models": []})
         assert manager.get_allocated_num_ctx("llama3:latest") is None
 
 
@@ -726,25 +765,28 @@ class TestNeedsReload:
     def test_false_when_no_allocation_recorded(self):
         # Defensive: we can't tell, so don't trigger spurious reloads.
         manager = _make_manager()
-        manager._loaded_models = {
-            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
-        }
+        _set_loaded(
+            manager,
+            {"llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)},
+        )
         assert manager.needs_reload("llama3:latest", 16384) is False
 
     def test_false_when_requested_fits(self):
         manager = _make_manager()
-        manager._loaded_models = {
-            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
-        }
+        _set_loaded(
+            manager,
+            {"llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)},
+        )
         manager.record_allocated_num_ctx("llama3:latest", 32768)
         assert manager.needs_reload("llama3:latest", 16384) is False
         assert manager.needs_reload("llama3:latest", 32768) is False
 
     def test_true_when_requested_exceeds(self):
         manager = _make_manager()
-        manager._loaded_models = {
-            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
-        }
+        _set_loaded(
+            manager,
+            {"llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)},
+        )
         manager.record_allocated_num_ctx("llama3:latest", 8192)
         assert manager.needs_reload("llama3:latest", 16384) is True
 
@@ -755,9 +797,10 @@ class TestNeedsReload:
         # so the scheduler tries to reload again instead of silently
         # dispatching against an unknown slot.
         manager = _make_manager()
-        manager._loaded_models = {
-            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
-        }
+        _set_loaded(
+            manager,
+            {"llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)},
+        )
         manager.record_allocated_num_ctx("llama3:latest", 0)
         assert manager.needs_reload("llama3:latest", 1024) is True
         assert manager.needs_reload("llama3:latest", 65536) is True
@@ -775,20 +818,22 @@ class TestUpdateFromPsShapeRobustness:
 
     def test_models_not_a_list_treated_as_empty(self):
         manager = _make_manager()
-        manager._loaded_models = {
-            "x:1": LoadedModel(name="x:1", size_vram=1),
-        }
-        manager._update_from_ps({"models": "not a list"})
+        _set_loaded(
+            manager,
+            {"x:1": LoadedModel(name="x:1", size_vram=1)},
+        )
+        _apply_ps(manager, {"models": "not a list"})
         assert manager.get_loaded_models() == {}
 
     def test_models_is_none_treated_as_empty(self):
         manager = _make_manager()
-        manager._update_from_ps({"models": None})
+        _apply_ps(manager, {"models": None})
         assert manager.get_loaded_models() == {}
 
     def test_non_dict_entries_skipped(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             {
                 "models": [
                     "string-not-dict",
@@ -796,37 +841,37 @@ class TestUpdateFromPsShapeRobustness:
                     42,
                     {"name": "valid:1", "size_vram": 1000},
                 ]
-            }
+            },
         )
         loaded = manager.get_loaded_models()
         assert list(loaded) == ["valid:1"]
 
     def test_missing_name_skipped(self):
         manager = _make_manager()
-        manager._update_from_ps(
-            {"models": [{"size_vram": 1000}, {"name": "valid:1", "size_vram": 1}]}
+        _apply_ps(
+            manager,
+            {"models": [{"size_vram": 1000}, {"name": "valid:1", "size_vram": 1}]},
         )
         loaded = manager.get_loaded_models()
         assert list(loaded) == ["valid:1"]
 
     def test_non_string_name_skipped(self):
         manager = _make_manager()
-        manager._update_from_ps(
+        _apply_ps(
+            manager,
             {
                 "models": [
                     {"name": 12345, "size_vram": 1},
                     {"name": "ok:1", "size_vram": 1},
                 ]
-            }
+            },
         )
         loaded = manager.get_loaded_models()
         assert list(loaded) == ["ok:1"]
 
     def test_garbage_size_vram_defaults_to_zero(self):
         manager = _make_manager()
-        manager._update_from_ps(
-            {"models": [{"name": "x:1", "size_vram": "not-a-number"}]}
-        )
+        _apply_ps(manager, {"models": [{"name": "x:1", "size_vram": "not-a-number"}]})
         assert manager.get_loaded_models()["x:1"].size_vram == 0
 
 
@@ -838,29 +883,34 @@ class TestUpdateFromPsShapeRobustness:
 class TestUnexpectedUnloadDetection:
     def test_intended_unload_does_not_trigger(self):
         manager = _make_manager()
-        manager._loaded_models = {
-            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)
-        }
+        _set_loaded(
+            manager,
+            {"llama3:latest": LoadedModel(name="llama3:latest", size_vram=1)},
+        )
         manager.mark_intended_unload("llama3:latest")
-        manager._update_from_ps({"models": []})
+        _apply_ps(manager, {"models": []})
         assert manager.unexpected_unloads_observed == 0
 
     def test_unexpected_unload_increments_counter(self):
         # Marshal didn't ask for the unload — Ollama did it.
         manager = _make_manager()
-        manager._loaded_models = {
-            "mistral:latest": LoadedModel(name="mistral:latest", size_vram=1)
-        }
-        manager._update_from_ps({"models": []})
+        _set_loaded(
+            manager,
+            {"mistral:latest": LoadedModel(name="mistral:latest", size_vram=1)},
+        )
+        _apply_ps(manager, {"models": []})
         assert manager.unexpected_unloads_observed == 1
 
     def test_take_count_resets(self):
         manager = _make_manager()
-        manager._loaded_models = {
-            "x:1": LoadedModel(name="x:1", size_vram=1),
-            "x:2": LoadedModel(name="x:2", size_vram=1),
-        }
-        manager._update_from_ps({"models": []})
+        _set_loaded(
+            manager,
+            {
+                "x:1": LoadedModel(name="x:1", size_vram=1),
+                "x:2": LoadedModel(name="x:2", size_vram=1),
+            },
+        )
+        _apply_ps(manager, {"models": []})
         assert manager.take_unexpected_unload_count() == 2
         # Subsequent take returns 0 (resets on read).
         assert manager.take_unexpected_unload_count() == 0
@@ -869,12 +919,283 @@ class TestUnexpectedUnloadDetection:
         # Marking intended-unload should consume the marker so a later
         # unexpected unload of the same name still triggers.
         manager = _make_manager()
-        manager._loaded_models = {"x:1": LoadedModel(name="x:1", size_vram=1)}
+        _set_loaded(
+            manager,
+            {"x:1": LoadedModel(name="x:1", size_vram=1)},
+        )
         manager.mark_intended_unload("x:1")
-        manager._update_from_ps({"models": []})  # intended — no count
+        _apply_ps(manager, {"models": []})  # intended — no count
         assert manager.unexpected_unloads_observed == 0
 
         # Now load + unexpected-unload again; should count.
-        manager._update_from_ps({"models": [{"name": "x:1", "size_vram": 1}]})
-        manager._update_from_ps({"models": []})
+        _apply_ps(manager, {"models": [{"name": "x:1", "size_vram": 1}]})
+        _apply_ps(manager, {"models": []})
         assert manager.unexpected_unloads_observed == 1
+
+
+# ---------------------------------------------------------------------------
+# Multi-instance state (v0.5.0+)
+# ---------------------------------------------------------------------------
+
+
+def _multi_instance_config(total_ram="64GB"):
+    """Build a 3-instance config (f16 / q8_0 / q4_0)."""
+    from ollama_marshal.config import KVCacheType, OllamaInstance
+
+    return MarshalConfig(
+        instances=[
+            OllamaInstance(url="http://localhost:11434", kv_cache_type=KVCacheType.F16),
+            OllamaInstance(
+                url="http://localhost:11444", kv_cache_type=KVCacheType.Q8_0
+            ),
+            OllamaInstance(
+                url="http://localhost:11454", kv_cache_type=KVCacheType.Q4_0
+            ),
+        ],
+        memory=MemoryConfig(total_ram=total_ram),
+    )
+
+
+def _make_multi_manager(total_ram="64GB"):
+    config = _multi_instance_config(total_ram=total_ram)
+    with patch("ollama_marshal.memory.psutil"):
+        return MemoryManager(config)
+
+
+class TestMultiInstanceLoadedTracking:
+    """Per-instance ``_loaded_models`` map + flat-view accessors."""
+
+    def test_attribution_to_correct_instance(self):
+        manager = _make_multi_manager()
+        manager._update_from_ps(
+            "http://localhost:11434",
+            {"models": [{"name": "f16-only:x", "size_vram": 1}]},
+        )
+        manager._update_from_ps(
+            "http://localhost:11444",
+            {"models": [{"name": "q8-only:x", "size_vram": 2}]},
+        )
+        # Per-instance lookup
+        assert manager.is_loaded_on("f16-only:x", "http://localhost:11434")
+        assert not manager.is_loaded_on("f16-only:x", "http://localhost:11444")
+        assert manager.is_loaded_on("q8-only:x", "http://localhost:11444")
+        # Flat view sees both
+        flat = manager.get_loaded_models()
+        assert set(flat.keys()) == {"f16-only:x", "q8-only:x"}
+        assert flat["q8-only:x"].instance_url == "http://localhost:11444"
+
+    def test_loaded_on_returns_url_to_set_map(self):
+        manager = _make_multi_manager()
+        manager._update_from_ps(
+            "http://localhost:11434",
+            {"models": [{"name": "x:1", "size_vram": 1}]},
+        )
+        m = manager.loaded_on()
+        assert m["http://localhost:11434"] == {"x:1"}
+        assert m["http://localhost:11444"] == set()
+        assert m["http://localhost:11454"] == set()
+
+    def test_get_loaded_models_on_isolates_instance(self):
+        manager = _make_multi_manager()
+        manager._update_from_ps(
+            "http://localhost:11444",
+            {"models": [{"name": "shared:x", "size_vram": 1}]},
+        )
+        only_q8 = manager.get_loaded_models_on("http://localhost:11444")
+        assert "shared:x" in only_q8
+        assert manager.get_loaded_models_on("http://localhost:11434") == {}
+
+    def test_find_instance_for_walks_in_precision_order(self):
+        manager = _make_multi_manager()
+        # Same model on both f16 and q8 (mid-promotion); higher-precision wins.
+        manager._update_from_ps(
+            "http://localhost:11434",
+            {"models": [{"name": "shared:x", "size_vram": 1}]},
+        )
+        manager._update_from_ps(
+            "http://localhost:11444",
+            {"models": [{"name": "shared:x", "size_vram": 2}]},
+        )
+        assert manager.find_instance_for("shared:x") == "http://localhost:11434"
+
+    def test_find_instance_for_returns_none_when_unloaded(self):
+        manager = _make_multi_manager()
+        assert manager.find_instance_for("nope:x") is None
+
+    def test_used_vram_sums_across_instances(self):
+        manager = _make_multi_manager()
+        manager._update_from_ps(
+            "http://localhost:11434",
+            {"models": [{"name": "a:1", "size_vram": 5_000_000_000}]},
+        )
+        manager._update_from_ps(
+            "http://localhost:11444",
+            {"models": [{"name": "b:1", "size_vram": 3_000_000_000}]},
+        )
+        # GLOBAL budget — sum across instances on Mac unified memory.
+        assert manager.used_vram() == 8_000_000_000
+
+
+class TestProbeFit:
+    """``probe_fit`` is the routing-aware fit answer.
+
+    Three outcomes (see ``routing.FitProbe``):
+    1. ``fits=True`` — global budget has room.
+    2. ``fits=False, would_evict_non_idle=True`` — fits only by
+       evicting work on this instance.
+    3. ``fits=False, would_evict_non_idle=False`` — only idle models
+       on this instance could be freed.
+    """
+
+    def test_fits_when_budget_available(self):
+        manager = _make_multi_manager(total_ram="64GB")
+        probe = manager.probe_fit(
+            instance_url="http://localhost:11434",
+            model_size=4 * 1024**3,
+            non_idle_loaded_on_instance=set(),
+        )
+        assert probe.fits is True
+        assert probe.would_evict_non_idle is False
+
+    def test_would_evict_non_idle_when_pinned_loaded(self):
+        manager = _make_multi_manager(total_ram="8GB")
+        # Soak the global budget so probe_fit takes the eviction path.
+        manager._update_from_ps(
+            "http://localhost:11434",
+            {"models": [{"name": "pinned:x", "size_vram": 4 * 1024**3}]},
+        )
+        probe = manager.probe_fit(
+            instance_url="http://localhost:11434",
+            model_size=4 * 1024**3,
+            non_idle_loaded_on_instance={"pinned:x"},
+        )
+        assert probe.fits is False
+        assert probe.would_evict_non_idle is True
+
+    def test_only_idle_eviction_needed(self):
+        manager = _make_multi_manager(total_ram="8GB")
+        manager._update_from_ps(
+            "http://localhost:11434",
+            {"models": [{"name": "idle:x", "size_vram": 4 * 1024**3}]},
+        )
+        probe = manager.probe_fit(
+            instance_url="http://localhost:11434",
+            model_size=4 * 1024**3,
+            non_idle_loaded_on_instance=set(),
+        )
+        assert probe.fits is False
+        assert probe.would_evict_non_idle is False
+
+
+class TestMultiInstanceAllocations:
+    """Per-instance ``_allocated_num_ctx`` + ``_intended_unloads``."""
+
+    def test_record_per_instance_isolation(self):
+        manager = _make_multi_manager()
+        manager.record_allocated_num_ctx(
+            "x:1", 16384, instance_url="http://localhost:11434"
+        )
+        manager.record_allocated_num_ctx(
+            "x:1", 4096, instance_url="http://localhost:11444"
+        )
+        assert (
+            manager.get_allocated_num_ctx("x:1", instance_url="http://localhost:11434")
+            == 16384
+        )
+        assert (
+            manager.get_allocated_num_ctx("x:1", instance_url="http://localhost:11444")
+            == 4096
+        )
+
+    def test_get_allocated_num_ctx_walks_instances_when_url_unset(self):
+        manager = _make_multi_manager()
+        # Only q8 has an allocation; the no-URL lookup should find it
+        # by walking instances in declared (precision) order.
+        manager.record_allocated_num_ctx(
+            "x:1", 8192, instance_url="http://localhost:11444"
+        )
+        assert manager.get_allocated_num_ctx("x:1") == 8192
+
+    def test_needs_reload_resolves_instance_when_url_unset(self):
+        manager = _make_multi_manager()
+        manager._update_from_ps(
+            "http://localhost:11434",
+            {"models": [{"name": "x:1", "size_vram": 1}]},
+        )
+        manager.record_allocated_num_ctx(
+            "x:1", 4096, instance_url="http://localhost:11434"
+        )
+        # No URL — resolve to the instance currently holding the model.
+        assert manager.needs_reload("x:1", 16384) is True
+        assert manager.needs_reload("x:1", 2048) is False
+
+    def test_needs_reload_returns_false_when_unloaded_anywhere(self):
+        manager = _make_multi_manager()
+        assert manager.needs_reload("never-loaded:x", 16384) is False
+
+    def test_mark_intended_unload_broadcasts_when_url_omitted(self):
+        manager = _make_multi_manager()
+        # Same model on two instances (transient, mid-promotion).
+        manager._update_from_ps(
+            "http://localhost:11434",
+            {"models": [{"name": "shared:x", "size_vram": 1}]},
+        )
+        manager._update_from_ps(
+            "http://localhost:11444",
+            {"models": [{"name": "shared:x", "size_vram": 2}]},
+        )
+        manager.mark_intended_unload("shared:x")  # no URL
+        # Both intended sets see the marker.
+        manager._update_from_ps("http://localhost:11434", {"models": []})
+        manager._update_from_ps("http://localhost:11444", {"models": []})
+        assert manager.unexpected_unloads_observed == 0
+
+
+class TestPerInstanceRefresh:
+    """``refresh`` fans out across instances; per-instance polls are isolated."""
+
+    async def test_refresh_polls_each_instance(self):
+        manager = _make_multi_manager()
+        urls_hit: list[str] = []
+
+        async def fake_get(url, timeout=10):
+            urls_hit.append(url)
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {"models": []}
+            mock_resp.raise_for_status = MagicMock()
+            return mock_resp
+
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(side_effect=fake_get)
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            await manager.refresh()
+
+        # Order is deterministic — instances are sorted by precision.
+        assert urls_hit == [
+            "http://localhost:11434/api/ps",
+            "http://localhost:11444/api/ps",
+            "http://localhost:11454/api/ps",
+        ]
+
+    async def test_one_instance_failure_does_not_abort_others(self):
+        manager = _make_multi_manager()
+
+        async def fake_get(url, timeout=10):
+            if "11444" in url:
+                raise httpx.HTTPError("q8 down")
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {"models": [{"name": "x:1", "size_vram": 1}]}
+            mock_resp.raise_for_status = MagicMock()
+            return mock_resp
+
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(side_effect=fake_get)
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            await manager.refresh()
+
+        # f16 + q4_0 both saw their model load even though q8_0 errored.
+        assert manager.is_loaded_on("x:1", "http://localhost:11434")
+        assert manager.is_loaded_on("x:1", "http://localhost:11454")
+        assert not manager.is_loaded_on("x:1", "http://localhost:11444")

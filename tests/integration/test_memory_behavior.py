@@ -249,18 +249,38 @@ async def test_marshal_eviction_drains_then_unloads(tmp_marshal_paths):
     (e.g. the user's running marshal at :11435). Stop the running
     marshal before this test if you hit this skip.
     """
-    # Pre-flight check: any loaded models > our test budget would
-    # poison the test. Sum their VRAM and bail if too big.
-    with httpx.Client(timeout=2.0) as c:
-        resp = c.get(f"{DEFAULT_OLLAMA_HOST}/api/ps")
-        loaded_total = sum(
+    # Pre-flight: unload any models currently in Ollama. The integration
+    # suite is already destructive of Ollama state — `cleanup_models` in
+    # other tests does the same — so issuing keep_alive=0 to force-unload
+    # is consistent with the existing convention. After the unloads we
+    # re-poll: if SOMETHING still has models loaded above our 2.5 GB test
+    # budget, a competing process (commonly the user's running
+    # production marshal at :11435) is reloading them faster than we
+    # can unload. The constrained-budget test can't run cleanly under
+    # that contention; skip with a precise message instead of timing out.
+    async with httpx.AsyncClient(timeout=10) as preflight:
+        resp = await preflight.get(f"{DEFAULT_OLLAMA_HOST}/api/ps")
+        for m in resp.json().get("models", []):
+            name = m.get("name") or m.get("model")
+            if not name:
+                continue
+            await preflight.post(
+                f"{DEFAULT_OLLAMA_HOST}/api/generate",
+                json={"model": name, "prompt": "", "keep_alive": "0"},
+            )
+        # Brief settle, then re-poll to detect a reloading competitor.
+        await asyncio.sleep(1.0)
+        resp = await preflight.get(f"{DEFAULT_OLLAMA_HOST}/api/ps")
+        residual = sum(
             int(m.get("size_vram", 0)) for m in resp.json().get("models", [])
         )
-    if loaded_total > 2_500_000_000:
+    if residual > 2_500_000_000:
         pytest.skip(
-            f"Other models already loaded in Ollama "
-            f"({loaded_total / 1e9:.1f} GB > 2.5 GB test budget). "
-            f"Stop your running marshal before re-running this test."
+            f"After pre-flight unload, Ollama still reports "
+            f"{residual / 1e9:.1f} GB loaded — a competing process "
+            f"(likely your running marshal at :11435) is reloading "
+            f"models faster than this test can unload them. Stop the "
+            f"running marshal before re-running this test."
         )
     # Custom config: 2.5GB available, both models together (~2.8GB) won't fit.
     cfg = MarshalConfig(

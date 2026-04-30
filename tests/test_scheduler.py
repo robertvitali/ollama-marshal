@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+
 from ollama_marshal.config import MarshalConfig, Priority, ProgramConfig
 from ollama_marshal.queue import ModelQueues, RequestEnvelope
 from ollama_marshal.scheduler import (
@@ -42,6 +44,48 @@ def _make_envelope(model="llama3:latest", program_id="default", **kw):
     )
 
 
+_PRIMARY_INSTANCE_URL = "http://localhost:11434"
+
+
+def _apply_instance_defaults(memory, registry, config):
+    """Stamp single-instance defaults on test mocks so routing works.
+
+    v0.5.0 routing reads ``memory.instances`` + ``memory.probe_fit``
+    + ``registry.get_total_footprint``. Tests that build their own
+    MagicMock for memory/registry need these defaults filled in so
+    ``routing.pick_instance`` short-circuits via ``SINGLE_INSTANCE``
+    instead of hitting the unreachable-state RuntimeError.
+    """
+    from ollama_marshal.routing import FitProbe as _FitProbe
+
+    memory.instances = list(config.instances)
+    memory.loaded_on.return_value = {_PRIMARY_INSTANCE_URL: set()}
+    memory.get_loaded_models_on.return_value = {}
+    memory.probe_fit.return_value = _FitProbe(fits=True, would_evict_non_idle=False)
+    # In single-instance mode, "loaded somewhere" == "loaded on the
+    # primary". Mirror is_loaded → is_loaded_on so tests that only
+    # set is_loaded keep working. find_instance_for unconditionally
+    # returns the primary URL — that's the correct answer in single-
+    # instance setups even before /api/ps confirms the load (the
+    # legacy behavior was equivalent).
+    memory.is_loaded_on.side_effect = lambda model, _url: bool(memory.is_loaded(model))
+    memory.find_instance_for.return_value = _PRIMARY_INSTANCE_URL
+    # Likewise, a test that didn't bother to set memory.refresh = AsyncMock
+    # still needs an awaitable refresh for the routing-aware load path.
+    if not isinstance(memory.refresh, AsyncMock):
+        memory.refresh = AsyncMock()
+    # registry.get_total_footprint may be missing on user-supplied
+    # mocks; replace with an AsyncMock that returns a sensible default
+    # so routing's footprint math returns a real int.
+    gtf = getattr(registry, "get_total_footprint", None)
+    if (
+        not isinstance(gtf, AsyncMock)
+        or gtf.return_value is None
+        or isinstance(gtf.return_value, MagicMock)
+    ):
+        registry.get_total_footprint = AsyncMock(return_value=4 * 1024**3)
+
+
 def _make_scheduler(
     queues=None,
     memory=None,
@@ -49,6 +93,8 @@ def _make_scheduler(
     lifecycle=None,
     config=None,
 ):
+    if config is None:
+        config = MarshalConfig()
     if queues is None:
         queues = ModelQueues()
     if memory is None:
@@ -59,7 +105,7 @@ def _make_scheduler(
         memory.available_vram.return_value = 50 * 1024**3
         memory.get_eviction_candidates.return_value = []
         memory.refresh = AsyncMock()
-        # New v0.4.0 methods (Surface C1 Dim 4 + C2). Default to "no
+        # v0.4.0 methods (Surface C1 Dim 4 + C2). Default to "no
         # reload needed" / "no unexpected unloads" / "no allocation".
         memory.needs_reload.return_value = False
         memory.get_allocated_num_ctx.return_value = None
@@ -73,8 +119,9 @@ def _make_scheduler(
         lifecycle = MagicMock()
         lifecycle.preload = AsyncMock(return_value=True)
         lifecycle.unload = AsyncMock(return_value=True)
-    if config is None:
-        config = MarshalConfig()
+    # Always stamp multi-instance defaults so routing has the data it
+    # needs, even when the test built its own memory/registry mocks.
+    _apply_instance_defaults(memory, registry, config)
     return Scheduler(
         queues=queues,
         memory=memory,
@@ -443,7 +490,9 @@ class TestBinPackModels:
 
         await sched._bin_pack_models()
 
-        lifecycle.preload.assert_called_once_with("small:latest", num_ctx=None)
+        lifecycle.preload.assert_called_once_with(
+            "small:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+        )
         assert sched.metrics.model_swaps == 1
         memory.refresh.assert_called_once()
 
@@ -646,7 +695,9 @@ class TestEnsureModelLoaded:
 
         result = await sched._ensure_model_loaded("llama3:latest")
         assert result is True
-        lifecycle.preload.assert_called_once_with("llama3:latest", num_ctx=None)
+        lifecycle.preload.assert_called_once_with(
+            "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+        )
         assert sched.metrics.model_swaps == 1
 
     async def test_evicts_when_needed(self):
@@ -740,7 +791,9 @@ class TestEvictOne:
 
         result = await sched._evict_one("new:latest")
         assert result is True
-        lifecycle.unload.assert_called_once_with("victim:latest")
+        lifecycle.unload.assert_called_once_with(
+            "victim:latest", instance_url=_PRIMARY_INSTANCE_URL
+        )
         assert sched.metrics.evictions == 1
 
     async def test_excludes_needed_model(self):
@@ -1259,11 +1312,19 @@ class TestEnsureModelLoadedReloadOnNeed:
         # the new (larger) slot.
         assert await queues.pending_count("llama3:latest") == 1
         # Marshal told memory it's an intended unload.
-        memory.mark_intended_unload.assert_called_with("llama3:latest")
+        memory.mark_intended_unload.assert_called_with(
+            "llama3:latest", instance_url=_PRIMARY_INSTANCE_URL
+        )
         # Unload then preload at the bigger size.
-        lifecycle.unload.assert_called_once_with("llama3:latest")
-        lifecycle.preload.assert_called_once_with("llama3:latest", num_ctx=32768)
-        memory.record_allocated_num_ctx.assert_called_with("llama3:latest", 32768)
+        lifecycle.unload.assert_called_once_with(
+            "llama3:latest", instance_url=_PRIMARY_INSTANCE_URL
+        )
+        lifecycle.preload.assert_called_once_with(
+            "llama3:latest", num_ctx=32768, instance_url=_PRIMARY_INSTANCE_URL
+        )
+        memory.record_allocated_num_ctx.assert_called_with(
+            "llama3:latest", 32768, instance_url=_PRIMARY_INSTANCE_URL
+        )
         # Metric bumped only after preload succeeded.
         assert sched.metrics.reload_count == 1
 
@@ -1299,7 +1360,9 @@ class TestEnsureModelLoadedReloadOnNeed:
         assert sched.metrics.reload_count == 0
         # Sentinel allocation written so future calls force a fresh reload
         # rather than silently dispatching against an unknown slot.
-        memory.record_allocated_num_ctx.assert_called_with("llama3:latest", 0)
+        memory.record_allocated_num_ctx.assert_called_with(
+            "llama3:latest", 0, instance_url=_PRIMARY_INSTANCE_URL
+        )
 
 
 class TestUnexpectedUnloadsRollup:
@@ -1514,7 +1577,9 @@ class TestIdleEvictUnusedModels:
 
         await sched._idle_evict_unused_models()
 
-        sched.lifecycle.unload.assert_awaited_once_with("foo")
+        sched.lifecycle.unload.assert_awaited_once_with(
+            "foo", instance_url=_PRIMARY_INSTANCE_URL
+        )
         # Eviction counter incremented + activity entry removed on success.
         assert sched.metrics.evictions == 1
         assert "foo" not in sched._last_activity
@@ -1751,7 +1816,9 @@ class TestBurstHintsIntegration:
         # = 8 * 3 = 24 (using SchedulerConfig.max_skips default of 3).
         assert captured["pending"]["burst-protected"] == 24
         # The chosen target is low-priority — burst-protected stays loaded.
-        sched.lifecycle.unload.assert_awaited_with("low-priority")
+        sched.lifecycle.unload.assert_awaited_with(
+            "low-priority", instance_url=_PRIMARY_INSTANCE_URL
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1902,3 +1969,281 @@ class TestProcessBatchParallelism:
         # Both slots free → can acquire twice without blocking.
         async with sem, sem:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Multi-instance routing — _resolve_routing + envelope tagging
+# ---------------------------------------------------------------------------
+
+
+def _multi_instance_config():
+    """Build a 3-instance config for routing tests."""
+    from ollama_marshal.config import KVCacheType, OllamaInstance
+
+    return MarshalConfig(
+        instances=[
+            OllamaInstance(url="http://localhost:11434", kv_cache_type=KVCacheType.F16),
+            OllamaInstance(
+                url="http://localhost:11444", kv_cache_type=KVCacheType.Q8_0
+            ),
+        ],
+    )
+
+
+class TestResolveRouting:
+    """``_resolve_routing`` builds the FitProbe map + calls pick_instance."""
+
+    async def test_single_instance_short_circuits(self):
+        # Default config has one auto-backfilled instance.
+        sched = _make_scheduler()
+        decision = await sched._resolve_routing("any:model", num_ctx=4096)
+        from ollama_marshal.routing import RoutingReason
+
+        assert decision.reason == RoutingReason.SINGLE_INSTANCE
+        assert decision.instance.url == "http://localhost:11434"
+
+    async def test_multi_instance_cold_start_picks_primary(self):
+        from ollama_marshal.routing import FitProbe, RoutingReason
+
+        config = _multi_instance_config()
+        sched = _make_scheduler(config=config)
+        # Both instances are empty + budget has room. Routing should
+        # pick the primary (f16) tier.
+        sched.memory.loaded_on.return_value = {
+            "http://localhost:11434": set(),
+            "http://localhost:11444": set(),
+        }
+        sched.memory.probe_fit.return_value = FitProbe(
+            fits=True, would_evict_non_idle=False
+        )
+        decision = await sched._resolve_routing("any:model", num_ctx=8192)
+        assert decision.instance.url == "http://localhost:11434"
+        assert decision.reason == RoutingReason.PRIMARY_FITS
+
+    async def test_multi_instance_falls_back_to_q8_under_pressure(self):
+        from ollama_marshal.routing import FitProbe, RoutingReason
+
+        config = _multi_instance_config()
+        sched = _make_scheduler(config=config)
+        sched.memory.loaded_on.return_value = {
+            "http://localhost:11434": {"pinned:x"},
+            "http://localhost:11444": set(),
+        }
+
+        def per_instance(*, instance_url, model_size, non_idle_loaded_on_instance):
+            if instance_url == "http://localhost:11434":
+                return FitProbe(fits=False, would_evict_non_idle=True)
+            return FitProbe(fits=True, would_evict_non_idle=False)
+
+        sched.memory.probe_fit.side_effect = per_instance
+        decision = await sched._resolve_routing("any:model", num_ctx=8192)
+        assert decision.instance.url == "http://localhost:11444"
+        assert decision.reason == RoutingReason.PRIMARY_WOULD_EVICT
+
+
+class TestNonIdleModelsPerInstance:
+    """Non-idle = has pending requests OR an active program."""
+
+    async def test_pending_marks_model_non_idle(self):
+        config = _multi_instance_config()
+        queues = ModelQueues()
+        await queues.enqueue(_make_envelope(model="busy:x"))
+        sched = _make_scheduler(queues=queues, config=config)
+        sched.memory.get_loaded_models_on.side_effect = lambda url: (
+            {"busy:x": MagicMock()} if "11434" in url else {}
+        )
+        non_idle = await sched._non_idle_models_per_instance()
+        assert "busy:x" in non_idle["http://localhost:11434"]
+
+    async def test_active_program_marks_model_non_idle(self):
+        config = _multi_instance_config()
+        sched = _make_scheduler(config=config)
+        sched._active_programs["recent:x"] = {"prog-a": time.monotonic()}
+        sched.memory.get_loaded_models_on.side_effect = lambda url: (
+            {"recent:x": MagicMock()} if "11434" in url else {}
+        )
+        non_idle = await sched._non_idle_models_per_instance()
+        assert "recent:x" in non_idle["http://localhost:11434"]
+
+    async def test_silent_model_is_idle(self):
+        config = _multi_instance_config()
+        sched = _make_scheduler(config=config)
+        sched.memory.get_loaded_models_on.side_effect = lambda url: (
+            {"silent:x": MagicMock()} if "11434" in url else {}
+        )
+        non_idle = await sched._non_idle_models_per_instance()
+        assert "silent:x" not in non_idle["http://localhost:11434"]
+
+
+class TestForwardSingleAuditFields:
+    """Audit records carry tier_label + routing_reason from the envelope."""
+
+    async def test_served_includes_tier_and_reason(self):
+        from ollama_marshal.routing import RoutingReason
+
+        sched = _make_scheduler()
+        sched.audit = MagicMock()
+        sched.audit.record = AsyncMock()
+        envelope = _make_envelope(model="m:1")
+        envelope.instance_url = "http://localhost:11444"
+        envelope.tier_label = "fallback"
+        envelope.routing_reason = RoutingReason.PRIMARY_WOULD_EVICT.value
+        # Stub forward_request to return immediately.
+        with patch(
+            "ollama_marshal.scheduler.forward_request",
+            new_callable=AsyncMock,
+            return_value=MagicMock(),
+        ):
+            await sched._forward_single(envelope)
+        served_calls = [
+            c
+            for c in sched.audit.record.await_args_list
+            if c.args and c.args[0] == "request.served"
+        ]
+        assert len(served_calls) == 1
+        kwargs = served_calls[0].kwargs
+        assert kwargs["instance_url"] == "http://localhost:11444"
+        assert kwargs["tier_label"] == "fallback"
+        assert kwargs["routing_reason"] == "primary_would_evict"
+
+    async def test_failed_includes_tier_and_reason(self):
+        sched = _make_scheduler()
+        sched.audit = MagicMock()
+        sched.audit.record = AsyncMock()
+        envelope = _make_envelope(model="m:1")
+        envelope.instance_url = "http://localhost:11434"
+        envelope.tier_label = "primary"
+        envelope.routing_reason = "primary_fits"
+        with patch(
+            "ollama_marshal.scheduler.forward_request",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("oops"),
+        ):
+            await sched._forward_single(envelope)
+        failed = [
+            c
+            for c in sched.audit.record.await_args_list
+            if c.args and c.args[0] == "request.failed"
+        ]
+        assert len(failed) == 1
+        kwargs = failed[0].kwargs
+        assert kwargs["instance_url"] == "http://localhost:11434"
+        assert kwargs["tier_label"] == "primary"
+        assert kwargs["routing_reason"] == "primary_fits"
+
+
+class TestForwardSingleUsesEnvelopeInstance:
+    """``forward_request`` targets the envelope's instance URL when set."""
+
+    async def test_envelope_url_overrides_legacy_host(self):
+        sched = _make_scheduler()
+        envelope = _make_envelope(model="m:1")
+        envelope.instance_url = "http://other:9999"
+        with patch(
+            "ollama_marshal.scheduler.forward_request",
+            new_callable=AsyncMock,
+            return_value=MagicMock(),
+        ) as mock_forward:
+            await sched._forward_single(envelope)
+        assert mock_forward.await_args.kwargs["ollama_host"] == "http://other:9999"
+
+    async def test_legacy_host_used_when_envelope_unset(self):
+        sched = _make_scheduler()
+        envelope = _make_envelope(model="m:1")
+        # envelope.instance_url left at default None
+        with patch(
+            "ollama_marshal.scheduler.forward_request",
+            new_callable=AsyncMock,
+            return_value=MagicMock(),
+        ) as mock_forward:
+            await sched._forward_single(envelope)
+        assert mock_forward.await_args.kwargs["ollama_host"] == sched.config.ollama.host
+
+
+# ---------------------------------------------------------------------------
+# Steady-state audit field plumbing — regression test for the
+# /review-found gap where envelopes dispatched via _tag_batch_with_instance
+# (already-loaded common case) were missing tier_label / routing_reason.
+# ---------------------------------------------------------------------------
+
+
+class TestTagBatchWithInstancePopulatesAllFields:
+    """``_tag_batch_with_instance`` must populate all 3 routing fields.
+
+    Regression target: an earlier implementation only set
+    ``envelope.instance_url`` and left ``tier_label`` and
+    ``routing_reason`` as None — meaning audit records for
+    already-loaded steady-state dispatches (the common case) were
+    missing the routing context the audit log promises to deliver.
+    """
+
+    def test_tags_all_three_fields(self):
+        sched = _make_scheduler()
+        batch = [_make_envelope(model="m") for _ in range(3)]
+        sched._tag_batch_with_instance(batch, _PRIMARY_INSTANCE_URL)
+        for env in batch:
+            assert env.instance_url == _PRIMARY_INSTANCE_URL
+            # tier_label looked up from memory.instances (default
+            # config has one f16 instance with tier_label="primary").
+            assert env.tier_label == "primary"
+            # Reason for already-loaded dispatches is ALREADY_LOADED.
+            assert env.routing_reason == "already_loaded"
+
+    def test_skips_envelopes_with_existing_tags(self):
+        # An envelope already tagged via _tag_pending_with_decision
+        # (cold-start path) must NOT be retagged with the
+        # already-loaded reason — it should keep the original
+        # cold-start reason (e.g. PRIMARY_FITS).
+        sched = _make_scheduler()
+        env = _make_envelope(model="m")
+        env.instance_url = _PRIMARY_INSTANCE_URL
+        env.tier_label = "primary"
+        env.routing_reason = "primary_fits"
+        sched._tag_batch_with_instance([env], _PRIMARY_INSTANCE_URL)
+        # Original cold-start tag preserved.
+        assert env.routing_reason == "primary_fits"
+
+    def test_no_op_when_instance_url_is_none(self):
+        # Race-safe path: scheduler skips dispatch when find_instance_for
+        # returns None, but if some future caller passes None directly,
+        # we still no-op cleanly.
+        sched = _make_scheduler()
+        env = _make_envelope(model="m")
+        sched._tag_batch_with_instance([env], None)
+        assert env.instance_url is None
+        assert env.tier_label is None
+        assert env.routing_reason is None
+
+
+class TestForwardLoadedModelRequestsRaceSafe:
+    """``_forward_loaded_model_requests`` skips when find_instance_for is None.
+
+    Regression target: a poll-loop unload between the
+    ``get_loaded_models()`` snapshot and ``find_instance_for`` would
+    leave the dispatch path with ``instance_url=None``, falling back
+    to ``config.ollama.host`` — wrong instance in multi-instance
+    setups.
+    """
+
+    async def test_skips_when_model_no_longer_attributable(self):
+        memory = MagicMock()
+        # Snapshot says model is loaded.
+        memory.get_loaded_models.return_value = {"vanished:x": MagicMock()}
+
+        queues = ModelQueues()
+        envelope = _make_envelope(model="vanished:x")
+        await queues.enqueue(envelope)
+
+        sched = _make_scheduler(queues=queues, memory=memory)
+        # Override the helper-applied default (which returns the primary
+        # URL) AFTER scheduler construction. Simulates the race where
+        # the poll loop unloaded the model between the snapshot above
+        # and the find_instance_for call inside the dispatch loop.
+        memory.find_instance_for.return_value = None
+
+        with patch.object(sched, "_process_batch", new_callable=AsyncMock) as mock_pb:
+            await sched._forward_loaded_model_requests()
+
+        # Crucially, no dispatch happened — envelope still in queue.
+        assert envelope.done_event.is_set() is False
+        mock_pb.assert_not_called()
