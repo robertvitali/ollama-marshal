@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multi-instance routing — Stage 2 plumbing (Track 2 stage 2)** —
+  the Stage 1 routing decision is now wired through the actual
+  request path. `MemoryManager` polls every configured Ollama
+  instance independently and tracks loaded models per-instance;
+  `ModelLifecycle.preload` / `unload` / `unload_all` accept an
+  `instance_url` parameter; `RequestEnvelope` carries `instance_url`
+  + `tier_label` + `routing_reason` set by the scheduler from the
+  `routing.pick_instance` decision; `forward_request` targets the
+  envelope's instance URL (falls back to the primary on legacy
+  single-instance setups). VRAM budget stays GLOBAL across instances
+  (Mac unified memory is a single pool — partitioning would double-
+  count). New `MemoryManager.probe_fit(instance, size, non_idle)`
+  returns the routing-aware fit answer (fits / would-evict-non-idle
+  / only-idle). New `ModelRegistry.get_kv_per_slot_scaled(model,
+  kv_cache_type)` and `get_total_footprint(model, num_ctx,
+  kv_cache_type)` apply precision multipliers (f16=1.0, q8_0=0.5,
+  q4_0=0.25) so routing's fit math reflects real per-instance cost.
+  Audit-log records (`request.served`, `request.failed`) now include
+  `instance_url`, `tier_label`, and `routing_reason` so operators
+  can answer "why did this request run on q8?" by reading the JSONL
+  alone. 35+ new unit tests cover the per-instance memory state,
+  routing-decision wiring, and audit-field plumbing. New integration
+  test file `tests/integration/test_multi_instance.py` (4 tests)
+  validates the cross-component path against a real two-instance
+  setup; tests skip cleanly when only :11434 is up.
+
 - **Multi-instance routing foundation (Track 2 stage 1)** — config
   schema + pure decision logic for routing requests across multiple
   Ollama instances at different KV cache precisions. New types in

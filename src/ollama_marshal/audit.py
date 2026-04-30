@@ -147,12 +147,23 @@ class AuditLogger:
         stream: bool | None = None,
         burst_size_hint: int | None = None,
         error_type: str | None = None,
+        instance_url: str | None = None,
+        tier_label: str | None = None,
+        routing_reason: str | None = None,
     ) -> None:
         """Enqueue an audit record. No-op when disabled.
 
         Records are buffered and flushed in the background. Callers do
         NOT pass prompt text or response content — those are forbidden
         for privacy reasons.
+
+        Multi-instance fields (v0.5.0+):
+        - ``instance_url``: which Ollama instance served the request
+        - ``tier_label``: free-form label of that instance ("primary",
+          "fallback", "last_resort")
+        - ``routing_reason``: structured cause from
+          ``routing.RoutingReason`` (e.g. "primary_fits",
+          "primary_would_evict")
         """
         if not self._enabled or self._stopped:
             return
@@ -178,6 +189,12 @@ class AuditLogger:
             record["burst_size_hint"] = burst_size_hint
         if error_type is not None:
             record["error_type"] = error_type
+        if instance_url is not None:
+            record["instance_url"] = instance_url
+        if tier_label is not None:
+            record["tier_label"] = tier_label
+        if routing_reason is not None:
+            record["routing_reason"] = routing_reason
         async with self._lock:
             self._buffer.append(record)
             buffer_full = len(self._buffer) >= _FLUSH_BATCH_SIZE

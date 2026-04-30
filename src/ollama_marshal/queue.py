@@ -42,6 +42,16 @@ class RequestEnvelope:
     # call (e.g. tool-calling agent that wants fail-fast) or extend
     # it for an idempotent embedding burst.
     retry_max_override: int | None = None
+    # Multi-instance routing decision (v0.5.0+). Populated by the
+    # scheduler from ``routing.pick_instance`` before the envelope is
+    # dispatched. ``forward_request`` reads ``instance_url`` to pick
+    # the right Ollama upstream. ``tier_label`` and ``routing_reason``
+    # ride along for audit-log enrichment. None on single-instance
+    # setups or before routing has decided — call sites must fall back
+    # to the primary instance URL.
+    instance_url: str | None = None
+    tier_label: str | None = None
+    routing_reason: str | None = None
 
     def increment_skip(self) -> None:
         """Increment the skip counter for this request."""

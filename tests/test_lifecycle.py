@@ -271,7 +271,9 @@ class TestWaitForModel:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.get = AsyncMock(return_value=mock_response)
 
-        result = await lifecycle._wait_for_model(mock_client, "llama3:latest")
+        result = await lifecycle._wait_for_model(
+            mock_client, "llama3:latest", "http://localhost:11434"
+        )
         assert result is True
 
     async def test_model_found_after_retries(self, lifecycle):
@@ -291,7 +293,9 @@ class TestWaitForModel:
         )
 
         with patch("ollama_marshal.lifecycle.asyncio.sleep", new_callable=AsyncMock):
-            result = await lifecycle._wait_for_model(mock_client, "llama3:latest")
+            result = await lifecycle._wait_for_model(
+                mock_client, "llama3:latest", "http://localhost:11434"
+            )
 
         assert result is True
         assert mock_client.get.await_count == 3
@@ -309,7 +313,9 @@ class TestWaitForModel:
             patch("ollama_marshal.lifecycle._PS_POLL_INTERVAL", 1),
             patch("ollama_marshal.lifecycle.asyncio.sleep", new_callable=AsyncMock),
         ):
-            result = await lifecycle._wait_for_model(mock_client, "llama3:latest")
+            result = await lifecycle._wait_for_model(
+                mock_client, "llama3:latest", "http://localhost:11434"
+            )
 
         assert result is False
 
@@ -325,7 +331,9 @@ class TestWaitForModel:
         mock_client.get = AsyncMock(side_effect=[error_response, found_response])
 
         with patch("ollama_marshal.lifecycle.asyncio.sleep", new_callable=AsyncMock):
-            result = await lifecycle._wait_for_model(mock_client, "llama3:latest")
+            result = await lifecycle._wait_for_model(
+                mock_client, "llama3:latest", "http://localhost:11434"
+            )
 
         assert result is True
 
@@ -339,7 +347,9 @@ class TestWaitForModel:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.get = AsyncMock(return_value=mock_response)
 
-        result = await lifecycle._wait_for_model(mock_client, "llama3:latest")
+        result = await lifecycle._wait_for_model(
+            mock_client, "llama3:latest", "http://localhost:11434"
+        )
         assert result is True
 
     async def test_wait_no_models_key_in_response(self, lifecycle):
@@ -355,7 +365,9 @@ class TestWaitForModel:
             patch("ollama_marshal.lifecycle._PS_POLL_INTERVAL", 1),
             patch("ollama_marshal.lifecycle.asyncio.sleep", new_callable=AsyncMock),
         ):
-            result = await lifecycle._wait_for_model(mock_client, "llama3:latest")
+            result = await lifecycle._wait_for_model(
+                mock_client, "llama3:latest", "http://localhost:11434"
+            )
 
         assert result is False
 
@@ -380,7 +392,9 @@ class TestEnsureLoaded:
             result = await lifecycle.ensure_loaded("llama3:latest", set())
 
         assert result is True
-        mock_preload.assert_awaited_once_with("llama3:latest", num_ctx=None)
+        mock_preload.assert_awaited_once_with(
+            "llama3:latest", num_ctx=None, instance_url=None
+        )
 
     async def test_not_loaded_preload_fails(self, lifecycle):
         with patch.object(
@@ -397,7 +411,9 @@ class TestEnsureLoaded:
             result = await lifecycle.ensure_loaded("mistral:latest", {"llama3:latest"})
 
         assert result is True
-        mock_preload.assert_awaited_once_with("mistral:latest", num_ctx=None)
+        mock_preload.assert_awaited_once_with(
+            "mistral:latest", num_ctx=None, instance_url=None
+        )
 
 
 # ---------------------------------------------------------------------------
