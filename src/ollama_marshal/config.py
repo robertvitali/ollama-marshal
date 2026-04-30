@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Default config search paths (in priority order)
 _CONFIG_SEARCH_PATHS = [
@@ -38,8 +38,84 @@ class LogFormat(StrEnum):
     JSON = "json"
 
 
+class KVCacheType(StrEnum):
+    """KV cache quantization for an Ollama instance.
+
+    Lower precision shrinks per-slot VRAM (KV cache scales with
+    ``num_ctx``) at some quality cost. f16 is full half-precision;
+    q8_0 is 8-bit quantized (~50% smaller, usually invisible quality
+    drop on chat); q4_0 is 4-bit (~75% smaller, more visible on
+    long-context reasoning).
+    """
+
+    F16 = "f16"
+    Q8_0 = "q8_0"
+    Q4_0 = "q4_0"
+
+
+# Tier labels used in audit logs and ``app.state`` introspection. Free-form
+# strings, but the canonical names match what's recommended in the README.
+TIER_PRIMARY = "primary"
+TIER_FALLBACK = "fallback"
+TIER_LAST_RESORT = "last_resort"
+
+
+class OllamaInstance(BaseModel):
+    """One Ollama process with a specific KV cache precision.
+
+    Multi-instance setup runs two or three Ollama processes on
+    different ports, each with a different ``OLLAMA_KV_CACHE_TYPE``
+    env var. Marshal routes requests between them to relieve memory
+    pressure without summarizing or trimming the prompt.
+
+    Single-instance setups (the default) just use one entry with
+    ``kv_cache_type=f16``. The legacy singular ``ollama: {host: ...}``
+    config form is auto-promoted to a single ``[{...}]`` list at load
+    time — see ``MarshalConfig`` validator.
+
+    Frozen so instances are hashable: routing uses them as dict keys
+    + set members, and they're set-once-at-startup config data anyway.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    url: str = Field(
+        ...,
+        description=(
+            "Full base URL of this Ollama instance, e.g. "
+            "'http://localhost:11434'. Must be reachable from marshal's "
+            "host (typically all instances run on the same machine)."
+        ),
+    )
+    kv_cache_type: KVCacheType = Field(
+        default=KVCacheType.F16,
+        description=(
+            "Must match the ``OLLAMA_KV_CACHE_TYPE`` env var the "
+            "instance was launched with. Marshal does NOT verify this "
+            "at startup — mismatches surface as wrong fit calculations "
+            "and surprising OOMs."
+        ),
+    )
+    tier_label: str = Field(
+        default=TIER_PRIMARY,
+        description=(
+            "Free-form label used in audit logs + status output. "
+            "Canonical names: 'primary' (highest precision, default "
+            "target), 'fallback' (mid precision, used to relieve "
+            "pressure), 'last_resort' (lowest precision, used only "
+            "when nothing else fits)."
+        ),
+    )
+
+
 class OllamaConfig(BaseModel):
-    """Ollama connection settings."""
+    """Legacy single-instance Ollama config.
+
+    Kept for backward compatibility. New configs should use the list
+    form ``ollama: [...]`` with explicit ``OllamaInstance`` entries.
+    A ``MarshalConfig`` validator converts singular form to a single-
+    instance list at load time.
+    """
 
     host: str = Field(
         default="http://localhost:11434",
@@ -396,6 +472,18 @@ class MarshalConfig(BaseModel):
     """Root configuration for ollama-marshal."""
 
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
+    instances: list[OllamaInstance] = Field(
+        default_factory=list,
+        description=(
+            "Multi-instance Ollama setup. Each entry is one Ollama "
+            "process with its own URL + KV cache precision. Marshal "
+            "routes requests between them to relieve memory pressure "
+            "without summarizing or trimming the prompt. Empty list "
+            "(the default) → marshal auto-derives a single-instance "
+            "list from the legacy ``ollama.host`` field, mirroring "
+            "v0.4.0 behavior. See README 'Multi-instance setup'."
+        ),
+    )
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
@@ -407,6 +495,44 @@ class MarshalConfig(BaseModel):
     audit: AuditConfig = Field(default_factory=AuditConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+
+    @model_validator(mode="after")
+    def _normalize_instances(self) -> MarshalConfig:
+        """Backfill ``instances`` from singular ``ollama.host`` if empty.
+
+        Existing v0.4.0 configs ship the legacy singular form
+        (``ollama: {host: ...}``); marshal continues to honor that
+        without requiring a config rewrite. After this validator,
+        ``self.instances`` always has at least one entry, ordered by
+        descending precision (f16 → q8_0 → q4_0). Routing logic
+        treats ``instances[0]`` as the highest-precision tier.
+        """
+        if not self.instances:
+            self.instances = [
+                OllamaInstance(
+                    url=self.ollama.host,
+                    kv_cache_type=KVCacheType.F16,
+                    tier_label=TIER_PRIMARY,
+                )
+            ]
+            return self
+        # Validate the explicit list form.
+        seen_urls: set[str] = set()
+        for inst in self.instances:
+            if inst.url in seen_urls:
+                msg = f"duplicate Ollama instance URL: {inst.url!r}"
+                raise ValueError(msg)
+            seen_urls.add(inst.url)
+        # Sort by precision (highest first) so routing.pick_instance
+        # can walk top-down. f16 < q8_0 < q4_0 in the StrEnum order
+        # we declared, so reverse=False gives f16 first.
+        precision_rank = {
+            KVCacheType.F16: 0,
+            KVCacheType.Q8_0: 1,
+            KVCacheType.Q4_0: 2,
+        }
+        self.instances.sort(key=lambda i: precision_rank[i.kv_cache_type])
+        return self
 
     def get_program_config(self, program_id: str) -> ProgramConfig:
         """Get config for a program, falling back to 'default'."""
