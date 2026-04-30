@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multi-instance routing foundation (Track 2 stage 1)** — config
+  schema + pure decision logic for routing requests across multiple
+  Ollama instances at different KV cache precisions. New types in
+  `ollama_marshal.config`: `KVCacheType` (f16 / q8_0 / q4_0),
+  `OllamaInstance` (frozen Pydantic model with url + kv_cache_type
+  + tier_label), `MarshalConfig.instances` (list, auto-derived from
+  the legacy singular `ollama.host` form so existing configs work
+  unchanged). New `ollama_marshal.routing` module with
+  `pick_instance(state, fit_probe)` — pure function implementing the
+  decision tree (memory-pressure failover only, never per-program
+  "tier preference"). 15 unit tests in `tests/test_routing.py`. No
+  consumer reads the new types yet — production behavior unchanged
+  in this stage. Stage 2 (plumbing through MemoryManager / Scheduler
+  / Lifecycle / Server) ships in a follow-up commit.
 - **Integration test suite** — opt-in pytest suite under
   `tests/integration/` (24 tests across 7 files) that validates
   end-to-end behavior against the user's real Ollama. Runs locally

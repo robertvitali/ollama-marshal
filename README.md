@@ -387,6 +387,148 @@ FastAPI auto-generates Swagger UI and the OpenAPI spec:
 }
 ```
 
+## Multi-instance setup (optional, v0.5.0+)
+
+Marshal supports routing across multiple Ollama instances running at
+different KV cache precisions. The intended use case is **memory
+pressure failover**: when loading a big model + big `num_ctx` on the
+primary instance would require evicting active work, marshal routes
+the request to a smaller-precision instance instead of summarizing
+or trimming the prompt.
+
+This is **opt-in** — single-instance setups (the default) need no
+changes; existing v0.4.0 configs continue to work unchanged.
+
+### Why bother?
+
+The KV cache (the per-slot state every loaded model allocates,
+proportional to `num_ctx`) dominates VRAM for big-context requests.
+At `f16` (full precision, the default) the cache is ~2x larger than
+at `q8_0`, ~4x larger than at `q4_0`. Running a smaller-precision
+instance alongside the primary lets marshal hand off pressured
+requests without dropping context. Quality cost: q8_0 is usually
+invisible on chat workloads; q4_0 is more visible on long-context
+reasoning.
+
+### Setup walkthrough (macOS, launchd)
+
+This assumes you already have one Ollama instance running at
+`http://localhost:11434` with `OLLAMA_KV_CACHE_TYPE=f16` (the default
+`com.user.ollama-serve.plist` setup). We're adding a second instance
+on port 11444 with `q8_0`, optionally a third on 11454 with `q4_0`.
+
+The repo ships worked example plists at
+`examples/com.user.ollama-serve-q8.plist` and
+`examples/com.user.ollama-serve-q4.plist` — copy + adjust paths
+rather than hand-editing the original. Editing a copy is safer
+than diff-against-existing because Homebrew vs official-pkg vs
+manual-install Ollama distros ship different plist templates.
+
+1. **Copy the example plists into LaunchAgents:**
+
+    ```bash
+    cp examples/com.user.ollama-serve-q8.plist ~/Library/LaunchAgents/
+    # Optional last-resort tier:
+    # cp examples/com.user.ollama-serve-q4.plist ~/Library/LaunchAgents/
+    ```
+
+2. **Verify the plists for your install path.** The examples assume
+   Ollama is at `/opt/homebrew/opt/ollama/bin/ollama` (Homebrew). If
+   you installed via the official `.pkg`, the binary is at
+   `/usr/local/bin/ollama` — edit `ProgramArguments[0]` accordingly.
+   Same for `StandardErrorPath` / `StandardOutPath` if
+   `/opt/homebrew/var/log/` doesn't exist on your system.
+
+   `plutil -lint ~/Library/LaunchAgents/com.user.ollama-serve-q8.plist`
+   confirms the XML is well-formed.
+
+3. **Bootstrap it:**
+
+    ```bash
+    launchctl bootstrap gui/$UID \
+      ~/Library/LaunchAgents/com.user.ollama-serve-q8.plist
+    curl -s http://localhost:11444/api/version  # should respond
+    ```
+
+4. **Pull every model you want routable on the new instance.** Models
+   are addressed by name and routing assumes the same name resolves
+   on every configured instance:
+
+    ```bash
+    OLLAMA_HOST=127.0.0.1:11444 ollama pull qwen3.5:4b-bf16
+    # repeat for every model you expect to route to q8
+    ```
+
+5. **Optional: repeat steps 1-4 for the q4 plist** on port 11454 if
+   you want the last-resort tier.
+
+6. **Update `~/.ollama-marshal/marshal.yaml`** to declare the
+   instances:
+
+    ```yaml
+    # Replace the legacy singular form:
+    #   ollama:
+    #     host: "http://localhost:11434"
+    # with the explicit list form:
+    instances:
+      - url: "http://localhost:11434"
+        kv_cache_type: f16
+        tier_label: primary
+
+      - url: "http://localhost:11444"
+        kv_cache_type: q8_0
+        tier_label: fallback
+
+      # Optional last-resort tier:
+      - url: "http://localhost:11454"
+        kv_cache_type: q4_0
+        tier_label: last_resort
+    ```
+
+7. **Restart marshal:**
+
+    ```bash
+    launchctl kickstart -k gui/$UID/com.ollama-marshal
+    ```
+
+### Routing behavior
+
+Marshal walks the routing tree per-request:
+
+- **Loaded on f16 → use f16** (already-loaded wins).
+- **Loaded on q8 → use q8** (q8 is "good enough — don't pay the
+  load tax to promote").
+- **Loaded on q4 only → try to escape**: f16 if it fits without
+  evicting active work, else q8 if it strictly fits, else stay on q4.
+- **Cold start → walk top-down**: f16 if no eviction needed; else
+  q8 if it strictly fits; else q4 as last resort.
+
+### Caveats
+
+- **Pull every model on every instance with the same name.** Ollama
+  models are addressed by name (e.g. `qwen3.5:4b-bf16`), and routing
+  uses the same name string against every instance. If you `ollama
+  pull qwen3.5:4b-bf16` only on the f16 instance, marshal can't
+  route requests for that model to q8 even when memory pressure
+  triggers fallback — the q8 instance simply doesn't have the
+  model. Run `ollama pull <name>` against EACH instance you
+  configure (set `OLLAMA_HOST` for the pull command, e.g.
+  `OLLAMA_HOST=127.0.0.1:11444 ollama pull qwen3.5:4b-bf16`).
+- Marshal does NOT verify the `kv_cache_type` field matches the
+  instance's actual `OLLAMA_KV_CACHE_TYPE` env var. Mismatches
+  surface as wrong fit calculations + surprising OOM. Double-check
+  each plist's env block.
+- Each instance runs its own copy of any model used in both tiers.
+  Disk storage is shared via Ollama's blob cache; VRAM is not.
+- `marshal doctor` currently reports recommendations for instance 0
+  only (not multi-instance aware in v0.5.0). If you run doctor against
+  a non-primary instance, ignore the `OLLAMA_KV_CACHE_TYPE=q8_0`
+  recommendation for the f16 tier — it's the wrong advice for that
+  instance.
+- Failover triggers on memory pressure, NOT on instance death. If
+  the q8 instance crashes, requests routed to it will fail until
+  launchd's `KeepAlive: true` brings it back.
+
 ## Running integration tests locally (v0.5.0+)
 
 Marshal ships with an opt-in integration test suite under

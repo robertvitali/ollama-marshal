@@ -16,12 +16,17 @@ scheduling that maximizes VRAM utilization.
 ## Project Layout
 
 ```
-src/ollama_marshal/    — package source (12 modules)
+src/ollama_marshal/    — package source (13 modules)
 tests/                 — pytest unit + integration tests
 ```
 
-Modules in dependency order: config → audit → queue → registry → memory →
-lifecycle → scheduler → stream → openai_compat → server → dashboard → cli
+Modules in dependency order: config → routing → audit → queue → registry →
+memory → lifecycle → scheduler → stream → openai_compat → server →
+dashboard → cli
+
+(`routing.py` is pure decision logic — no I/O, no async, no
+MemoryManager. Imports only `config.py`. Easy to test in isolation.
+See `pick_instance()` for the multi-instance failover decision tree.)
 
 (`audit.py` only depends on `config.py` — listed near the top to reflect
 the actual import graph. The scheduler intentionally avoids importing
