@@ -1199,3 +1199,96 @@ class TestPerInstanceRefresh:
         assert manager.is_loaded_on("x:1", "http://localhost:11434")
         assert manager.is_loaded_on("x:1", "http://localhost:11454")
         assert not manager.is_loaded_on("x:1", "http://localhost:11444")
+
+
+# ---------------------------------------------------------------------------
+# Per-instance reachability (v0.5.0+)
+# ---------------------------------------------------------------------------
+
+
+class TestIsInstanceReachable:
+    """``is_instance_reachable`` flips per-poll based on outcome.
+
+    Used by /api/marshal/status to expose per-instance health to
+    operators. Starts False (no poll seen yet); flips True after a
+    successful poll, False after a poll error.
+    """
+
+    def test_starts_false_before_first_poll(self):
+        manager = _make_multi_manager()
+        for inst in manager.instances:
+            assert manager.is_instance_reachable(inst.url) is False
+
+    def test_unknown_url_is_unreachable(self):
+        # Defensive: a status payload consumer asking about an instance
+        # that's not in the configured list gets False, not a KeyError.
+        manager = _make_multi_manager()
+        assert manager.is_instance_reachable("http://nope:9999") is False
+
+    async def test_flips_true_on_successful_poll(self):
+        manager = _make_multi_manager()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"models": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            await manager.refresh()
+
+        # All three instances polled successfully → all reachable.
+        for inst in manager.instances:
+            assert manager.is_instance_reachable(inst.url) is True
+
+    async def test_flips_false_on_poll_error(self):
+        manager = _make_multi_manager()
+
+        async def fake_get(url, timeout=10):
+            # f16 succeeds, q8 errors, q4 succeeds.
+            if "11444" in url:
+                raise httpx.HTTPError("q8 down")
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {"models": []}
+            mock_resp.raise_for_status = MagicMock()
+            return mock_resp
+
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(side_effect=fake_get)
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            await manager.refresh()
+
+        assert manager.is_instance_reachable("http://localhost:11434") is True
+        assert manager.is_instance_reachable("http://localhost:11444") is False
+        assert manager.is_instance_reachable("http://localhost:11454") is True
+
+    async def test_flips_back_on_recovery(self):
+        # Instance recovers between polls — reachability flips back to
+        # True. Per-poll outcome is the source of truth, no time-decay.
+        manager = _make_multi_manager()
+        call_state = {"calls": 0}
+
+        async def fake_get(url, timeout=10):
+            call_state["calls"] += 1
+            # First batch: q8 errors. Second batch: all succeed.
+            if "11444" in url and call_state["calls"] <= 3:
+                raise httpx.HTTPError("transient")
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {"models": []}
+            mock_resp.raise_for_status = MagicMock()
+            return mock_resp
+
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(side_effect=fake_get)
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            await manager.refresh()
+
+        assert manager.is_instance_reachable("http://localhost:11444") is False
+
+        # Second poll — q8 recovers.
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            await manager.refresh()
+
+        assert manager.is_instance_reachable("http://localhost:11444") is True

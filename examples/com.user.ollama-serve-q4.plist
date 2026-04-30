@@ -13,6 +13,11 @@
   Verify:
     curl -s http://localhost:11454/api/version
 
+  No OLLAMA_MODELS env override is set, so this daemon shares
+  ~/.ollama/models/ with the primary daemon at :11434. Models pulled
+  via the default daemon are immediately available here without any
+  repulling — `ollama pull <name>` once is enough for every tier.
+
   See README "Multi-instance setup" for the full walkthrough +
   marshal.yaml integration.
 -->

@@ -332,6 +332,27 @@ def _register_routes(app: FastAPI) -> None:
         active_progs = _scheduler.active_programs_by_model()
         sysmem = psutil.virtual_memory()
         sysswap = psutil.swap_memory()
+        # url → tier_label map for enriching loaded_models entries
+        # (so consumers don't need to cross-reference the instances
+        # array separately to get the tier of each loaded model).
+        url_to_tier = {inst.url: inst.tier_label for inst in _memory.instances}
+        # Per-instance breakdown — sibling of memory/queue/metrics.
+        # Always present; for legacy single-instance configs the
+        # validator backfills a single f16 entry, so this is a list
+        # of length 1 in that case (consistent shape).
+        instances_payload = []
+        for inst in _memory.instances:
+            here = _memory.get_loaded_models_on(inst.url)
+            instances_payload.append(
+                {
+                    "url": inst.url,
+                    "kv_cache_type": inst.kv_cache_type.value,
+                    "tier_label": inst.tier_label,
+                    "reachable": _memory.is_instance_reachable(inst.url),
+                    "loaded_models": sorted(here.keys()),
+                    "used_vram": sum(m.size_vram for m in here.values()),
+                }
+            )
         return {
             "uptime_seconds": round(time.monotonic() - _started_at, 1),
             "loaded_models": [
@@ -346,9 +367,15 @@ def _register_routes(app: FastAPI) -> None:
                         set(pending_progs.get(m.name, []))
                         | set(active_progs.get(m.name, []))
                     ),
+                    # v0.5.0+: which instance holds this copy + its tier.
+                    # For legacy single-instance setups this is the
+                    # primary URL with tier_label="primary".
+                    "instance_url": m.instance_url,
+                    "tier_label": url_to_tier.get(m.instance_url),
                 }
                 for m in loaded.values()
             ],
+            "instances": instances_payload,
             "memory": {
                 # Marshal's budget (kept for backward compat with v0.1.x).
                 "total": _memory.budget.total_ram,

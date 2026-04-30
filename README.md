@@ -450,16 +450,21 @@ manual-install Ollama distros ship different plist templates.
     curl -s http://localhost:11444/api/version  # should respond
     ```
 
-4. **Pull every model you want routable on the new instance.** Models
-   are addressed by name and routing assumes the same name resolves
-   on every configured instance:
+4. **Verify the new daemon sees your existing models.** No repulling
+   needed — Ollama daemons share `~/.ollama/models/` by default, and
+   the example plists deliberately don't override `OLLAMA_MODELS`.
+   The model count from the new instance should match the primary:
 
     ```bash
-    OLLAMA_HOST=127.0.0.1:11444 ollama pull qwen3.5:4b-bf16
-    # repeat for every model you expect to route to q8
+    curl -s http://localhost:11434/api/tags | jq '.models | length'
+    curl -s http://localhost:11444/api/tags | jq '.models | length'
+    # Both numbers should match.
     ```
 
-5. **Optional: repeat steps 1-4 for the q4 plist** on port 11454 if
+   Only if you set `OLLAMA_MODELS=/some/other/path` on a daemon would
+   you need to repull. The example plists don't do this.
+
+5. **Optional: repeat steps 1-3 for the q4 plist** on port 11454 if
    you want the last-resort tier.
 
 6. **Update `~/.ollama-marshal/marshal.yaml`** to declare the
@@ -505,21 +510,22 @@ Marshal walks the routing tree per-request:
 
 ### Caveats
 
-- **Pull every model on every instance with the same name.** Ollama
-  models are addressed by name (e.g. `qwen3.5:4b-bf16`), and routing
-  uses the same name string against every instance. If you `ollama
-  pull qwen3.5:4b-bf16` only on the f16 instance, marshal can't
-  route requests for that model to q8 even when memory pressure
-  triggers fallback — the q8 instance simply doesn't have the
-  model. Run `ollama pull <name>` against EACH instance you
-  configure (set `OLLAMA_HOST` for the pull command, e.g.
-  `OLLAMA_HOST=127.0.0.1:11444 ollama pull qwen3.5:4b-bf16`).
+- **Models are shared by default; only override `OLLAMA_MODELS` if you
+  want isolated per-daemon stores.** Ollama daemons read
+  `~/.ollama/models/` unless you set `OLLAMA_MODELS=/some/other/path`
+  in the plist's env block. The example plists deliberately omit that
+  override, so a single `ollama pull qwen3.5:4b-bf16` makes the model
+  available on every daemon — no repulling. If your operational policy
+  requires per-tier model stores (e.g. air-gapped audit boundary), set
+  `OLLAMA_MODELS` differently on each plist and pull on each one.
 - Marshal does NOT verify the `kv_cache_type` field matches the
   instance's actual `OLLAMA_KV_CACHE_TYPE` env var. Mismatches
   surface as wrong fit calculations + surprising OOM. Double-check
   each plist's env block.
-- Each instance runs its own copy of any model used in both tiers.
-  Disk storage is shared via Ollama's blob cache; VRAM is not.
+- Each instance maintains its own loaded-in-VRAM copy of any model
+  used at that tier. Disk storage is shared (one copy in
+  `~/.ollama/models/`), but VRAM is not — loading the same model on
+  f16 and q8 simultaneously consumes RAM in both places.
 - `marshal doctor` currently reports recommendations for instance 0
   only (not multi-instance aware in v0.5.0). If you run doctor against
   a non-primary instance, ignore the `OLLAMA_KV_CACHE_TYPE=q8_0`

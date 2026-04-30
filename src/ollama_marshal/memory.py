@@ -126,6 +126,14 @@ class MemoryManager:
         # unexpected unload on ANY instance. The scheduler reads + zeros
         # this to roll the value into SchedulerMetrics.unexpected_unloads.
         self.unexpected_unloads_observed: int = 0
+        # Per-instance reachability — flips True after the first
+        # successful /api/ps poll, False after a poll error. Surfaces
+        # in the /api/marshal/status payload so operators can see at a
+        # glance which instances are alive. Starts False so we don't
+        # claim instances are reachable before we've actually polled.
+        self._last_poll_ok: dict[str, bool] = {
+            inst.url: False for inst in self._instances
+        }
 
     @property
     def instances(self) -> list[OllamaInstance]:
@@ -203,11 +211,14 @@ class MemoryManager:
             )
         for inst, result in zip(self._instances, results, strict=True):
             if isinstance(result, BaseException):
+                self._last_poll_ok[inst.url] = False
                 logger.warning(
                     "memory.refresh_failed",
                     instance=inst.url,
                     reason="cannot reach Ollama",
                 )
+            else:
+                self._last_poll_ok[inst.url] = True
 
     async def _refresh_one(
         self,
@@ -363,6 +374,19 @@ class MemoryManager:
             if model in self._loaded_models.get(inst.url, {}):
                 return inst.url
         return None
+
+    def is_instance_reachable(self, instance_url: str) -> bool:
+        """Whether the most recent poll of ``instance_url`` succeeded.
+
+        Surfaced in the ``/api/marshal/status`` payload so operators
+        can spot a dead daemon at a glance. Starts ``False`` for every
+        instance until the first successful poll; flips on each
+        subsequent poll based on outcome.
+
+        Returns ``False`` for unknown URLs (not in the configured
+        instance list).
+        """
+        return self._last_poll_ok.get(instance_url, False)
 
     def used_vram(self) -> int:
         """Get total VRAM currently used by loaded models (across all instances).
