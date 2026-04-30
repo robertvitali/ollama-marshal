@@ -417,23 +417,30 @@ This assumes you already have one Ollama instance running at
 `com.user.ollama-serve.plist` setup). We're adding a second instance
 on port 11444 with `q8_0`, optionally a third on 11454 with `q4_0`.
 
-1. **Copy the existing plist for the q8 instance:**
+The repo ships worked example plists at
+`examples/com.user.ollama-serve-q8.plist` and
+`examples/com.user.ollama-serve-q4.plist` — copy + adjust paths
+rather than hand-editing the original. Editing a copy is safer
+than diff-against-existing because Homebrew vs official-pkg vs
+manual-install Ollama distros ship different plist templates.
+
+1. **Copy the example plists into LaunchAgents:**
 
     ```bash
-    cp ~/Library/LaunchAgents/com.user.ollama-serve.plist \
-       ~/Library/LaunchAgents/com.user.ollama-serve-q8.plist
+    cp examples/com.user.ollama-serve-q8.plist ~/Library/LaunchAgents/
+    # Optional last-resort tier:
+    # cp examples/com.user.ollama-serve-q4.plist ~/Library/LaunchAgents/
     ```
 
-2. **Edit the q8 plist:**
-    - Change `<string>com.user.ollama-serve</string>` →
-      `<string>com.user.ollama-serve-q8</string>` (Label key)
-    - Change `<key>OLLAMA_KV_CACHE_TYPE</key>\n<string>f16</string>`
-      → `<string>q8_0</string>`
-    - Add `<key>OLLAMA_HOST</key>\n<string>127.0.0.1:11444</string>`
-      to the EnvironmentVariables dict
-    - Change StandardErrorPath / StandardOutPath log paths so the
-      two instances don't fight over the same log file (e.g.
-      `/opt/homebrew/var/log/ollama-q8.log`)
+2. **Verify the plists for your install path.** The examples assume
+   Ollama is at `/opt/homebrew/opt/ollama/bin/ollama` (Homebrew). If
+   you installed via the official `.pkg`, the binary is at
+   `/usr/local/bin/ollama` — edit `ProgramArguments[0]` accordingly.
+   Same for `StandardErrorPath` / `StandardOutPath` if
+   `/opt/homebrew/var/log/` doesn't exist on your system.
+
+   `plutil -lint ~/Library/LaunchAgents/com.user.ollama-serve-q8.plist`
+   confirms the XML is well-formed.
 
 3. **Bootstrap it:**
 
@@ -443,11 +450,19 @@ on port 11444 with `q8_0`, optionally a third on 11454 with `q4_0`.
     curl -s http://localhost:11444/api/version  # should respond
     ```
 
-4. **Optional: repeat for q4 on port 11454** with
-   `OLLAMA_KV_CACHE_TYPE=q4_0` and a new `com.user.ollama-serve-q4`
-   label.
+4. **Pull every model you want routable on the new instance.** Models
+   are addressed by name and routing assumes the same name resolves
+   on every configured instance:
 
-5. **Update `~/.ollama-marshal/marshal.yaml`** to declare the
+    ```bash
+    OLLAMA_HOST=127.0.0.1:11444 ollama pull qwen3.5:4b-bf16
+    # repeat for every model you expect to route to q8
+    ```
+
+5. **Optional: repeat steps 1-4 for the q4 plist** on port 11454 if
+   you want the last-resort tier.
+
+6. **Update `~/.ollama-marshal/marshal.yaml`** to declare the
    instances:
 
     ```yaml
@@ -470,7 +485,7 @@ on port 11444 with `q8_0`, optionally a third on 11454 with `q4_0`.
         tier_label: last_resort
     ```
 
-6. **Restart marshal:**
+7. **Restart marshal:**
 
     ```bash
     launchctl kickstart -k gui/$UID/com.ollama-marshal
@@ -490,6 +505,15 @@ Marshal walks the routing tree per-request:
 
 ### Caveats
 
+- **Pull every model on every instance with the same name.** Ollama
+  models are addressed by name (e.g. `qwen3.5:4b-bf16`), and routing
+  uses the same name string against every instance. If you `ollama
+  pull qwen3.5:4b-bf16` only on the f16 instance, marshal can't
+  route requests for that model to q8 even when memory pressure
+  triggers fallback — the q8 instance simply doesn't have the
+  model. Run `ollama pull <name>` against EACH instance you
+  configure (set `OLLAMA_HOST` for the pull command, e.g.
+  `OLLAMA_HOST=127.0.0.1:11444 ollama pull qwen3.5:4b-bf16`).
 - Marshal does NOT verify the `kv_cache_type` field matches the
   instance's actual `OLLAMA_KV_CACHE_TYPE` env var. Mismatches
   surface as wrong fit calculations + surprising OOM. Double-check
@@ -497,7 +521,10 @@ Marshal walks the routing tree per-request:
 - Each instance runs its own copy of any model used in both tiers.
   Disk storage is shared via Ollama's blob cache; VRAM is not.
 - `marshal doctor` currently reports recommendations for instance 0
-  only (not multi-instance aware in v0.5.0).
+  only (not multi-instance aware in v0.5.0). If you run doctor against
+  a non-primary instance, ignore the `OLLAMA_KV_CACHE_TYPE=q8_0`
+  recommendation for the f16 tier — it's the wrong advice for that
+  instance.
 - Failover triggers on memory pressure, NOT on instance death. If
   the q8 instance crashes, requests routed to it will fail until
   launchd's `KeepAlive: true` brings it back.

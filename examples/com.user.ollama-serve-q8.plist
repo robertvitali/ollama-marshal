@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Worked example launchd plist for the q8_0 fallback instance of
+  Ollama, used by marshal's multi-instance memory-pressure failover.
+
+  Place at: ~/Library/LaunchAgents/com.user.ollama-serve-q8.plist
+  Bootstrap:
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.user.ollama-serve-q8.plist
+  Verify:
+    curl -s http://localhost:11444/api/version
+
+  Adjust ProgramArguments[0] if Ollama is installed somewhere other
+  than /opt/homebrew/opt/ollama/bin/ollama (e.g. via the official
+  .pkg installer it lives at /usr/local/bin/ollama).
+
+  Adjust the log path under StandardErrorPath/StandardOutPath if
+  /opt/homebrew/var/log/ doesn't exist on your system.
+
+  See README "Multi-instance setup" for the full walkthrough +
+  marshal.yaml integration.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.user.ollama-serve-q8</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/opt/ollama/bin/ollama</string>
+		<string>serve</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>OLLAMA_HOST</key>
+		<string>127.0.0.1:11444</string>
+		<key>OLLAMA_KV_CACHE_TYPE</key>
+		<string>q8_0</string>
+		<key>OLLAMA_FLASH_ATTENTION</key>
+		<string>1</string>
+		<key>OLLAMA_LOAD_TIMEOUT</key>
+		<string>10m</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>StandardErrorPath</key>
+	<string>/opt/homebrew/var/log/ollama-q8.log</string>
+
+	<key>StandardOutPath</key>
+	<string>/opt/homebrew/var/log/ollama-q8.log</string>
+
+	<key>WorkingDirectory</key>
+	<string>/opt/homebrew/var</string>
+</dict>
+</plist>

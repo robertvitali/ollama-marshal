@@ -236,3 +236,102 @@ def test_two_instance_setup_q8_q4_only_no_f16_in_play():
     )
     assert decision.instance == Q8
     assert decision.reason == RoutingReason.FALLBACK_FITS
+
+
+# ---------------------------------------------------------------------------
+# Reason precision: PRIMARY_FITS vs PRIMARY_EVICTING_IDLE
+# ---------------------------------------------------------------------------
+
+
+def test_cold_start_primary_fits_when_fit_probe_fits_true():
+    """Cleanly-fits f16 → PRIMARY_FITS."""
+    decision = pick_instance(
+        _state(F16, Q8, Q4),
+        fit_probe={F16.url: FITS},
+    )
+    assert decision.reason == RoutingReason.PRIMARY_FITS
+
+
+def test_cold_start_primary_evicting_idle_distinguished_from_fits():
+    """f16 fits-only-by-evicting-idle → PRIMARY_EVICTING_IDLE (not PRIMARY_FITS).
+
+    Audit log needs to distinguish "no eviction needed" from "evicting
+    idle work but B-rule still allows it" — both route to f16 but
+    operators reading the log shouldn't conflate the memory states.
+    """
+    decision = pick_instance(
+        _state(F16, Q8, Q4),
+        fit_probe={F16.url: WOULD_EVICT_ONLY_IDLE},
+    )
+    assert decision.instance == F16
+    assert decision.reason == RoutingReason.PRIMARY_EVICTING_IDLE
+
+
+# ---------------------------------------------------------------------------
+# Two-instance topologies missed by the original test pass
+# ---------------------------------------------------------------------------
+
+
+def test_already_loaded_on_q4_no_f16_promotes_to_q8():
+    """No f16 configured, q4 has the model, q8 fits → promote to q8."""
+    decision = pick_instance(
+        _state(Q8, Q4, loaded_on={Q4: {"qwen3.5:4b-bf16"}}),
+        fit_probe={Q8.url: FITS},
+    )
+    assert decision.instance == Q8
+    assert decision.reason == RoutingReason.PROMOTING_FROM_LAST_RESORT
+    assert decision.unload_from == [Q4]
+
+
+def test_already_loaded_on_q8_no_f16_stays():
+    """No f16 configured, q8 has the model → stay on q8."""
+    decision = pick_instance(
+        _state(Q8, Q4, loaded_on={Q8: {"qwen3.5:4b-bf16"}}),
+        fit_probe={},
+    )
+    assert decision.instance == Q8
+    assert decision.reason == RoutingReason.ALREADY_LOADED
+
+
+def test_already_loaded_on_f16_no_q8_unloads_only_q4_straggler():
+    """f16 + q4 only (no q8), model on both → use f16, unload q4."""
+    decision = pick_instance(
+        _state(
+            F16,
+            Q4,
+            loaded_on={F16: {"qwen3.5:4b-bf16"}, Q4: {"qwen3.5:4b-bf16"}},
+        ),
+        fit_probe={},
+    )
+    assert decision.instance == F16
+    assert decision.unload_from == [Q4]
+
+
+# ---------------------------------------------------------------------------
+# Missing-probe contract: if caller forgets to populate, cascade gracefully
+# ---------------------------------------------------------------------------
+
+
+def test_missing_f16_probe_falls_to_q8():
+    """Caller didn't populate f16 probe → treat as ineligible, try q8.
+
+    Pins the cascade contract for Stage 2: a forgotten probe entry
+    silently routes to lower tier rather than panicking. A future
+    Stage 2 caller that misses populating one instance gets the
+    behavior captured here, not a surprise.
+    """
+    decision = pick_instance(
+        _state(F16, Q8, Q4),
+        fit_probe={Q8.url: FITS, Q4.url: FITS},  # f16 entry missing
+    )
+    assert decision.instance == Q8
+
+
+def test_completely_empty_fit_probe_falls_to_q4():
+    """Empty probe dict → cascade all the way to q4 (last resort)."""
+    decision = pick_instance(
+        _state(F16, Q8, Q4),
+        fit_probe={},
+    )
+    assert decision.instance == Q4
+    assert decision.reason == RoutingReason.FALLBACK_NO_FIT

@@ -44,7 +44,12 @@ class RoutingReason(StrEnum):
     """Model is already loaded on this instance; using it directly."""
 
     PRIMARY_FITS = "primary_fits"
-    """Cold-start: f16 has room for the model + KV cache."""
+    """Cold-start: f16 has room with no eviction needed."""
+
+    PRIMARY_EVICTING_IDLE = "primary_evicting_idle"
+    """Cold-start: f16 fits only by evicting idle models — still B-rule
+    OK (only non-idle eviction triggers fallback to q8). Distinct from
+    ``PRIMARY_FITS`` so audit logs reflect the real memory state."""
 
     PRIMARY_WOULD_EVICT = "primary_would_evict"
     """f16 can't fit without evicting a non-idle model — falling back."""
@@ -192,10 +197,12 @@ def pick_instance(
         q4.url, set()
     )
 
-    if loaded_on_f16:
+    if loaded_on_f16 and f16 is not None:
         # Already on the highest tier — done. (Unload q8/q4 stragglers
-        # if they exist, though that should be rare.)
-        assert f16 is not None
+        # if they exist, though that should be rare.) The redundant
+        # ``f16 is not None`` clause is a no-op at runtime (implied
+        # by ``loaded_on_f16``) but lets mypy narrow the type without
+        # an ``assert`` that would be stripped under ``python -O``.
         unload = []
         if loaded_on_q8 and q8 is not None:
             unload.append(q8)
@@ -207,9 +214,8 @@ def pick_instance(
             unload_from=unload,
         )
 
-    if loaded_on_q8:
+    if loaded_on_q8 and q8 is not None:
         # q8 is "good enough — don't pay the load tax to promote".
-        assert q8 is not None
         unload = []
         if loaded_on_q4 and q4 is not None:
             unload.append(q4)
@@ -219,13 +225,12 @@ def pick_instance(
             unload_from=unload,
         )
 
-    if loaded_on_q4:
+    if loaded_on_q4 and q4 is not None:
         # q4 only — try to escape. Apply B-rule for f16, A-rule for q8.
         if f16 is not None:
             f16_probe = fit_probe.get(f16.url)
             if f16_probe is not None and not f16_probe.would_evict_non_idle:
                 # f16 fits without evicting work → promote.
-                assert q4 is not None
                 return RoutingDecision(
                     instance=f16,
                     reason=RoutingReason.PROMOTING_FROM_LAST_RESORT,
@@ -235,14 +240,12 @@ def pick_instance(
             q8_probe = fit_probe.get(q8.url)
             if q8_probe is not None and q8_probe.fits:
                 # q8 strictly fits (A-rule) → promote.
-                assert q4 is not None
                 return RoutingDecision(
                     instance=q8,
                     reason=RoutingReason.PROMOTING_FROM_LAST_RESORT,
                     unload_from=[q4],
                 )
         # Neither tier can take it → stay on q4.
-        assert q4 is not None
         return RoutingDecision(
             instance=q4,
             reason=RoutingReason.ALREADY_LOADED,
@@ -253,9 +256,16 @@ def pick_instance(
     if f16 is not None:
         f16_probe = fit_probe.get(f16.url)
         if f16_probe is not None and not f16_probe.would_evict_non_idle:
+            # B-rule passed: either fits cleanly OR fits-by-evicting-idle.
+            # Distinguish the two so audit logs reflect reality.
+            reason = (
+                RoutingReason.PRIMARY_FITS
+                if f16_probe.fits
+                else RoutingReason.PRIMARY_EVICTING_IDLE
+            )
             return RoutingDecision(
                 instance=f16,
-                reason=RoutingReason.PRIMARY_FITS,
+                reason=reason,
                 unload_from=[],
             )
 
@@ -283,11 +293,16 @@ def pick_instance(
             unload_from=[],
         )
 
-    # Reaching here means f16/q8/q4 are all None but len(instances) >=
-    # 2 — possible only with non-canonical kv_cache_types we don't
-    # know how to rank. Fall back to first configured instance.
-    return RoutingDecision(
-        instance=state.instances[0],
-        reason=RoutingReason.SINGLE_INSTANCE,
-        unload_from=[],
+    # Unreachable given the closed ``KVCacheType`` enum (every member
+    # is mapped into ``tier_to_instance`` above; with len(instances) >=
+    # 2 at least two of f16/q8/q4 must be non-None). If we ever land
+    # here, the type system was bypassed (e.g. someone added a new
+    # KVCacheType variant without updating routing) — surface loudly
+    # rather than silently emit a wrong-shaped audit decision.
+    msg = (
+        f"routing.pick_instance: unreachable state — none of f16/q8/q4 "
+        f"matched among {len(state.instances)} configured instance(s). "
+        f"This means a new KVCacheType variant was added without "
+        f"updating pick_instance."
     )
+    raise RuntimeError(msg)

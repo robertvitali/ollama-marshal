@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Worked example launchd plist for the q4_0 last-resort instance of
+  Ollama, used by marshal when even q8_0 cannot fit a request.
+
+  This tier is OPTIONAL — most users will run only f16 (primary) +
+  q8_0 (fallback). Add this third tier only if you regularly hit
+  scenarios where q8 also can't accommodate.
+
+  Place at: ~/Library/LaunchAgents/com.user.ollama-serve-q4.plist
+  Bootstrap:
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.user.ollama-serve-q4.plist
+  Verify:
+    curl -s http://localhost:11454/api/version
+
+  See README "Multi-instance setup" for the full walkthrough +
+  marshal.yaml integration.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.user.ollama-serve-q4</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/opt/ollama/bin/ollama</string>
+		<string>serve</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>OLLAMA_HOST</key>
+		<string>127.0.0.1:11454</string>
+		<key>OLLAMA_KV_CACHE_TYPE</key>
+		<string>q4_0</string>
+		<key>OLLAMA_FLASH_ATTENTION</key>
+		<string>1</string>
+		<key>OLLAMA_LOAD_TIMEOUT</key>
+		<string>10m</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>StandardErrorPath</key>
+	<string>/opt/homebrew/var/log/ollama-q4.log</string>
+
+	<key>StandardOutPath</key>
+	<string>/opt/homebrew/var/log/ollama-q4.log</string>
+
+	<key>WorkingDirectory</key>
+	<string>/opt/homebrew/var</string>
+</dict>
+</plist>

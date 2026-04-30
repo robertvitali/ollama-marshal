@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Default config search paths (in priority order)
 _CONFIG_SEARCH_PATHS = [
@@ -84,9 +84,30 @@ class OllamaInstance(BaseModel):
         description=(
             "Full base URL of this Ollama instance, e.g. "
             "'http://localhost:11434'. Must be reachable from marshal's "
-            "host (typically all instances run on the same machine)."
+            "host (typically all instances run on the same machine). "
+            "Normalized at validation time: trailing slash stripped + "
+            "scheme/host lowercased so cosmetic-only differences "
+            "(e.g. 'http://Localhost:11434/' vs 'http://localhost:11434') "
+            "don't bypass the duplicate-URL check on MarshalConfig."
         ),
     )
+
+    @field_validator("url", mode="after")
+    @classmethod
+    def _normalize_url(cls, v: str) -> str:
+        """Strip trailing slash + lowercase the scheme/host."""
+        v = v.rstrip("/")
+        # Lowercase scheme and host but leave anything after the first
+        # slash alone (Ollama doesn't use path components today, but
+        # don't lowercase a future query string in place).
+        if "://" in v:
+            scheme, _, rest = v.partition("://")
+            host_part, slash, after = rest.partition("/")
+            v = f"{scheme.lower()}://{host_part.lower()}"
+            if slash:
+                v = f"{v}/{after}"
+        return v
+
     kv_cache_type: KVCacheType = Field(
         default=KVCacheType.F16,
         description=(
@@ -516,6 +537,20 @@ class MarshalConfig(BaseModel):
                 )
             ]
             return self
+        # Both legacy ``ollama.host`` and explicit ``instances`` set:
+        # explicit list wins, but sync the legacy field to the primary
+        # instance URL so consumers that still read ``config.ollama.host``
+        # (memory.py, server.py, etc — Stage 2 will refactor these to
+        # walk ``instances`` instead) don't silently use the legacy
+        # value while routing uses a different one. The sync removes
+        # the split-brain risk during the Stage 1 → Stage 2 transition.
+        primary_url = self.instances[0].url
+        if self.ollama.host != primary_url:
+            # Pydantic's ``frozen=True`` on OllamaConfig isn't set, so
+            # this assignment works. We don't log here because config
+            # loaders may run before logging is configured; a startup
+            # smoke-check in server.py logs the sync if it fired.
+            self.ollama = OllamaConfig(host=primary_url)
         # Validate the explicit list form.
         seen_urls: set[str] = set()
         for inst in self.instances:
@@ -524,13 +559,12 @@ class MarshalConfig(BaseModel):
                 raise ValueError(msg)
             seen_urls.add(inst.url)
         # Sort by precision (highest first) so routing.pick_instance
-        # can walk top-down. f16 < q8_0 < q4_0 in the StrEnum order
-        # we declared, so reverse=False gives f16 first.
-        precision_rank = {
-            KVCacheType.F16: 0,
-            KVCacheType.Q8_0: 1,
-            KVCacheType.Q4_0: 2,
-        }
+        # can walk top-down. KVCacheType members are declared in
+        # highest-to-lowest precision order, so deriving the rank
+        # from enum declaration order keeps a single source of truth
+        # — adding a new variant in the right slot is enough; no
+        # parallel rank dict to update.
+        precision_rank = {kv: i for i, kv in enumerate(KVCacheType)}
         self.instances.sort(key=lambda i: precision_rank[i.kv_cache_type])
         return self
 
