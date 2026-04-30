@@ -64,7 +64,14 @@ async def test_app_starts_and_status_endpoint_works(marshal_app):
     body = resp.json()
     # Verify the canonical top-level shape — anything missing here
     # indicates the lifespan didn't fully initialize.
-    for key in ("uptime_seconds", "loaded_models", "memory", "queue", "metrics"):
+    for key in (
+        "uptime_seconds",
+        "loaded_models",
+        "instances",
+        "memory",
+        "queue",
+        "metrics",
+    ):
         assert key in body, f"missing top-level key: {key}"
     assert isinstance(body["loaded_models"], list)
     assert isinstance(body["metrics"], dict)
@@ -80,6 +87,23 @@ async def test_app_starts_and_status_endpoint_works(marshal_app):
         "reload_count",
     ):
         assert key in body["metrics"], f"missing metric: {key}"
+    # v0.5.0+: per-instance breakdown. Even on legacy single-instance
+    # setups this is a list with exactly one entry (the validator
+    # backfills `instances=[primary]`).
+    assert isinstance(body["instances"], list)
+    assert len(body["instances"]) >= 1
+    for inst in body["instances"]:
+        for key in (
+            "url",
+            "kv_cache_type",
+            "tier_label",
+            "reachable",
+            "loaded_models",
+            "used_vram",
+        ):
+            assert key in inst, f"missing instance field: {key}"
+        assert isinstance(inst["loaded_models"], list)
+        assert isinstance(inst["reachable"], bool)
 
 
 @_REQUIRES_MODEL
@@ -115,6 +139,14 @@ async def test_real_chat_round_trip(marshal_app):
     assert REQUIRED_MODEL in loaded_names, (
         f"expected {REQUIRED_MODEL} loaded; got {loaded_names}"
     )
+    # v0.5.0+: each loaded model entry is tagged with its instance and
+    # tier so an operator can correlate model → instance without
+    # cross-referencing the instances array.
+    loaded_entry = next(
+        m for m in status["loaded_models"] if m["name"] == REQUIRED_MODEL
+    )
+    assert loaded_entry.get("instance_url"), "instance_url not populated"
+    assert loaded_entry.get("tier_label"), "tier_label not populated"
 
 
 @_REQUIRES_MODEL

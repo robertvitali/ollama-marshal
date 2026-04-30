@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-instance state in `/api/marshal/status`** — the status payload
+  now includes a top-level `instances` array with one entry per
+  configured Ollama instance: `url`, `kv_cache_type`, `tier_label`,
+  `reachable` (boolean — true after a successful `/api/ps` poll, false
+  on poll error), `loaded_models` (list of model names on that
+  instance), and `used_vram` (sum of model size_vram on that
+  instance). Each entry in the existing `loaded_models` array is now
+  tagged with `instance_url` and `tier_label` so consumers can
+  correlate model → tier without cross-referencing the new array.
+  Legacy single-instance configs still produce a one-entry `instances`
+  list (the validator-backfilled primary), giving operator tooling a
+  consistent shape regardless of multi-instance setup. Backed by new
+  `MemoryManager.is_instance_reachable(url)` API; reachability flips
+  per-poll (no time-decay logic) and starts False until the first
+  successful poll.
+- **Three new multi-instance integration tests**:
+  - `test_fault_proxy_per_instance_unexpected_unload` — fault-proxy
+    based, runs on every integration suite invocation. Verifies that
+    when one Ollama instance drops a model unexpectedly while another
+    keeps it loaded, marshal counts the unload exactly once and
+    attributes it to the correct instance (no double-count, no
+    false-positive on the wrong tier).
+  - `test_a_rule_strict_q8_to_q4_fallback` — gated on three real
+    daemons (`_REQUIRES_THREE_INSTANCES`). Verifies the routing tree
+    walks through f16 → q8 → q4 under tight memory pressure and
+    chooses q4 with `routing_reason=fallback_no_fit` only when q8
+    strictly cannot fit.
+  - `test_q4_only_promotes_to_higher_tier_when_room` — gated on three
+    daemons. Pre-loads model on q4 only; verifies routing returns
+    `routing_reason=promoting_from_last_resort` with `unload_from=[q4]`
+    so the scheduler cleans up the stale copy after promotion.
+
+### Changed
+
+- **README "Multi-instance setup" walkthrough corrected.** Previous
+  versions of the bootstrap walkthrough instructed operators to run
+  `ollama pull` against every Ollama instance separately, claiming
+  daemons don't share model files. This was wrong — Ollama daemons
+  read `~/.ollama/models/` by default (no `OLLAMA_MODELS` env
+  override), so a single `ollama pull <name>` is enough; every daemon
+  on the box sees the model immediately. The walkthrough now uses
+  this happy path with a verification snippet (`curl /api/tags | jq
+  '.models | length'` from each daemon should match). The
+  per-daemon-pull instruction is preserved as a caveat for operators
+  who deliberately set `OLLAMA_MODELS` to isolate per-tier model
+  stores.
+- **Example launchd plists updated** with explicit comment confirming
+  the shared-store behavior — `examples/com.user.ollama-serve-q8.plist`
+  and `…-q4.plist` both note "no `OLLAMA_MODELS` env override → this
+  daemon shares `~/.ollama/models/` with the primary, no need to
+  repull."
+
 - **Multi-instance routing — Stage 2 plumbing (Track 2 stage 2)** —
   the Stage 1 routing decision is now wired through the actual
   request path. `MemoryManager` polls every configured Ollama

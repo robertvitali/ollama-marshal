@@ -16,6 +16,11 @@
   Adjust the log path under StandardErrorPath/StandardOutPath if
   /opt/homebrew/var/log/ doesn't exist on your system.
 
+  No OLLAMA_MODELS env override is set, so this daemon shares
+  ~/.ollama/models/ with the primary daemon at :11434. Models pulled
+  via the default daemon are immediately available here without any
+  repulling — `ollama pull <name>` once is enough for every tier.
+
   See README "Multi-instance setup" for the full walkthrough +
   marshal.yaml integration.
 -->
