@@ -687,7 +687,16 @@ class Scheduler:
            `scheduler.idle_eviction_minutes` (0 disables)
         6. Drop expired X-Burst-Size hints (cleanup; doesn't affect
            dispatch decisions on this tick)
+
+        Pause: when ``_dispatch_paused`` is set, the entire normal tick
+        body is skipped and only ``_tick_bypass_only`` runs. Non-bypass
+        envelopes pile up in the queue (no client-visible 503s); they
+        drain at full speed once ``resume`` flips the flag.
         """
+        if self._dispatch_paused:
+            await self._tick_bypass_only()
+            return
+
         # Step 1: Forward requests for models already loaded
         await self._forward_loaded_model_requests()
 
@@ -718,6 +727,47 @@ class Scheduler:
         unexpected = self.memory.take_unexpected_unload_count()
         if unexpected > 0:
             self.metrics.unexpected_unloads += unexpected
+
+    async def _tick_bypass_only(self) -> None:
+        """During admin pause, dispatch only bypass-flagged envelopes.
+
+        Bypass envelopes are tagged when the request handler sees a
+        valid ``X-Marshal-Test-Bypass`` header (matching
+        ``admin.test_bypass_token``). They represent integration test
+        traffic that needs to flow even while production dispatch is
+        frozen.
+
+        The flow per loaded-or-loadable model:
+          1. Pre-check the queue for any pending bypass envelopes
+             (cheap — peeks without removing).
+          2. If the model isn't loaded, force-load it via the same
+             eviction-aware path CRITICAL preemption uses. Test traffic
+             gets the strongest dispatch guarantee — no point pausing
+             dispatch for tests if the tests can't actually run.
+          3. Pop only the bypass envelopes for that model and dispatch
+             them via the standard ``_process_batch`` path. Non-bypass
+             envelopes for the same model stay in the queue.
+
+        Skip-counter incrementing and idle-eviction don't run during
+        pause — both would create misleading state for the post-resume
+        drain.
+        """
+        models = await self.queues.peek_models()
+        for model in models:
+            pending = await self.queues.pending_for_model(model)
+            if not any(e.bypass_pause for e in pending):
+                continue
+            if not self.memory.is_loaded(model):
+                num_ctx = await self._max_num_ctx_for_pending(model)
+                success = await self._ensure_model_loaded(model, num_ctx=num_ctx)
+                if not success:
+                    # Couldn't load — skip this model's bypass envelopes
+                    # this tick. Will retry next tick. Better than popping
+                    # them and failing the dispatches.
+                    continue
+            bypass_batch = await self.queues.dequeue_bypass_for_model(model)
+            if bypass_batch:
+                await self._process_batch(bypass_batch)
 
     def active_programs_by_model(self) -> dict[str, list[str]]:
         """Return programs that have recently dispatched against each loaded model.
@@ -1357,8 +1407,26 @@ class Scheduler:
         retry helper short-circuits), and `retry_max_override` on the
         envelope can disable or extend retry per-request.
 
+        Maintains ``_in_flight_count`` for the admin pause endpoint's
+        drain wait — increment at entry, decrement in the outer
+        ``finally`` block so the counter never drifts even when the
+        dispatch raises or is cancelled mid-stream.
+
         Args:
             envelope: The request to forward.
+        """
+        self._in_flight_count += 1
+        try:
+            await self._forward_single_inner(envelope)
+        finally:
+            self._in_flight_count = max(0, self._in_flight_count - 1)
+
+    async def _forward_single_inner(self, envelope: RequestEnvelope) -> None:
+        """Inner dispatch body for ``_forward_single``.
+
+        Separated so the outer ``_forward_single`` can do clean
+        ``_in_flight_count`` bookkeeping without nesting the entire
+        dispatch path inside a try/finally.
         """
         max_attempts = self._resolve_retry_attempts(envelope)
         retry_cfg = self.config.retry
