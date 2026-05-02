@@ -554,15 +554,38 @@ def _register_routes(app: FastAPI) -> None:
     async def marshal_debug() -> Response:
         """Internal-state inspection for integration tests.
 
-        Returns scheduler metrics, pause state, in-flight count, and
-        memory-manager allocated num_ctx per model. Production marshal
-        keeps this endpoint disabled (returns 404) to avoid leaking
-        scheduler internals over the proxy port.
+        Returns scheduler metrics, pause state, in-flight count, plus
+        memory-manager allocated_num_ctx_per_model and registry
+        metadata cache. Production marshal keeps this endpoint
+        disabled (returns 404) to avoid leaking scheduler internals
+        over the proxy port.
         """
         if not _config.debug.endpoint_enabled:
             return JSONResponse(
                 {"error": "debug endpoint not enabled"}, status_code=404
             )
+        # Flatten allocated_num_ctx across all instances. Tests usually
+        # care "did marshal allocate a slot for this model" without
+        # caring which instance — first-instance-wins matches the
+        # MemoryManager.get_allocated_num_ctx(instance_url=None) path.
+        allocated_per_model: dict[str, int] = {}
+        for inst_models in _memory._allocated_num_ctx.values():
+            for model_name, num_ctx in inst_models.items():
+                allocated_per_model.setdefault(model_name, num_ctx)
+        # Per-instance loaded models so tests can assert "model X is
+        # loaded on instance Y" without parsing /api/marshal/status.
+        loaded_per_instance: dict[str, list[str]] = {
+            inst.url: list(_memory._loaded_models.get(inst.url, {}).keys())
+            for inst in _memory._instances
+        }
+        # Registry metadata cache — surfaces architecture/max_ctx/
+        # kv_per_slot per model. Only includes models marshal has
+        # probed (cold registry returns empty dict).
+        from dataclasses import asdict
+
+        metadata_per_model = {
+            model: asdict(meta) for model, meta in _registry._metadata.items()
+        }
         return JSONResponse(
             {
                 "metrics": {
@@ -577,6 +600,13 @@ def _register_routes(app: FastAPI) -> None:
                 "scheduler": {
                     "is_paused": _scheduler.is_paused(),
                     "in_flight_count": _scheduler.in_flight_count(),
+                },
+                "memory": {
+                    "allocated_num_ctx_per_model": allocated_per_model,
+                    "loaded_per_instance": loaded_per_instance,
+                },
+                "registry": {
+                    "metadata_per_model": metadata_per_model,
                 },
             }
         )
