@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-02
+
 ### Added
 
 - **Admin pause/resume + debug config foundation** (v0.6.0 Stage 1).
@@ -78,6 +80,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parameter lets the scheduler exempt CRITICAL-priority program IDs.
   Default behavior unchanged for callers that don't pass the new
   kwarg.
+
+### Deferred to v0.6.1
+
+The plan called for migrating all 27 success-path integration tests
+to either Path A (live prod marshal) or Path B (subprocess on
+ephemeral port). The fixture infrastructure to do so is fully shipped
+in v0.6.0 and verified working end-to-end via 8 meta-tests in
+`tests/integration/test_infra_subprocess.py`. The actual per-test
+migrations are mechanical but high-volume; deferring them to a
+focused v0.6.1 PR keeps v0.6.0's review surface manageable. The
+existing tests continue to use the in-process ASGI pattern in the
+meantime — they pass in isolation; cross-suite contamination flakes
+remain a known issue that the migrated subprocess pattern will fix
+incrementally.
+
+Also deferred: removing `app.state._marshal_internals` (depends on
+all tests being migrated) and the `make_test_app` helper (same).
+
+### Operator action required
+
+Update `~/.ollama-marshal/marshal.yaml` admin section once you've
+generated tokens (use `openssl rand -hex 32` for each):
+
+```yaml
+admin:
+  pause_endpoints_enabled: true
+  admin_token: "<long-random-token>"
+  test_bypass_token: "<another-long-random-token>"
+debug:
+  endpoint_enabled: true   # OFF in production unless integration tests need it
+```
+
+Then export the matching tokens for the test session:
+
+```bash
+export MARSHAL_TEST_ADMIN_TOKEN="<same as admin.admin_token>"
+export MARSHAL_TEST_BYPASS_TOKEN="<same as admin.test_bypass_token>"
+```
+
+Restart prod marshal so the new config takes effect:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.user.ollama-marshal.plist
+launchctl load ~/Library/LaunchAgents/com.user.ollama-marshal.plist
+```
+
+If your prod marshal.yaml has `ai-portfolio-rebalance` (or similar
+ai-portfolio programs) under `programs:`, flip them to
+`priority: critical` so they get the dedicated preemption path AND
+the new max_skips exemption.
 
 ## [0.5.1] - 2026-05-01
 
