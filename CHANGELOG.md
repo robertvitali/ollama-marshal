@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Admin pause/resume + debug config foundation** (v0.6.0 Stage 1).
+  New `AdminConfig` section (`pause_endpoints_enabled`, `admin_token`,
+  `test_bypass_token`) with a Pydantic validator that rejects
+  enabled-without-token configs to prevent accidentally exposing
+  unauthenticated endpoints. New `DebugConfig` section
+  (`endpoint_enabled`) for the upcoming `/api/marshal/debug`. Both
+  default OFF; production marshal stays lean. Both env vars
+  (`MARSHAL_ADMIN_*`, `MARSHAL_DEBUG_*`) parse to real Python
+  booleans via the explicit bool coercion list.
+- **Scheduler pause/resume state machine** (v0.6.0 Stage 1, no
+  behavior change yet). New public API: `Scheduler.pause(drain_timeout_s)`,
+  `resume()`, `is_paused()`, `in_flight_count()`. Soft-pause
+  semantics: pause flips a flag and waits for in-flight dispatches
+  to drain before returning True; never rejects new requests, never
+  affects the queue. The HTTP endpoints + dispatch loop integration
+  ship in the next chunk.
+- **`RequestEnvelope.bypass_pause` field** (default `False`).
+  Carried through the queue so scheduler dispatch can identify test
+  traffic that bypasses the admin pause guard.
+
+### Changed
+
+- **CRITICAL-priority requests are exempt from the `max_skips`
+  fairness floor.** Previously, the scheduler's bin-pack step
+  incremented `skip_count` on every pending envelope of a model that
+  didn't fit in VRAM, regardless of priority. CRITICAL programs have
+  a dedicated preemption path (`_handle_critical_preemption`) so the
+  fairness floor doesn't apply to them — incrementing their skip
+  counter would surface spurious `scheduler.forced_load` log noise
+  and double-handle requests already covered by preemption. The new
+  `ModelQueues.increment_skips_for_model(exclude_program_ids=...)`
+  parameter lets the scheduler exempt CRITICAL-priority program IDs.
+  Default behavior unchanged for callers that don't pass the new
+  kwarg.
+
 ## [0.5.1] - 2026-05-01
 
 ### Fixed

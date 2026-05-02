@@ -663,6 +663,77 @@ class TestBinPackSkipCounters:
         await sched._bin_pack_models()
         assert envelope.skip_count == 0
 
+    async def test_critical_envelopes_exempt_from_skip_increment(self):
+        """CRITICAL-priority requests should NOT have skip_count incremented.
+
+        The fairness floor (max_skips → forced load) is for NORMAL-
+        priority starvation prevention. CRITICAL has its own
+        preemption path (_handle_critical_preemption), so the skip
+        counter staying at 0 keeps the two paths cleanly separated
+        and avoids spurious "forced_load" events.
+        """
+        # Two envelopes for the same model: one CRITICAL, one NORMAL.
+        # Bin-pack should skip the model (doesn't fit) and increment
+        # only the NORMAL envelope's skip count.
+        config = MarshalConfig(
+            programs={
+                "default": ProgramConfig(),
+                "crit-prog": ProgramConfig(priority=Priority.CRITICAL),
+            }
+        )
+        queues = ModelQueues()
+        critical_env = _make_envelope(model="big:latest", program_id="crit-prog")
+        normal_env = _make_envelope(model="big:latest", program_id="default")
+        await queues.enqueue(critical_env)
+        await queues.enqueue(normal_env)
+
+        memory = MagicMock()
+        memory.is_loaded.return_value = False
+        memory.can_fit_model.return_value = False  # Doesn't fit → skip
+        memory.refresh = AsyncMock()
+
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=50 * 1024**3)
+
+        sched = _make_scheduler(
+            queues=queues, memory=memory, registry=registry, config=config
+        )
+
+        await sched._bin_pack_models()
+
+        assert critical_env.skip_count == 0  # Exempt
+        assert normal_env.skip_count == 1  # Counted
+
+    async def test_critical_only_envelopes_skip_count_stays_zero(self):
+        """If the only pending envelope is CRITICAL, skip count stays 0."""
+        config = MarshalConfig(
+            programs={
+                "default": ProgramConfig(),
+                "crit-prog": ProgramConfig(priority=Priority.CRITICAL),
+            }
+        )
+        queues = ModelQueues()
+        critical_env = _make_envelope(model="big:latest", program_id="crit-prog")
+        await queues.enqueue(critical_env)
+
+        memory = MagicMock()
+        memory.is_loaded.return_value = False
+        memory.can_fit_model.return_value = False
+        memory.refresh = AsyncMock()
+
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=50 * 1024**3)
+
+        sched = _make_scheduler(
+            queues=queues, memory=memory, registry=registry, config=config
+        )
+
+        # Multiple ticks of bin-pack should still leave skip_count at 0.
+        for _ in range(5):
+            await sched._bin_pack_models()
+
+        assert critical_env.skip_count == 0
+
 
 # ---------------------------------------------------------------------------
 # _ensure_model_loaded

@@ -889,8 +889,22 @@ class Scheduler:
 
         # Only increment skip counters for models that were actually
         # passed over this round (didn't fit in VRAM), not every tick.
+        # CRITICAL-priority programs are exempt from the fairness floor
+        # (their dedicated preemption path in
+        # _handle_critical_preemption already guarantees forced load on
+        # the next tick) so we exclude them here. Without this, a
+        # CRITICAL request stuck behind a single-preemption-per-tick
+        # queue would have its skip_count climb anyway and surface
+        # spurious "forced_load" log noise.
+        critical_program_ids = {
+            program_id
+            for program_id, profile in self.config.programs.items()
+            if profile.priority == Priority.CRITICAL
+        }
         for model in skipped_models:
-            await self.queues.increment_skips_for_model(model)
+            await self.queues.increment_skips_for_model(
+                model, exclude_program_ids=critical_program_ids
+            )
 
     @staticmethod
     def _envelope_num_ctx(envelope: RequestEnvelope) -> int | None:
