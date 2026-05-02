@@ -152,6 +152,8 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: requires a running Ollama instance",
+    "marshal_subprocess: integration test that spawns its own marshal subprocess",
+    "marshal_prod: integration test that hits the live prod marshal at :11435",
 ]
 addopts = [
     "--strict-markers",
