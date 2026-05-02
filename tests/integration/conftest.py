@@ -173,6 +173,13 @@ def make_test_app(cfg: MarshalConfig, tmp_marshal_paths: dict[str, Path]) -> Fas
             )
         }
     )
+    # Regression guard: if a future Pydantic version or refactor changes
+    # the model_copy semantics so the override silently fails, this
+    # assertion fires loudly during test setup instead of letting the
+    # benchmark sweep run through the test fault_proxy.
+    assert cfg.scheduler.benchmark_on_startup is False, (
+        "make_test_app override failed — benchmark_on_startup is still True"
+    )
     app = create_app(cfg)
     app.state.metrics_path = tmp_marshal_paths["metrics_path"]
     app.state.registry_path = tmp_marshal_paths["registry_path"]

@@ -112,95 +112,97 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # without taking a server-module dependency.
     _scheduler.audit = _audit
 
-    # Start background tasks
-    await _memory.start_polling()
-    await _registry.initialize()
-    # Benchmark task is gated by config so integration tests can opt
-    # out — running the full per-model load/unload sweep through a
-    # fault-injection proxy saturates the upstream and turns
-    # /api/ps polls into 10s timeouts.
+    # Initialize fire-and-forget task handles BEFORE the try block so the
+    # finally clause can clean them up regardless of which startup step
+    # raised. Without this pre-declaration, an exception between
+    # `create_task(...)` and the yield would leak the task — the cleanup
+    # branch would skip it because the variable would be unbound.
     benchmark_task: asyncio.Task[None] | None = None
-    if _config.scheduler.benchmark_on_startup:
-        benchmark_task = asyncio.create_task(_registry.benchmark_unknown())
-    await _scheduler.start()
+    metrics_persister: asyncio.Task[None] | None = None
 
-    # Expose component instances on app.state under a private,
-    # namespaced handle for integration tests (and any future consumer
-    # that wants in-process introspection without reaching into module
-    # globals). Underscore-prefixed name + SimpleNamespace wrapper
-    # signals "test-only, not part of the public app surface" — any
-    # third-party middleware or future endpoint that goes looking for
-    # `app.state._marshal_internals` is making an explicit choice to
-    # cross the encapsulation boundary, vs. accidentally bumping into
-    # the components via attribute lookup. Production request handlers
-    # continue to use the module globals (`_scheduler`, etc.) as they
-    # always have. Additive only; no behavior change.
-    #
-    # TODO: when request handlers are refactored off module globals
-    # (`_scheduler`, `_memory`, etc) and start reading components from
-    # `request.app.state` directly, promote these to a public
-    # `app.state.components` dataclass and drop the underscore prefix.
-    # That refactor unblocks safe pytest-xdist parallelism inside
-    # tests/integration/.
-    app.state._marshal_internals = SimpleNamespace(
-        scheduler=_scheduler,
-        memory=_memory,
-        registry=_registry,
-        lifecycle=_lifecycle,
-        queues=_queues,
-    )
-
-    # Periodically snapshot metrics to disk so a hard crash loses at
-    # most metrics_persist_interval_s of counter data.
-    metrics_persister = asyncio.create_task(
-        _persist_metrics_loop(
-            metrics_path, _config.scheduler.metrics_persist_interval_s
-        )
-    )
-
-    logger.info(
-        "server.started",
-        proxy_port=_config.proxy.port,
-        ollama_host=_config.ollama.host,
-    )
-
-    yield
-
-    # Stop the background persister cleanly before final save below.
-    metrics_persister.cancel()
     try:
-        await metrics_persister
-    except asyncio.CancelledError:
-        pass
-    # Cancel the benchmark task too — if it's still running on shutdown,
-    # we don't want to wait for it to finish probing every model.
-    if benchmark_task is not None and not benchmark_task.done():
-        benchmark_task.cancel()
-        try:
-            await benchmark_task
-        except asyncio.CancelledError:
-            pass
+        # Start background tasks
+        await _memory.start_polling()
+        await _registry.initialize()
+        # Benchmark task is gated by config so integration tests can opt
+        # out — running the full per-model load/unload sweep through a
+        # fault-injection proxy saturates the upstream and turns
+        # /api/ps polls into 10s timeouts.
+        if _config.scheduler.benchmark_on_startup:
+            benchmark_task = asyncio.create_task(_registry.benchmark_unknown())
+        await _scheduler.start()
 
-    # Shutdown — drain BEFORE stopping the scheduler so requests
-    # can still be processed during the drain phase
-    logger.info("server.shutting_down", mode=_config.shutdown.mode.value)
+        # Expose component instances on app.state under a private,
+        # namespaced handle for integration tests (and any future consumer
+        # that wants in-process introspection without reaching into module
+        # globals). Underscore-prefixed name + SimpleNamespace wrapper
+        # signals "test-only, not part of the public app surface" — any
+        # third-party middleware or future endpoint that goes looking for
+        # `app.state._marshal_internals` is making an explicit choice to
+        # cross the encapsulation boundary, vs. accidentally bumping into
+        # the components via attribute lookup. Production request handlers
+        # continue to use the module globals (`_scheduler`, etc.) as they
+        # always have. Additive only; no behavior change.
+        #
+        # TODO: when request handlers are refactored off module globals
+        # (`_scheduler`, `_memory`, etc) and start reading components from
+        # `request.app.state` directly, promote these to a public
+        # `app.state.components` dataclass and drop the underscore prefix.
+        # That refactor unblocks safe pytest-xdist parallelism inside
+        # tests/integration/.
+        app.state._marshal_internals = SimpleNamespace(
+            scheduler=_scheduler,
+            memory=_memory,
+            registry=_registry,
+            lifecycle=_lifecycle,
+            queues=_queues,
+        )
 
-    if _config.shutdown.mode == ShutdownMode.DRAIN:
-        pending = await _queues.total_pending()
-        if pending > 0:
-            logger.info("server.draining", pending_requests=pending)
-            deadline = time.monotonic() + _config.shutdown.drain_timeout
-            while await _queues.total_pending() > 0 and time.monotonic() < deadline:
-                await asyncio.sleep(0.5)
+        # Periodically snapshot metrics to disk so a hard crash loses at
+        # most metrics_persist_interval_s of counter data.
+        metrics_persister = asyncio.create_task(
+            _persist_metrics_loop(
+                metrics_path, _config.scheduler.metrics_persist_interval_s
+            )
+        )
 
-    await _scheduler.stop()
-    await _memory.stop_polling()
+        logger.info(
+            "server.started",
+            proxy_port=_config.proxy.port,
+            ollama_host=_config.ollama.host,
+        )
 
-    if _config.shutdown.unload_models:
-        loaded = list(_memory.get_loaded_models().keys())
-        if loaded:
-            logger.info("server.unloading_models", models=loaded)
-            await _lifecycle.unload_all(loaded)
+        yield
+    finally:
+        # Stop the background persister cleanly before final save below.
+        # Always await tasks (don't skip on .done()) so a task that finished
+        # by raising surfaces its exception via structlog instead of riding
+        # silently as "Task exception was never retrieved" at GC time.
+        if metrics_persister is not None:
+            await _shutdown_task(metrics_persister, "server.metrics_persister_failed")
+        if benchmark_task is not None:
+            await _shutdown_task(benchmark_task, "server.benchmark_task_failed")
+
+        # Shutdown — drain BEFORE stopping the scheduler so requests
+        # can still be processed during the drain phase
+        logger.info("server.shutting_down", mode=_config.shutdown.mode.value)
+
+        if _config.shutdown.mode == ShutdownMode.DRAIN:
+            pending = await _queues.total_pending()
+            if pending > 0:
+                logger.info("server.draining", pending_requests=pending)
+                deadline = time.monotonic() + _config.shutdown.drain_timeout
+                while await _queues.total_pending() > 0 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.5)
+
+        await _scheduler.stop()
+        await _memory.stop_polling()
+
+        if _config.shutdown.unload_models:
+            loaded = list(_memory.get_loaded_models().keys())
+            if loaded:
+                logger.info("server.unloading_models", models=loaded)
+                await _lifecycle.unload_all(loaded)
 
     # Final metrics snapshot — captures any counter changes from drain
     # phase plus any work that happened after the last periodic write.
@@ -212,6 +214,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await _audit.stop()
 
     logger.info("server.stopped")
+
+
+async def _shutdown_task(task: asyncio.Task[None], failure_event: str) -> None:
+    """Cancel + await a fire-and-forget background task during shutdown.
+
+    Always awaits the task (does not skip on ``done()``) so a task that
+    finished by raising surfaces its exception via structlog instead of
+    riding silently as ``Task exception was never retrieved`` at GC.
+    Cancelled tasks log nothing — that's the expected shutdown path.
+
+    Args:
+        task: The fire-and-forget task to clean up.
+        failure_event: structlog event name to use if the task raised
+            something other than CancelledError. Caller picks a name
+            that identifies which background task failed.
+    """
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.warning(failure_event, error=str(exc), exc_info=True)
 
 
 async def _persist_metrics_loop(path: Path, interval_s: float) -> None:

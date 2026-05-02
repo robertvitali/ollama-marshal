@@ -261,6 +261,27 @@ class TestApplyEnvOverrides:
         result = _apply_env_overrides(data)
         assert result["shutdown"]["unload_models"] is True
 
+    def test_benchmark_on_startup_env_override_false(self, monkeypatch):
+        """MARSHAL_SCHEDULER_BENCHMARK_ON_STARTUP=false flips the gate.
+
+        Documented contract in marshal.example.yaml: operators can
+        disable the model-size benchmark sweep via env var without
+        editing the YAML file. Verifies the env override path actually
+        produces a Python ``False`` (not the literal string ``"false"``)
+        so Pydantic validates cleanly downstream.
+        """
+        monkeypatch.setenv("MARSHAL_SCHEDULER_BENCHMARK_ON_STARTUP", "false")
+        data: dict[str, Any] = {}
+        result = _apply_env_overrides(data)
+        assert result["scheduler"]["benchmark_on_startup"] is False
+
+    def test_benchmark_on_startup_env_override_true(self, monkeypatch):
+        """MARSHAL_SCHEDULER_BENCHMARK_ON_STARTUP=true keeps the gate on."""
+        monkeypatch.setenv("MARSHAL_SCHEDULER_BENCHMARK_ON_STARTUP", "true")
+        data: dict[str, Any] = {}
+        result = _apply_env_overrides(data)
+        assert result["scheduler"]["benchmark_on_startup"] is True
+
     def test_preserves_existing_data(self, monkeypatch):
         monkeypatch.setenv("MARSHAL_PROXY_PORT", "9999")
         data: dict[str, Any] = {"proxy": {"host": "127.0.0.1"}}

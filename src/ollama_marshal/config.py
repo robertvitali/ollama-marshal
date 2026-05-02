@@ -673,6 +673,8 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 # v0.4.0: retry + context bool fields
                 "read_timeouts",
                 "injection_enabled",
+                # v0.5.0: scheduler benchmark gate
+                "benchmark_on_startup",
             ):
                 data[section][field] = value.lower() in ("true", "1", "yes")
             else:
