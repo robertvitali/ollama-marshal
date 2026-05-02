@@ -477,6 +477,167 @@ class Scheduler:
         # to 1 (current sequential behavior). When raised, _process_batch
         # fans out same-model envelopes through this semaphore.
         self.inflight = InflightTracker(config.scheduler.parallel_per_model)
+        # Admin pause state (v0.6.0+). When ``_dispatch_paused`` is set,
+        # the scheduler tick suspends queue draining (envelopes pile up
+        # but aren't dispatched). Bypass-flagged envelopes
+        # (``RequestEnvelope.bypass_pause=True``) still dispatch — the
+        # tick logic in v0.6.0 Stage 2 handles that filtering.
+        # ``_in_flight_count`` tracks how many envelopes are currently
+        # mid-dispatch to Ollama so the admin pause endpoint can wait
+        # for the scheduler to actually be idle (drain) before
+        # returning 200. Counter rather than set because RequestEnvelope
+        # isn't hashable (mutable asyncio.Event field) and the drain
+        # wait only needs the count, not envelope identity. Incremented
+        # and decremented at the ``_forward_single`` boundary; see usage
+        # in v0.6.0 Stage 2.
+        self._dispatch_paused = False
+        self._in_flight_count = 0
+        # Auto-resume failsafe task. If a test session crashes (Ctrl-C,
+        # OOM) before calling resume, the scheduler would otherwise
+        # stay paused indefinitely and prod would be stuck at 503-free
+        # but dispatch-frozen. The auto-resume timer flips the flag
+        # back after ``auto_resume_after_seconds`` regardless. Cancelled
+        # by an explicit resume.
+        self._auto_resume_task: asyncio.Task[None] | None = None
+
+    def is_paused(self) -> bool:
+        """Return True if dispatch is currently paused.
+
+        Reads the in-memory flag — caller does not need to acquire a
+        lock. Race: a concurrent ``pause()`` / ``resume()`` may flip
+        the flag immediately after the read, but Python's GIL makes
+        the bool read itself atomic. Callers using this for routing
+        (e.g. middleware deciding whether to apply the pause guard)
+        must accept that the value reflects the moment of the read.
+        """
+        return self._dispatch_paused
+
+    async def pause(
+        self,
+        drain_timeout_s: float = 60.0,
+        auto_resume_after_seconds: float = 300.0,
+    ) -> bool:
+        """Stop dispatching from the queue and wait for in-flight to drain.
+
+        SOFT PAUSE: incoming requests still enqueue normally (no 503s).
+        The scheduler stops popping envelopes off the queue; bypass-
+        flagged envelopes (``RequestEnvelope.bypass_pause=True``)
+        continue to dispatch via the bypass path. Returns once
+        in-flight count reaches zero (scheduler is idle), so callers
+        that pause to do test work can be confident no production
+        inference is mid-stream.
+
+        Idempotent — calling ``pause`` while already paused returns
+        immediately with the current drain status. Each call resets
+        the auto-resume timer (so a long test session can extend the
+        pause by re-calling pause periodically).
+
+        Args:
+            drain_timeout_s: Max seconds to wait for in-flight
+                dispatches to complete naturally. Long-running
+                inferences (a 5min generation) may exceed this; the
+                caller decides what to do (skip the test, retry
+                later, etc).
+            auto_resume_after_seconds: Failsafe — if no explicit
+                ``resume`` call arrives within this many seconds, the
+                scheduler resumes itself and emits an audit event
+                (``admin.auto_resumed``). Defends against test-session
+                crashes leaving prod paused forever. Set to a value
+                comfortably larger than the expected pause duration.
+
+        Returns:
+            True if drain completed within ``drain_timeout_s``, False
+            if timeout was hit (one or more envelopes still in flight).
+            The pause flag is set in either case — a False return is
+            informational, not a failure to pause.
+        """
+        self._dispatch_paused = True
+        # Reset auto-resume timer on every pause call (idempotent extend).
+        self._cancel_auto_resume_task()
+        self._auto_resume_task = asyncio.create_task(
+            self._auto_resume_after(auto_resume_after_seconds)
+        )
+        return await self._wait_for_drain(timeout_s=drain_timeout_s)
+
+    def resume(self) -> None:
+        """Resume dispatching from the queue.
+
+        Drops the pause flag and cancels the auto-resume timer.
+        The next scheduler tick picks up the accumulated queue at
+        full speed. Idempotent — calling ``resume`` on an already-
+        running scheduler is a no-op.
+        """
+        self._dispatch_paused = False
+        self._cancel_auto_resume_task()
+
+    def _cancel_auto_resume_task(self) -> None:
+        """Cancel any pending auto-resume timer.
+
+        Safe to call when no timer is active. Used by ``resume`` and
+        by ``pause`` (to extend the timer on re-pause).
+        """
+        if self._auto_resume_task is not None and not self._auto_resume_task.done():
+            self._auto_resume_task.cancel()
+        self._auto_resume_task = None
+
+    async def _auto_resume_after(self, delay_s: float) -> None:
+        """Sleep ``delay_s`` then resume dispatch if still paused.
+
+        Catches its own CancelledError so the cancel from
+        ``_cancel_auto_resume_task`` doesn't propagate as
+        "Task exception was never retrieved" warnings. If the timer
+        actually fires (no explicit resume arrived), logs a warning
+        and emits ``admin.auto_resumed`` via the audit logger so
+        operators see the failsafe activated.
+        """
+        try:
+            await asyncio.sleep(delay_s)
+        except asyncio.CancelledError:
+            return
+        if not self._dispatch_paused:
+            return
+        self._dispatch_paused = False
+        logger.warning(
+            "scheduler.auto_resumed",
+            after_seconds=delay_s,
+            reason="explicit resume never arrived; failsafe activated",
+        )
+        try:
+            await self.audit.record(event="admin.auto_resumed")
+        except Exception as exc:
+            logger.warning("scheduler.auto_resume_audit_failed", error=str(exc))
+
+    async def _wait_for_drain(self, timeout_s: float) -> bool:
+        """Poll until ``_in_flight_count`` is zero or timeout fires.
+
+        Polled rather than event-driven because in-flight tracking is
+        an increment/decrement pair around ``_forward_single`` —
+        adding an event-set would couple the dispatch path to the
+        pause machinery. Polling at 100ms granularity is cheap and
+        keeps the dispatch path uncoupled from pause state.
+
+        Args:
+            timeout_s: Max seconds to wait.
+
+        Returns:
+            True if the counter drained to zero, False if timeout
+            fired first.
+        """
+        deadline = time.monotonic() + timeout_s
+        while self._in_flight_count > 0:
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.1)
+        return True
+
+    def in_flight_count(self) -> int:
+        """Number of envelopes currently mid-dispatch to Ollama.
+
+        Used by ``/api/marshal/admin/pause`` response payload to
+        surface drain status (so operators see whether the scheduler
+        is actually idle when pause returns).
+        """
+        return self._in_flight_count
 
     async def start(self) -> None:
         """Start the scheduler loop."""
@@ -494,6 +655,9 @@ class Scheduler:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        # Cancel any pending auto-resume timer so it doesn't leak past
+        # shutdown. Safe to call even if no timer was active.
+        self._cancel_auto_resume_task()
         logger.info(
             "scheduler.stopped",
             requests_served=self.metrics.requests_served,
@@ -523,7 +687,16 @@ class Scheduler:
            `scheduler.idle_eviction_minutes` (0 disables)
         6. Drop expired X-Burst-Size hints (cleanup; doesn't affect
            dispatch decisions on this tick)
+
+        Pause: when ``_dispatch_paused`` is set, the entire normal tick
+        body is skipped and only ``_tick_bypass_only`` runs. Non-bypass
+        envelopes pile up in the queue (no client-visible 503s); they
+        drain at full speed once ``resume`` flips the flag.
         """
+        if self._dispatch_paused:
+            await self._tick_bypass_only()
+            return
+
         # Step 1: Forward requests for models already loaded
         await self._forward_loaded_model_requests()
 
@@ -554,6 +727,47 @@ class Scheduler:
         unexpected = self.memory.take_unexpected_unload_count()
         if unexpected > 0:
             self.metrics.unexpected_unloads += unexpected
+
+    async def _tick_bypass_only(self) -> None:
+        """During admin pause, dispatch only bypass-flagged envelopes.
+
+        Bypass envelopes are tagged when the request handler sees a
+        valid ``X-Marshal-Test-Bypass`` header (matching
+        ``admin.test_bypass_token``). They represent integration test
+        traffic that needs to flow even while production dispatch is
+        frozen.
+
+        The flow per loaded-or-loadable model:
+          1. Pre-check the queue for any pending bypass envelopes
+             (cheap — peeks without removing).
+          2. If the model isn't loaded, force-load it via the same
+             eviction-aware path CRITICAL preemption uses. Test traffic
+             gets the strongest dispatch guarantee — no point pausing
+             dispatch for tests if the tests can't actually run.
+          3. Pop only the bypass envelopes for that model and dispatch
+             them via the standard ``_process_batch`` path. Non-bypass
+             envelopes for the same model stay in the queue.
+
+        Skip-counter incrementing and idle-eviction don't run during
+        pause — both would create misleading state for the post-resume
+        drain.
+        """
+        models = await self.queues.peek_models()
+        for model in models:
+            pending = await self.queues.pending_for_model(model)
+            if not any(e.bypass_pause for e in pending):
+                continue
+            if not self.memory.is_loaded(model):
+                num_ctx = await self._max_num_ctx_for_pending(model)
+                success = await self._ensure_model_loaded(model, num_ctx=num_ctx)
+                if not success:
+                    # Couldn't load — skip this model's bypass envelopes
+                    # this tick. Will retry next tick. Better than popping
+                    # them and failing the dispatches.
+                    continue
+            bypass_batch = await self.queues.dequeue_bypass_for_model(model)
+            if bypass_batch:
+                await self._process_batch(bypass_batch)
 
     def active_programs_by_model(self) -> dict[str, list[str]]:
         """Return programs that have recently dispatched against each loaded model.
@@ -793,8 +1007,22 @@ class Scheduler:
 
         # Only increment skip counters for models that were actually
         # passed over this round (didn't fit in VRAM), not every tick.
+        # CRITICAL-priority programs are exempt from the fairness floor
+        # (their dedicated preemption path in
+        # _handle_critical_preemption already guarantees forced load on
+        # the next tick) so we exclude them here. Without this, a
+        # CRITICAL request stuck behind a single-preemption-per-tick
+        # queue would have its skip_count climb anyway and surface
+        # spurious "forced_load" log noise.
+        critical_program_ids = {
+            program_id
+            for program_id, profile in self.config.programs.items()
+            if profile.priority == Priority.CRITICAL
+        }
         for model in skipped_models:
-            await self.queues.increment_skips_for_model(model)
+            await self.queues.increment_skips_for_model(
+                model, exclude_program_ids=critical_program_ids
+            )
 
     @staticmethod
     def _envelope_num_ctx(envelope: RequestEnvelope) -> int | None:
@@ -1179,8 +1407,26 @@ class Scheduler:
         retry helper short-circuits), and `retry_max_override` on the
         envelope can disable or extend retry per-request.
 
+        Maintains ``_in_flight_count`` for the admin pause endpoint's
+        drain wait — increment at entry, decrement in the outer
+        ``finally`` block so the counter never drifts even when the
+        dispatch raises or is cancelled mid-stream.
+
         Args:
             envelope: The request to forward.
+        """
+        self._in_flight_count += 1
+        try:
+            await self._forward_single_inner(envelope)
+        finally:
+            self._in_flight_count = max(0, self._in_flight_count - 1)
+
+    async def _forward_single_inner(self, envelope: RequestEnvelope) -> None:
+        """Inner dispatch body for ``_forward_single``.
+
+        Separated so the outer ``_forward_single`` can do clean
+        ``_in_flight_count`` bookkeeping without nesting the entire
+        dispatch path inside a try/finally.
         """
         max_attempts = self._resolve_retry_attempts(envelope)
         retry_cfg = self.config.retry

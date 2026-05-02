@@ -382,6 +382,41 @@ class TestModelQueuesSkipping:
         # Should not raise
         await queues.increment_skips_for_model("no-such-model")
 
+    async def test_increment_skips_excludes_program_ids(self, queues, make_envelope):
+        """Envelopes whose program_id is in exclude_program_ids stay at skip_count=0.
+
+        Used by the scheduler to exempt CRITICAL-priority programs from
+        the fairness floor — they have a dedicated preemption path so
+        the skip-based starvation guard doesn't apply to them.
+        """
+        critical_env = make_envelope(model="llama3:latest", program_id="crit-prog")
+        normal_env = make_envelope(model="llama3:latest", program_id="default")
+        await queues.enqueue(critical_env)
+        await queues.enqueue(normal_env)
+
+        await queues.increment_skips_for_model(
+            "llama3:latest", exclude_program_ids={"crit-prog"}
+        )
+
+        assert critical_env.skip_count == 0
+        assert normal_env.skip_count == 1
+
+    async def test_increment_skips_default_includes_all(self, queues, make_envelope):
+        """Without exclude_program_ids, every envelope's skip_count rises.
+
+        Preserves legacy behavior — callers that don't pass the new
+        kwarg get the same per-envelope increment as before.
+        """
+        e1 = make_envelope(model="llama3:latest", program_id="prog-a")
+        e2 = make_envelope(model="llama3:latest", program_id="prog-b")
+        await queues.enqueue(e1)
+        await queues.enqueue(e2)
+
+        await queues.increment_skips_for_model("llama3:latest")
+
+        assert e1.skip_count == 1
+        assert e2.skip_count == 1
+
     async def test_unskippable_sorted_by_arrival(self, queues, make_envelope):
         e1 = make_envelope(model="llama3:latest", arrived_at=200.0)
         e2 = make_envelope(model="mistral:latest", arrived_at=100.0)

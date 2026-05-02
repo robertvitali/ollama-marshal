@@ -7,6 +7,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-02
+
+### Added
+
+- **Admin pause/resume + debug config foundation** (v0.6.0 Stage 1).
+  New `AdminConfig` section (`pause_endpoints_enabled`, `admin_token`,
+  `test_bypass_token`) with a Pydantic validator that rejects
+  enabled-without-token configs to prevent accidentally exposing
+  unauthenticated endpoints. New `DebugConfig` section
+  (`endpoint_enabled`) for the upcoming `/api/marshal/debug`. Both
+  default OFF; production marshal stays lean. Both env vars
+  (`MARSHAL_ADMIN_*`, `MARSHAL_DEBUG_*`) parse to real Python
+  booleans via the explicit bool coercion list.
+- **Scheduler pause/resume state machine** (v0.6.0 Stage 1, no
+  behavior change yet). New public API: `Scheduler.pause(drain_timeout_s)`,
+  `resume()`, `is_paused()`, `in_flight_count()`. Soft-pause
+  semantics: pause flips a flag and waits for in-flight dispatches
+  to drain before returning True; never rejects new requests, never
+  affects the queue. The HTTP endpoints + dispatch loop integration
+  ship in the next chunk.
+- **`RequestEnvelope.bypass_pause` field** (default `False`).
+  Carried through the queue so scheduler dispatch can identify test
+  traffic that bypasses the admin pause guard.
+- **Admin pause/resume HTTP endpoints** at
+  `POST /api/marshal/admin/pause` and
+  `POST /api/marshal/admin/resume`. Both gated by
+  `admin.pause_endpoints_enabled=true` (return 404 otherwise) and
+  require an `X-Marshal-Admin-Token` header matching
+  `admin.admin_token` (return 401 otherwise). Pause accepts a JSON
+  body with `drain_timeout_s` (default 60) and
+  `auto_resume_after_seconds` (default 300); returns 200 with
+  `{drained_in_flight, queued_at_pause, auto_resume_at}` on success
+  or 409 if drain timed out (with the same fields plus current
+  `in_flight` count). Resume returns 200 with the current
+  `queue_depth`. Auth uses `secrets.compare_digest` for
+  constant-time comparison. Audit events
+  (`admin.dispatch_paused`, `admin.dispatch_resumed`,
+  `admin.drain_timeout_exceeded`, `admin.auto_resumed`) record on
+  every state change.
+- **Auto-resume failsafe** in the scheduler. `Scheduler.pause` now
+  schedules an `_auto_resume_after` background task that flips
+  `_dispatch_paused` back after the configured delay. Defends
+  against test-session crashes that would otherwise leave prod
+  paused indefinitely. Cancelled by explicit `resume`; reset by
+  re-`pause`; cleaned up by `Scheduler.stop`.
+- **`GET /api/marshal/debug` endpoint** gated by
+  `debug.endpoint_enabled=true` (return 404 otherwise). Returns
+  scheduler metrics + pause state + in-flight count for integration
+  tests that assert on marshal-internal state via HTTP rather than
+  reaching into `app.state._marshal_internals`. Production marshal
+  keeps this endpoint disabled to avoid leaking internals.
+- **Bypass-token detection on inference requests.** The
+  `_enqueue_inference` and `_enqueue_and_wait` request handlers
+  now read `X-Marshal-Test-Bypass`; matching the configured
+  `admin.test_bypass_token` flips `RequestEnvelope.bypass_pause` to
+  `True` (constant-time compare). The scheduler dispatch loop
+  changes that respect the flag during pause ship in v0.6.0
+  Stage 2.
+
+### Changed
+
+- **CRITICAL-priority requests are exempt from the `max_skips`
+  fairness floor.** Previously, the scheduler's bin-pack step
+  incremented `skip_count` on every pending envelope of a model that
+  didn't fit in VRAM, regardless of priority. CRITICAL programs have
+  a dedicated preemption path (`_handle_critical_preemption`) so the
+  fairness floor doesn't apply to them — incrementing their skip
+  counter would surface spurious `scheduler.forced_load` log noise
+  and double-handle requests already covered by preemption. The new
+  `ModelQueues.increment_skips_for_model(exclude_program_ids=...)`
+  parameter lets the scheduler exempt CRITICAL-priority program IDs.
+  Default behavior unchanged for callers that don't pass the new
+  kwarg.
+
+### Deferred to v0.6.1
+
+The plan called for migrating all 27 success-path integration tests
+to either Path A (live prod marshal) or Path B (subprocess on
+ephemeral port). The fixture infrastructure to do so is fully shipped
+in v0.6.0 and verified working end-to-end via 8 meta-tests in
+`tests/integration/test_infra_subprocess.py`. The actual per-test
+migrations are mechanical but high-volume; deferring them to a
+focused v0.6.1 PR keeps v0.6.0's review surface manageable. The
+existing tests continue to use the in-process ASGI pattern in the
+meantime — they pass in isolation; cross-suite contamination flakes
+remain a known issue that the migrated subprocess pattern will fix
+incrementally.
+
+Also deferred: removing `app.state._marshal_internals` (depends on
+all tests being migrated) and the `make_test_app` helper (same).
+
+### Operator action required
+
+Update `~/.ollama-marshal/marshal.yaml` admin section once you've
+generated tokens (use `openssl rand -hex 32` for each):
+
+```yaml
+admin:
+  pause_endpoints_enabled: true
+  admin_token: "<long-random-token>"
+  test_bypass_token: "<another-long-random-token>"
+debug:
+  endpoint_enabled: true   # OFF in production unless integration tests need it
+```
+
+Then export the matching tokens for the test session:
+
+```bash
+export MARSHAL_TEST_ADMIN_TOKEN="<same as admin.admin_token>"
+export MARSHAL_TEST_BYPASS_TOKEN="<same as admin.test_bypass_token>"
+```
+
+Restart prod marshal so the new config takes effect:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.user.ollama-marshal.plist
+launchctl load ~/Library/LaunchAgents/com.user.ollama-marshal.plist
+```
+
+If your prod marshal.yaml has `ai-portfolio-rebalance` (or similar
+ai-portfolio programs) under `programs:`, flip them to
+`priority: critical` so they get the dedicated preemption path AND
+the new max_skips exemption.
+
 ## [0.5.1] - 2026-05-01
 
 ### Fixed

@@ -52,6 +52,15 @@ class RequestEnvelope:
     instance_url: str | None = None
     tier_label: str | None = None
     routing_reason: str | None = None
+    # Admin pause bypass (v0.6.0+). When the scheduler's dispatch is
+    # paused via ``/api/marshal/admin/pause``, normal envelopes sit in
+    # the queue waiting for resume. Envelopes flagged with
+    # ``bypass_pause=True`` (set when the request carries the
+    # ``X-Marshal-Test-Bypass`` header matching ``admin.test_bypass_token``)
+    # dispatch immediately even during pause. Used by integration tests
+    # so they can fire requests against a paused prod marshal without
+    # blocking on the queue freeze.
+    bypass_pause: bool = False
 
     def increment_skip(self) -> None:
         """Increment the skip counter for this request."""
@@ -261,14 +270,58 @@ class ModelQueues:
             unskippable.sort(key=lambda e: e.arrived_at)
             return unskippable
 
-    async def increment_skips_for_model(self, model: str) -> None:
-        """Increment skip count for all pending requests of a model.
+    async def dequeue_bypass_for_model(self, model: str) -> list[RequestEnvelope]:
+        """Pop only envelopes flagged with ``bypass_pause=True``.
+
+        Used by the scheduler during admin pause to dispatch test
+        traffic carrying ``X-Marshal-Test-Bypass`` while leaving
+        non-bypass envelopes parked in the queue. Preserves arrival
+        order among the popped bypass envelopes.
+
+        Args:
+            model: The model whose queue to drain bypass envelopes from.
+
+        Returns:
+            List of bypass envelopes (possibly empty). Non-bypass
+            envelopes for the same model stay in the queue.
+        """
+        async with self._lock:
+            queue = self._queues.get(model)
+            if not queue:
+                return []
+            bypass: list[RequestEnvelope] = []
+            remaining: deque[RequestEnvelope] = deque()
+            for envelope in queue:
+                if envelope.bypass_pause:
+                    bypass.append(envelope)
+                else:
+                    remaining.append(envelope)
+            self._queues[model] = remaining
+            return bypass
+
+    async def increment_skips_for_model(
+        self,
+        model: str,
+        exclude_program_ids: set[str] | None = None,
+    ) -> None:
+        """Increment skip count for pending requests of a model.
 
         Args:
             model: The model whose requests were skipped.
+            exclude_program_ids: Program IDs whose envelopes should
+                NOT have their skip counter incremented. Used by the
+                scheduler to exempt CRITICAL-priority programs from
+                the fairness floor — they have a dedicated preemption
+                path (``Scheduler._handle_critical_preemption``) so
+                the skip-based starvation guard doesn't apply.
+                Default ``None`` increments every envelope (legacy
+                behavior).
         """
+        excluded = exclude_program_ids or set()
         async with self._lock:
             queue = self._queues.get(model)
             if queue:
                 for envelope in queue:
+                    if envelope.program_id in excluded:
+                        continue
                     envelope.increment_skip()
