@@ -492,6 +492,13 @@ class Scheduler:
         # in v0.6.0 Stage 2.
         self._dispatch_paused = False
         self._in_flight_count = 0
+        # Auto-resume failsafe task. If a test session crashes (Ctrl-C,
+        # OOM) before calling resume, the scheduler would otherwise
+        # stay paused indefinitely and prod would be stuck at 503-free
+        # but dispatch-frozen. The auto-resume timer flips the flag
+        # back after ``auto_resume_after_seconds`` regardless. Cancelled
+        # by an explicit resume.
+        self._auto_resume_task: asyncio.Task[None] | None = None
 
     def is_paused(self) -> bool:
         """Return True if dispatch is currently paused.
@@ -505,19 +512,25 @@ class Scheduler:
         """
         return self._dispatch_paused
 
-    async def pause(self, drain_timeout_s: float = 60.0) -> bool:
+    async def pause(
+        self,
+        drain_timeout_s: float = 60.0,
+        auto_resume_after_seconds: float = 300.0,
+    ) -> bool:
         """Stop dispatching from the queue and wait for in-flight to drain.
 
         SOFT PAUSE: incoming requests still enqueue normally (no 503s).
         The scheduler stops popping envelopes off the queue; bypass-
         flagged envelopes (``RequestEnvelope.bypass_pause=True``)
         continue to dispatch via the bypass path. Returns once
-        ``_in_flight_envelopes`` is empty (scheduler is idle), so
-        callers that pause to do test work can be confident no
-        production inference is mid-stream.
+        in-flight count reaches zero (scheduler is idle), so callers
+        that pause to do test work can be confident no production
+        inference is mid-stream.
 
         Idempotent — calling ``pause`` while already paused returns
-        immediately with the current drain status.
+        immediately with the current drain status. Each call resets
+        the auto-resume timer (so a long test session can extend the
+        pause by re-calling pause periodically).
 
         Args:
             drain_timeout_s: Max seconds to wait for in-flight
@@ -525,22 +538,74 @@ class Scheduler:
                 inferences (a 5min generation) may exceed this; the
                 caller decides what to do (skip the test, retry
                 later, etc).
+            auto_resume_after_seconds: Failsafe — if no explicit
+                ``resume`` call arrives within this many seconds, the
+                scheduler resumes itself and emits an audit event
+                (``admin.auto_resumed``). Defends against test-session
+                crashes leaving prod paused forever. Set to a value
+                comfortably larger than the expected pause duration.
 
         Returns:
-            True if drain completed within timeout, False if timeout
-            was hit (one or more envelopes still in flight).
+            True if drain completed within ``drain_timeout_s``, False
+            if timeout was hit (one or more envelopes still in flight).
+            The pause flag is set in either case — a False return is
+            informational, not a failure to pause.
         """
         self._dispatch_paused = True
+        # Reset auto-resume timer on every pause call (idempotent extend).
+        self._cancel_auto_resume_task()
+        self._auto_resume_task = asyncio.create_task(
+            self._auto_resume_after(auto_resume_after_seconds)
+        )
         return await self._wait_for_drain(timeout_s=drain_timeout_s)
 
     def resume(self) -> None:
         """Resume dispatching from the queue.
 
-        Drops the pause flag. The next scheduler tick picks up the
-        accumulated queue at full speed. Idempotent — calling
-        ``resume`` on an already-running scheduler is a no-op.
+        Drops the pause flag and cancels the auto-resume timer.
+        The next scheduler tick picks up the accumulated queue at
+        full speed. Idempotent — calling ``resume`` on an already-
+        running scheduler is a no-op.
         """
         self._dispatch_paused = False
+        self._cancel_auto_resume_task()
+
+    def _cancel_auto_resume_task(self) -> None:
+        """Cancel any pending auto-resume timer.
+
+        Safe to call when no timer is active. Used by ``resume`` and
+        by ``pause`` (to extend the timer on re-pause).
+        """
+        if self._auto_resume_task is not None and not self._auto_resume_task.done():
+            self._auto_resume_task.cancel()
+        self._auto_resume_task = None
+
+    async def _auto_resume_after(self, delay_s: float) -> None:
+        """Sleep ``delay_s`` then resume dispatch if still paused.
+
+        Catches its own CancelledError so the cancel from
+        ``_cancel_auto_resume_task`` doesn't propagate as
+        "Task exception was never retrieved" warnings. If the timer
+        actually fires (no explicit resume arrived), logs a warning
+        and emits ``admin.auto_resumed`` via the audit logger so
+        operators see the failsafe activated.
+        """
+        try:
+            await asyncio.sleep(delay_s)
+        except asyncio.CancelledError:
+            return
+        if not self._dispatch_paused:
+            return
+        self._dispatch_paused = False
+        logger.warning(
+            "scheduler.auto_resumed",
+            after_seconds=delay_s,
+            reason="explicit resume never arrived; failsafe activated",
+        )
+        try:
+            await self.audit.record(event="admin.auto_resumed")
+        except Exception as exc:
+            logger.warning("scheduler.auto_resume_audit_failed", error=str(exc))
 
     async def _wait_for_drain(self, timeout_s: float) -> bool:
         """Poll until ``_in_flight_count`` is zero or timeout fires.
@@ -590,6 +655,9 @@ class Scheduler:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        # Cancel any pending auto-resume timer so it doesn't leak past
+        # shutdown. Safe to call even if no timer was active.
+        self._cancel_auto_resume_task()
         logger.info(
             "scheduler.stopped",
             requests_served=self.metrics.requests_served,

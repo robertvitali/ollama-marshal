@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -455,6 +457,130 @@ def _register_routes(app: FastAPI) -> None:
         """
         return await _marshal_status_payload()
 
+    # -- Admin endpoints (gated by config + bearer token) --
+
+    @app.post("/api/marshal/admin/pause")
+    async def admin_pause(request: Request) -> Response:
+        """Pause scheduler dispatch and wait for in-flight to drain.
+
+        Soft-pause semantics: incoming requests still enqueue; only
+        dispatch is frozen. Bypass-token requests still flow. Returns
+        once the in-flight count drops to zero, or 409 if drain
+        timeout exceeded. Schedules an auto-resume failsafe so a
+        crashed test session doesn't leave prod paused forever.
+        """
+        if not _config.admin.pause_endpoints_enabled:
+            return JSONResponse(
+                {"error": "admin pause endpoints not enabled"}, status_code=404
+            )
+        if not _check_admin_token(request, _config):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body_bytes = await request.body()
+        body_data: dict[str, Any] = {}
+        if body_bytes:
+            try:
+                import json
+
+                body_data = json.loads(body_bytes)
+            except (ValueError, TypeError):
+                return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        drain_timeout_s = float(body_data.get("drain_timeout_s", 60.0))
+        auto_resume_after_seconds = float(
+            body_data.get("auto_resume_after_seconds", 300.0)
+        )
+
+        queue_depth_before = await _queues.total_pending()
+        drained = await _scheduler.pause(
+            drain_timeout_s=drain_timeout_s,
+            auto_resume_after_seconds=auto_resume_after_seconds,
+        )
+        auto_resume_at = (
+            datetime.now(UTC) + timedelta(seconds=auto_resume_after_seconds)
+        ).isoformat()
+
+        if not drained:
+            await _audit.record(event="admin.drain_timeout_exceeded")
+            logger.warning(
+                "admin.drain_timeout_exceeded",
+                drain_timeout_s=drain_timeout_s,
+                in_flight=_scheduler.in_flight_count(),
+            )
+            return JSONResponse(
+                {
+                    "error": (
+                        "drain timeout exceeded — one or more inferences "
+                        "still in flight"
+                    ),
+                    "in_flight": _scheduler.in_flight_count(),
+                    "queued_at_pause": queue_depth_before,
+                    "auto_resume_at": auto_resume_at,
+                },
+                status_code=409,
+            )
+
+        await _audit.record(event="admin.dispatch_paused")
+        logger.info(
+            "admin.dispatch_paused",
+            queued_at_pause=queue_depth_before,
+            auto_resume_after_seconds=auto_resume_after_seconds,
+        )
+        return JSONResponse(
+            {
+                "drained_in_flight": 0,
+                "queued_at_pause": queue_depth_before,
+                "auto_resume_at": auto_resume_at,
+            }
+        )
+
+    @app.post("/api/marshal/admin/resume")
+    async def admin_resume(request: Request) -> Response:
+        """Resume scheduler dispatch and cancel the auto-resume timer."""
+        if not _config.admin.pause_endpoints_enabled:
+            return JSONResponse(
+                {"error": "admin pause endpoints not enabled"}, status_code=404
+            )
+        if not _check_admin_token(request, _config):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        _scheduler.resume()
+        queue_depth = await _queues.total_pending()
+        await _audit.record(event="admin.dispatch_resumed")
+        logger.info("admin.dispatch_resumed", queue_depth=queue_depth)
+        return JSONResponse({"queue_depth": queue_depth})
+
+    # -- Debug endpoint (gated by config) --
+
+    @app.get("/api/marshal/debug")
+    async def marshal_debug() -> Response:
+        """Internal-state inspection for integration tests.
+
+        Returns scheduler metrics, pause state, in-flight count, and
+        memory-manager allocated num_ctx per model. Production marshal
+        keeps this endpoint disabled (returns 404) to avoid leaking
+        scheduler internals over the proxy port.
+        """
+        if not _config.debug.endpoint_enabled:
+            return JSONResponse(
+                {"error": "debug endpoint not enabled"}, status_code=404
+            )
+        return JSONResponse(
+            {
+                "metrics": {
+                    "requests_served": _scheduler.metrics.requests_served,
+                    "model_swaps": _scheduler.metrics.model_swaps,
+                    "evictions": _scheduler.metrics.evictions,
+                    "retries_attempted": _scheduler.metrics.retries_attempted,
+                    "retries_succeeded": _scheduler.metrics.retries_succeeded,
+                    "reload_count": _scheduler.metrics.reload_count,
+                    "unexpected_unloads": _scheduler.metrics.unexpected_unloads,
+                },
+                "scheduler": {
+                    "is_paused": _scheduler.is_paused(),
+                    "in_flight_count": _scheduler.in_flight_count(),
+                },
+            }
+        )
+
     # -- Pass-through endpoints (safe read-only allowlist) --
 
     safe_passthrough = {
@@ -509,6 +635,44 @@ _PROGRAM_ID_ALLOWED = set(
 # legitimate program name. Longer values are truncated rather than
 # rejected so a typo'd suffix doesn't surface as a fail-fast 400.
 _PROGRAM_ID_MAX_LEN = 64
+
+
+def _check_admin_token(request: Request, cfg: MarshalConfig) -> bool:
+    """Validate the ``X-Marshal-Admin-Token`` header against config.
+
+    Uses ``secrets.compare_digest`` for constant-time comparison so an
+    adversarial caller can't probe the token byte-by-byte via timing.
+    Returns False if the config has no token configured (admin endpoints
+    are unusable without one — see ``AdminConfig`` validator).
+    """
+    if not cfg.admin.admin_token:
+        return False
+    received = request.headers.get("x-marshal-admin-token")
+    if not received:
+        return False
+    return secrets.compare_digest(received, cfg.admin.admin_token)
+
+
+def _is_bypass_pause(request: Request) -> bool:
+    """Return True iff request carries a valid ``X-Marshal-Test-Bypass``.
+
+    Used to flag envelopes that should dispatch even when the
+    scheduler is paused. Reads config from ``request.app.state``
+    rather than the module global so tests that bypass lifespan
+    (don't initialize the global) still work. Returns False when:
+    - app.state.config is missing (test bypassed lifespan)
+    - admin.test_bypass_token is unset (bypass disabled by omission)
+    - the header is missing or doesn't match
+
+    Constant-time comparison defends against timing-leak token probing.
+    """
+    cfg = getattr(request.app.state, "config", None)
+    if cfg is None or not cfg.admin.test_bypass_token:
+        return False
+    received = request.headers.get("x-marshal-test-bypass")
+    if not received:
+        return False
+    return secrets.compare_digest(received, cfg.admin.test_bypass_token)
 
 
 def _normalize_program_id(raw: str | None) -> str:
@@ -890,6 +1054,7 @@ async def _enqueue_inference(
         endpoint=endpoint,
         stream=stream,
         retry_max_override=_parse_retry_max_header(request),
+        bypass_pause=_is_bypass_pause(request),
     )
 
     # Defensive: a client sending `options: null` (the JSON literal, not
@@ -1017,6 +1182,7 @@ async def _enqueue_and_wait(
         endpoint=endpoint,
         stream=stream,
         retry_max_override=_parse_retry_max_header(request),
+        bypass_pause=_is_bypass_pause(request),
     )
 
     await _queues.enqueue(envelope)

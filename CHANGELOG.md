@@ -28,6 +28,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`RequestEnvelope.bypass_pause` field** (default `False`).
   Carried through the queue so scheduler dispatch can identify test
   traffic that bypasses the admin pause guard.
+- **Admin pause/resume HTTP endpoints** at
+  `POST /api/marshal/admin/pause` and
+  `POST /api/marshal/admin/resume`. Both gated by
+  `admin.pause_endpoints_enabled=true` (return 404 otherwise) and
+  require an `X-Marshal-Admin-Token` header matching
+  `admin.admin_token` (return 401 otherwise). Pause accepts a JSON
+  body with `drain_timeout_s` (default 60) and
+  `auto_resume_after_seconds` (default 300); returns 200 with
+  `{drained_in_flight, queued_at_pause, auto_resume_at}` on success
+  or 409 if drain timed out (with the same fields plus current
+  `in_flight` count). Resume returns 200 with the current
+  `queue_depth`. Auth uses `secrets.compare_digest` for
+  constant-time comparison. Audit events
+  (`admin.dispatch_paused`, `admin.dispatch_resumed`,
+  `admin.drain_timeout_exceeded`, `admin.auto_resumed`) record on
+  every state change.
+- **Auto-resume failsafe** in the scheduler. `Scheduler.pause` now
+  schedules an `_auto_resume_after` background task that flips
+  `_dispatch_paused` back after the configured delay. Defends
+  against test-session crashes that would otherwise leave prod
+  paused indefinitely. Cancelled by explicit `resume`; reset by
+  re-`pause`; cleaned up by `Scheduler.stop`.
+- **`GET /api/marshal/debug` endpoint** gated by
+  `debug.endpoint_enabled=true` (return 404 otherwise). Returns
+  scheduler metrics + pause state + in-flight count for integration
+  tests that assert on marshal-internal state via HTTP rather than
+  reaching into `app.state._marshal_internals`. Production marshal
+  keeps this endpoint disabled to avoid leaking internals.
+- **Bypass-token detection on inference requests.** The
+  `_enqueue_inference` and `_enqueue_and_wait` request handlers
+  now read `X-Marshal-Test-Bypass`; matching the configured
+  `admin.test_bypass_token` flips `RequestEnvelope.bypass_pause` to
+  `True` (constant-time compare). The scheduler dispatch loop
+  changes that respect the flag during pause ship in v0.6.0
+  Stage 2.
 
 ### Changed
 

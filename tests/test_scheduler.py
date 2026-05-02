@@ -2412,6 +2412,64 @@ class TestSchedulerPauseState:
         sched._in_flight_count = 0
         assert sched.in_flight_count() == 0
 
+    async def test_pause_schedules_auto_resume_task(self):
+        sched = _make_scheduler()
+        await sched.pause(drain_timeout_s=0.1, auto_resume_after_seconds=10.0)
+        assert sched._auto_resume_task is not None
+        assert not sched._auto_resume_task.done()
+        sched.resume()  # cleanup
+
+    async def test_resume_cancels_auto_resume_task(self):
+        sched = _make_scheduler()
+        await sched.pause(drain_timeout_s=0.1, auto_resume_after_seconds=10.0)
+        task = sched._auto_resume_task
+        assert task is not None
+
+        sched.resume()
+        # Give the cancelled task a tick to settle.
+        await asyncio.sleep(0)
+        assert sched._auto_resume_task is None
+        assert task.cancelled() or task.done()
+
+    async def test_repause_cancels_prior_auto_resume_and_schedules_new(self):
+        sched = _make_scheduler()
+        await sched.pause(drain_timeout_s=0.1, auto_resume_after_seconds=10.0)
+        first_task = sched._auto_resume_task
+
+        await sched.pause(drain_timeout_s=0.1, auto_resume_after_seconds=20.0)
+        second_task = sched._auto_resume_task
+
+        assert second_task is not first_task
+        assert first_task is not None
+        # Give the cancellation a tick to land.
+        await asyncio.sleep(0)
+        assert first_task.cancelled() or first_task.done()
+        sched.resume()  # cleanup
+
+    async def test_auto_resume_fires_after_delay(self):
+        """Sleep just past the auto-resume window; flag flips back."""
+        sched = _make_scheduler()
+        # Tight delay so the test runs fast.
+        await sched.pause(drain_timeout_s=0.05, auto_resume_after_seconds=0.15)
+        assert sched.is_paused() is True
+
+        # Wait past the auto-resume window.
+        await asyncio.sleep(0.3)
+        assert sched.is_paused() is False
+
+    async def test_scheduler_stop_cancels_auto_resume(self):
+        sched = _make_scheduler()
+        await sched.pause(drain_timeout_s=0.1, auto_resume_after_seconds=60.0)
+        task = sched._auto_resume_task
+        assert task is not None
+
+        await sched.stop()
+        assert sched._auto_resume_task is None
+        # Cancellation goes through "cancelling" → "cancelled"; yield
+        # the loop once to let the cancellation finalize.
+        await asyncio.sleep(0)
+        assert task.cancelled() or task.done()
+
 
 class TestRequestEnvelopeBypassPause:
     """RequestEnvelope.bypass_pause defaults False; explicit True allowed."""

@@ -116,14 +116,27 @@ Blocked (return 403 — manage models via Ollama directly): /api/pull,
 
 Local (served by proxy): /api/marshal/status, /status (alias)
 
+Admin (gated by `admin.pause_endpoints_enabled` + bearer token):
+POST /api/marshal/admin/pause, POST /api/marshal/admin/resume
+
+Debug (gated by `debug.endpoint_enabled`, OFF in production):
+GET /api/marshal/debug
+
 ## Scheduling Algorithm
 
 1. FIFO baseline — respect arrival order
 2. Bin-pack — fill VRAM by loading smaller models that fit alongside current
-3. Skip limit — per-request counter; after max_skips, force-load the model
+3. Skip limit — per-request counter; after max_skips, force-load the model.
+   CRITICAL programs are EXEMPT from skip increment (their dedicated
+   preemption path in step 5 already guarantees forced load).
 4. Eviction — least disruptive: fewest pending, lowest priority, oldest
 5. Priority — normal (drain-then-evict) vs critical (can preempt)
 6. Immediate — if model already loaded, forward without queuing
+7. Pause — when `admin.pause` flips `_dispatch_paused`, the scheduler
+   suspends queue draining. Bypass-flagged envelopes
+   (`X-Marshal-Test-Bypass` header) still dispatch. Resume picks up
+   where it left off; auto-resume failsafe fires after the configured
+   timeout if no explicit resume arrives.
 
 ## Testing Rules
 
