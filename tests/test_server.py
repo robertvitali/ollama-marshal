@@ -1703,6 +1703,51 @@ class TestLifespan:
         # for 60s; the fact this test returned in milliseconds proves
         # the task was cancelled cleanly.
 
+    async def test_lifespan_skips_benchmark_when_disabled(self, tmp_path):
+        """benchmark_on_startup=False must NOT spawn the benchmark task.
+
+        Regression test for the gate added in v0.5.0. Without this
+        check, a future flip of the production default (or accidental
+        removal of the gate) would silently re-enable the saturating
+        sweep through the upstream Ollama on every test marshal startup.
+        Also exercises the None-branch shutdown guard
+        (``if benchmark_task is not None``) by entering and exiting
+        lifespan cleanly.
+        """
+        from ollama_marshal.config import SchedulerConfig
+
+        config = MarshalConfig(
+            scheduler=SchedulerConfig(
+                benchmark_on_startup=False,
+                metrics_path=str(tmp_path / "metrics.json"),
+            )
+        )
+        app = create_app(config)
+
+        memory, registry, lifecycle, scheduler, queues = _make_mock_components()
+        from ollama_marshal.scheduler import SchedulerMetrics as RealMetrics
+
+        scheduler.metrics = RealMetrics()
+
+        with (
+            patch("ollama_marshal.server.MemoryManager", return_value=memory),
+            patch("ollama_marshal.server.ModelRegistry", return_value=registry),
+            patch(
+                "ollama_marshal.server.ModelLifecycle",
+                return_value=lifecycle,
+            ),
+            patch("ollama_marshal.server.Scheduler", return_value=scheduler),
+            patch("ollama_marshal.server.ModelQueues", return_value=queues),
+        ):
+            async with server_mod.lifespan(app):
+                pass
+
+        # The gate must skip the benchmark sweep entirely.
+        registry.benchmark_unknown.assert_not_called()
+        # Sanity: the rest of lifespan (poll start, scheduler start) still ran.
+        memory.start_polling.assert_called_once()
+        scheduler.start.assert_called_once()
+
     async def test_lifespan_starts_audit_logger_when_enabled(self, tmp_path):
         """audit.enabled=True wires a real AuditLogger into the scheduler."""
         from ollama_marshal.audit import AuditLogger

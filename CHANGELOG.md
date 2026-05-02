@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-01
+
+### Fixed
+
+- **Lifespan task cleanup is now exception-safe.** The pre-yield setup
+  is wrapped in `try/finally` so the `benchmark_task` and
+  `metrics_persister` background tasks always get cancelled and awaited
+  on shutdown, even if startup raised partway through (e.g. between
+  task creation and the yield). Previously a startup exception would
+  leak both tasks because the cleanup branch was sequenced after the
+  yield. New helper `_shutdown_task` always awaits the task (instead
+  of skipping on `done()`) so a benchmark sweep that fails by raising
+  surfaces its exception via structlog's `server.benchmark_task_failed`
+  / `server.metrics_persister_failed` events instead of riding silently
+  as `Task exception was never retrieved` at GC time.
+- **`MARSHAL_SCHEDULER_BENCHMARK_ON_STARTUP` env var now coerces to
+  bool correctly.** The v0.5.0 release added the field but forgot to
+  list it in `_apply_env_overrides`'s explicit bool list, so
+  `MARSHAL_SCHEDULER_BENCHMARK_ON_STARTUP=false` was passed through as
+  the literal string `"false"` and relied on Pydantic's lax-mode
+  coercion. Now parses to a real Python bool with the same
+  `true|1|yes` truthiness rules as the other bool env overrides.
+
+### Tests
+
+- **Regression test for the v0.5.0 benchmark gate** —
+  `test_lifespan_skips_benchmark_when_disabled` asserts
+  `benchmark_unknown` is NOT called when `benchmark_on_startup=False`,
+  guarding against a future flip of the production default or
+  accidental removal of the gate.
+- **Regression tests for `MARSHAL_SCHEDULER_BENCHMARK_ON_STARTUP`
+  env override** — verifies both `false` and `true` parse correctly
+  and produce real Python booleans matching the documented contract
+  in `marshal.example.yaml`.
+- **Inline guard in `tests/integration/conftest.py::make_test_app`** —
+  asserts the `model_copy` belt-and-suspenders override actually
+  produced `benchmark_on_startup=False`. Catches future Pydantic
+  semantics changes loudly during test setup instead of silently
+  saturating the upstream Ollama through the test fault_proxy.
+
+### Build
+
+- **`uv.lock` is now tracked in version control** per the comment in
+  `.gitignore` (`# Similar to Pipfile.lock, it is generally
+  recommended to include uv.lock in version control.`). Locks the
+  dependency tree for reproducible local + CI builds across the
+  v0.5.x series.
+
 ## [0.5.0] - 2026-05-01
 
 ### Added
