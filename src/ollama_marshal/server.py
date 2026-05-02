@@ -115,10 +115,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Start background tasks
     await _memory.start_polling()
     await _registry.initialize()
-    # Store the task reference per CLAUDE.md async correctness rule —
-    # without this, Python may garbage-collect the task before it runs
-    # to completion (and emit a warning on 3.12+).
-    benchmark_task = asyncio.create_task(_registry.benchmark_unknown())
+    # Benchmark task is gated by config so integration tests can opt
+    # out — running the full per-model load/unload sweep through a
+    # fault-injection proxy saturates the upstream and turns
+    # /api/ps polls into 10s timeouts.
+    benchmark_task: asyncio.Task[None] | None = None
+    if _config.scheduler.benchmark_on_startup:
+        # Store the task reference per CLAUDE.md async correctness rule —
+        # without this, Python may garbage-collect the task before it runs
+        # to completion (and emit a warning on 3.12+).
+        benchmark_task = asyncio.create_task(_registry.benchmark_unknown())
     await _scheduler.start()
 
     # Expose component instances on app.state under a private,
@@ -171,7 +177,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         pass
     # Cancel the benchmark task too — if it's still running on shutdown,
     # we don't want to wait for it to finish probing every model.
-    if not benchmark_task.done():
+    if benchmark_task is not None and not benchmark_task.done():
         benchmark_task.cancel()
         try:
             await benchmark_task

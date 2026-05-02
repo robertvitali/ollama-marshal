@@ -80,6 +80,13 @@ scheduler:
   metrics_persist_interval_s: 60.0 # MARSHAL_SCHEDULER_METRICS_PERSIST_INTERVAL_S — seconds
                                     # between background metrics snapshots. Lower = tighter
                                     # crash recovery, higher = less disk wear.
+  benchmark_on_startup: true        # MARSHAL_SCHEDULER_BENCHMARK_ON_STARTUP — run the
+                                    # model-size benchmark on lifespan startup. Probes
+                                    # /api/show metadata for every installed model and loads
+                                    # each unbenchmarked model briefly to record its VRAM
+                                    # footprint. Default ON so routing has accurate sizes.
+                                    # Disable in integration test harnesses that front Ollama
+                                    # with a fault-injection proxy.
 
 # Per-program configuration
 # Programs identify themselves via the X-Program-ID header.
