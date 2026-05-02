@@ -166,25 +166,53 @@ async def cleanup_models():
 # ---------------------------------------------------------------------
 
 
+async def _is_loaded_via_status(client: httpx.AsyncClient, model: str) -> bool:
+    """Read /api/marshal/status to check if ``model`` is loaded."""
+    resp = await client.get("/api/marshal/status")
+    resp.raise_for_status()
+    return any(m["name"] == model for m in resp.json().get("loaded_models", []))
+
+
+async def _loaded_model_entry(client: httpx.AsyncClient, model: str) -> dict | None:
+    """Return the loaded_models entry for ``model`` or None."""
+    resp = await client.get("/api/marshal/status")
+    resp.raise_for_status()
+    for m in resp.json().get("loaded_models", []):
+        if m["name"] == model:
+            return m
+    return None
+
+
+async def _evictions_via_debug(client: httpx.AsyncClient) -> int:
+    resp = await client.get("/api/marshal/debug")
+    resp.raise_for_status()
+    return int(resp.json()["metrics"]["evictions"])
+
+
 @_REQUIRES_MODELS
-async def test_preload_populates_loaded_models(marshal_app, cleanup_models):
-    """Cold model becomes loaded after a chat; size_vram is non-zero."""
-    client, app = marshal_app
+@pytest.mark.marshal_subprocess
+async def test_preload_populates_loaded_models(
+    marshal_subprocess_client, cleanup_models
+):
+    """Cold model becomes loaded after a chat; size_vram is non-zero.
+
+    Migrated to subprocess pattern (v0.6.1+). Uses /api/marshal/status
+    to read loaded models instead of reaching into _marshal_internals.
+    """
+    client, _audit_path = marshal_subprocess_client
     cleanup_models.append(REQUIRED_MODEL)
 
     # Initially the model may or may not be loaded depending on user state.
     # We don't care — we care that it IS loaded after the request.
     await _trigger_load(client, REQUIRED_MODEL)
     await wait_for(
-        lambda: app.state._marshal_internals.memory.is_loaded(REQUIRED_MODEL),
+        lambda: _is_loaded_via_status(client, REQUIRED_MODEL),
         timeout=15,
         description=f"{REQUIRED_MODEL} loaded",
     )
-    loaded = app.state._marshal_internals.memory.get_loaded_models()
-    assert REQUIRED_MODEL in loaded
-    assert loaded[REQUIRED_MODEL].size_vram > 0, (
-        f"size_vram should be populated; got {loaded[REQUIRED_MODEL]}"
-    )
+    entry = await _loaded_model_entry(client, REQUIRED_MODEL)
+    assert entry is not None
+    assert entry.get("size_vram", 0) > 0, f"size_vram should be populated; got {entry}"
 
 
 # ---------------------------------------------------------------------
@@ -198,6 +226,13 @@ async def test_bin_packing_keeps_multiple_models_loaded(marshal_app, cleanup_mod
 
     With the user's 256GB budget and two ~1-2GB models, marshal's
     bin-packer should accommodate both without evicting either.
+
+    NOTE: still uses the in-process ASGI pattern. The subprocess
+    pattern surfaced cross-suite contamination flakes when the user's
+    prod marshal at :11435 competes for VRAM (both share the same
+    Ollama at :11434). Migration deferred to v0.6.2 once the test can
+    isolate from prod-marshal load (e.g. via a dedicated test Ollama
+    instance).
     """
     client, app = marshal_app
     cleanup_models.extend([REQUIRED_MODEL, SECOND_MODEL])
