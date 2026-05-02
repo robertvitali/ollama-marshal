@@ -2247,3 +2247,114 @@ class TestForwardLoadedModelRequestsRaceSafe:
         # Crucially, no dispatch happened — envelope still in queue.
         assert envelope.done_event.is_set() is False
         mock_pb.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Pause / resume state machine (v0.6.0+)
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerPauseState:
+    """Pause/resume state machine — flag flips, drain wait, in-flight count.
+
+    These tests cover the state machine in isolation. The dispatch loop
+    integration (envelopes actually skipped during pause, bypass-flagged
+    envelopes still dispatching) ships in v0.6.0 Stage 2 with its own
+    tests.
+    """
+
+    async def test_initial_state_is_unpaused(self):
+        sched = _make_scheduler()
+        assert sched.is_paused() is False
+        assert sched.in_flight_count() == 0
+
+    async def test_resume_when_already_unpaused_is_noop(self):
+        sched = _make_scheduler()
+        sched.resume()
+        assert sched.is_paused() is False
+
+    async def test_pause_with_no_in_flight_returns_drained_immediately(self):
+        sched = _make_scheduler()
+        # No envelopes in flight → drain completes on first poll.
+        drained = await sched.pause(drain_timeout_s=1.0)
+        assert drained is True
+        assert sched.is_paused() is True
+
+    async def test_pause_then_resume_clears_flag(self):
+        sched = _make_scheduler()
+        await sched.pause(drain_timeout_s=1.0)
+        assert sched.is_paused() is True
+        sched.resume()
+        assert sched.is_paused() is False
+
+    async def test_pause_idempotent(self):
+        """Calling pause twice in a row returns drained both times."""
+        sched = _make_scheduler()
+        first = await sched.pause(drain_timeout_s=1.0)
+        second = await sched.pause(drain_timeout_s=1.0)
+        assert first is True
+        assert second is True
+        assert sched.is_paused() is True
+
+    async def test_pause_waits_for_in_flight_to_drain(self):
+        """Pause should not return until ``_in_flight_count`` is zero."""
+        sched = _make_scheduler()
+        sched._in_flight_count = 1
+
+        async def drain_in_flight() -> None:
+            await asyncio.sleep(0.2)
+            sched._in_flight_count = 0
+
+        # Run the drainer concurrently with pause; pause should wait
+        # for the in-flight envelope to clear before returning.
+        drain_task = asyncio.create_task(drain_in_flight())
+        drained = await sched.pause(drain_timeout_s=2.0)
+        await drain_task
+
+        assert drained is True
+        assert sched.is_paused() is True
+        assert sched.in_flight_count() == 0
+
+    async def test_pause_returns_false_on_drain_timeout(self):
+        """If in-flight envelopes don't clear in time, pause returns False.
+
+        The flag is still set (subsequent calls see is_paused() True).
+        Caller decides what to do — typically skip the test phase or
+        retry pause later.
+        """
+        sched = _make_scheduler()
+        sched._in_flight_count = 1
+
+        # Tight timeout vs counter that never drains.
+        drained = await sched.pause(drain_timeout_s=0.2)
+
+        assert drained is False
+        assert sched.is_paused() is True
+        assert sched.in_flight_count() == 1
+
+    async def test_in_flight_count_tracks_counter(self):
+        sched = _make_scheduler()
+        sched._in_flight_count = 2
+        assert sched.in_flight_count() == 2
+        sched._in_flight_count = 1
+        assert sched.in_flight_count() == 1
+        sched._in_flight_count = 0
+        assert sched.in_flight_count() == 0
+
+
+class TestRequestEnvelopeBypassPause:
+    """RequestEnvelope.bypass_pause defaults False; explicit True allowed."""
+
+    def test_default_bypass_pause_false(self):
+        envelope = _make_envelope(model="qwen3.5:0.8b-bf16")
+        assert envelope.bypass_pause is False
+
+    def test_bypass_pause_can_be_set(self):
+        envelope = RequestEnvelope(
+            model="qwen3.5:0.8b-bf16",
+            program_id="integration-test",
+            request_body={},
+            endpoint="/api/chat",
+            bypass_pause=True,
+        )
+        assert envelope.bypass_pause is True

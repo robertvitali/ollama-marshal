@@ -159,6 +159,63 @@ class TestMarshalConfigDefaults:
         assert cfg.programs["default"].priority == Priority.NORMAL
         assert cfg.shutdown.mode == ShutdownMode.DRAIN
         assert cfg.logging.level == "INFO"
+        # v0.6.0 admin + debug additions — both default OFF.
+        assert cfg.admin.pause_endpoints_enabled is False
+        assert cfg.admin.admin_token is None
+        assert cfg.admin.test_bypass_token is None
+        assert cfg.debug.endpoint_enabled is False
+
+
+# ---------------------------------------------------------------------------
+# AdminConfig validation
+# ---------------------------------------------------------------------------
+
+
+class TestAdminConfig:
+    def test_default_admin_config_disabled(self):
+        from ollama_marshal.config import AdminConfig
+
+        cfg = AdminConfig()
+        assert cfg.pause_endpoints_enabled is False
+        assert cfg.admin_token is None
+        assert cfg.test_bypass_token is None
+
+    def test_enabled_with_admin_token_succeeds(self):
+        from ollama_marshal.config import AdminConfig
+
+        token = "0123456789abcdef0123456789abcdef"  # noqa: S105 — test fixture
+        cfg = AdminConfig(
+            pause_endpoints_enabled=True,
+            admin_token=token,
+        )
+        assert cfg.pause_endpoints_enabled is True
+        assert cfg.admin_token == token
+
+    def test_enabled_without_admin_token_raises(self):
+        """Validator must reject enabled-but-tokenless config.
+
+        Without this guard, an operator who flips
+        pause_endpoints_enabled=True and forgets the token would
+        expose unauthenticated admin endpoints. Fail at config load.
+        """
+        from pydantic import ValidationError
+
+        from ollama_marshal.config import AdminConfig
+
+        with pytest.raises(ValidationError, match="admin_token"):
+            AdminConfig(pause_endpoints_enabled=True, admin_token=None)
+
+    def test_test_bypass_token_optional(self):
+        """test_bypass_token can be set independently of admin_token."""
+        from ollama_marshal.config import AdminConfig
+
+        bypass_tok = "bypass-tok"
+        cfg = AdminConfig(
+            pause_endpoints_enabled=True,
+            admin_token="admin-tok",  # noqa: S106 — test fixture
+            test_bypass_token=bypass_tok,
+        )
+        assert cfg.test_bypass_token == bypass_tok
 
 
 # ---------------------------------------------------------------------------

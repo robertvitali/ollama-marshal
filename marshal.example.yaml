@@ -194,3 +194,31 @@ context:
   #   ai-email-triage:
   #     typical_num_ctx: 4096             # short prompts, K-vote
   #     max_num_ctx: 8192
+
+# Admin endpoints (v0.6.0+). Soft-pause semantics: pause freezes
+# scheduler dispatch from the queue, but new requests still enqueue
+# normally (no client-visible 503s). Bypass-token requests dispatch
+# even during pause. Resume drops the flag and the scheduler drains
+# the accumulated queue at full speed. Default OFF — operators opt
+# in by setting both pause_endpoints_enabled AND admin_token.
+admin:
+  pause_endpoints_enabled: false   # MARSHAL_ADMIN_PAUSE_ENDPOINTS_ENABLED
+                                   # — expose POST /api/marshal/admin/{pause,resume}.
+                                   # Required for integration tests that pause prod
+                                   # marshal during their run, or deploy-time draining.
+  admin_token: null                # MARSHAL_ADMIN_ADMIN_TOKEN
+                                   # — bearer token for X-Marshal-Admin-Token. Required
+                                   # when pause_endpoints_enabled=true. Generate via
+                                   # `openssl rand -hex 32`.
+  test_bypass_token: null          # MARSHAL_ADMIN_TEST_BYPASS_TOKEN
+                                   # — token for X-Marshal-Test-Bypass header. Requests
+                                   # carrying this header bypass the dispatch-pause
+                                   # guard. Optional; leave null to disallow bypass
+                                   # entirely.
+
+# Internal-state debug endpoint (v0.6.0+). When endpoint_enabled,
+# exposes GET /api/marshal/debug returning scheduler metrics, allocated
+# num_ctx per model, registry metadata cache, and other state used by
+# integration tests. Default OFF — production marshal stays lean.
+debug:
+  endpoint_enabled: false          # MARSHAL_DEBUG_ENDPOINT_ENABLED

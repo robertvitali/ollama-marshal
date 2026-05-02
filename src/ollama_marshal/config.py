@@ -502,6 +502,93 @@ class RetryConfig(BaseModel):
     )
 
 
+class AdminConfig(BaseModel):
+    """Operator/admin endpoints for pause/resume + future maintenance ops.
+
+    OFF by default — admin endpoints are gated behind
+    ``pause_endpoints_enabled`` AND a bearer token. Operators opt in
+    by setting both fields in ``marshal.yaml``. Used by integration
+    tests (and future deploy-time draining workflows) to safely
+    suspend dispatch from the queue without rejecting incoming
+    requests.
+
+    Pause semantics: SOFT. Setting the dispatch-paused flag freezes
+    the scheduler's queue draining but does NOT reject new requests
+    (they continue to enqueue normally). Tests carrying
+    ``X-Marshal-Test-Bypass: <token>`` (matching ``test_bypass_token``)
+    bypass the pause and dispatch immediately. Resume drops the flag
+    and the scheduler picks up where it left off, draining the
+    accumulated queue at normal speed.
+    """
+
+    pause_endpoints_enabled: bool = Field(
+        default=False,
+        description=(
+            "Expose ``POST /api/marshal/admin/pause`` and "
+            "``POST /api/marshal/admin/resume``. Default OFF — "
+            "operators opt in explicitly. When True, ``admin_token`` "
+            "must also be set."
+        ),
+    )
+    admin_token: str | None = Field(
+        default=None,
+        description=(
+            "Bearer token for the ``X-Marshal-Admin-Token`` header on "
+            "admin endpoints. Required when "
+            "``pause_endpoints_enabled=True``. Generate with "
+            "``openssl rand -hex 32``."
+        ),
+    )
+    test_bypass_token: str | None = Field(
+        default=None,
+        description=(
+            "Token for the ``X-Marshal-Test-Bypass`` header. Requests "
+            "carrying this header bypass the dispatch-pause guard. "
+            "Used by integration tests to fire requests against a "
+            "paused prod marshal. Optional — leave unset to disallow "
+            "bypass entirely."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_admin_token_when_enabled(self) -> AdminConfig:
+        """Reject configs that enable admin endpoints without a token.
+
+        Without this guard, an operator who sets
+        ``pause_endpoints_enabled=True`` and forgets the token would
+        expose unauthenticated admin endpoints. Fail fast at config
+        load instead of silently accepting them.
+        """
+        if self.pause_endpoints_enabled and not self.admin_token:
+            msg = (
+                "admin.pause_endpoints_enabled=True requires "
+                "admin.admin_token to be set (use `openssl rand -hex 32`)"
+            )
+            raise ValueError(msg)
+        return self
+
+
+class DebugConfig(BaseModel):
+    """Internal-state debug endpoints for integration tests.
+
+    OFF by default — production marshal stays lean. Test configs
+    flip ``endpoint_enabled`` to True. The env override
+    ``MARSHAL_DEBUG_ENDPOINT_ENABLED=true`` works the same.
+    """
+
+    endpoint_enabled: bool = Field(
+        default=False,
+        description=(
+            "Expose ``GET /api/marshal/debug`` returning scheduler "
+            "metrics, ``allocated_num_ctx_per_model``, registry "
+            "metadata cache contents, and other internal state. "
+            "Used by integration tests that need to assert on "
+            "marshal-internal state via HTTP rather than reaching "
+            "into ``app.state._marshal_internals``."
+        ),
+    )
+
+
 class MarshalConfig(BaseModel):
     """Root configuration for ollama-marshal."""
 
@@ -529,6 +616,8 @@ class MarshalConfig(BaseModel):
     audit: AuditConfig = Field(default_factory=AuditConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+    admin: AdminConfig = Field(default_factory=AdminConfig)
+    debug: DebugConfig = Field(default_factory=DebugConfig)
 
     @model_validator(mode="after")
     def _normalize_instances(self) -> MarshalConfig:
@@ -675,6 +764,9 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 "injection_enabled",
                 # v0.5.0: scheduler benchmark gate
                 "benchmark_on_startup",
+                # v0.6.0: admin endpoint gate + debug endpoint gate
+                "pause_endpoints_enabled",
+                "endpoint_enabled",
             ):
                 data[section][field] = value.lower() in ("true", "1", "yes")
             else:

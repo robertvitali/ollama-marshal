@@ -52,6 +52,15 @@ class RequestEnvelope:
     instance_url: str | None = None
     tier_label: str | None = None
     routing_reason: str | None = None
+    # Admin pause bypass (v0.6.0+). When the scheduler's dispatch is
+    # paused via ``/api/marshal/admin/pause``, normal envelopes sit in
+    # the queue waiting for resume. Envelopes flagged with
+    # ``bypass_pause=True`` (set when the request carries the
+    # ``X-Marshal-Test-Bypass`` header matching ``admin.test_bypass_token``)
+    # dispatch immediately even during pause. Used by integration tests
+    # so they can fire requests against a paused prod marshal without
+    # blocking on the queue freeze.
+    bypass_pause: bool = False
 
     def increment_skip(self) -> None:
         """Increment the skip counter for this request."""

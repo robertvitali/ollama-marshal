@@ -477,6 +477,102 @@ class Scheduler:
         # to 1 (current sequential behavior). When raised, _process_batch
         # fans out same-model envelopes through this semaphore.
         self.inflight = InflightTracker(config.scheduler.parallel_per_model)
+        # Admin pause state (v0.6.0+). When ``_dispatch_paused`` is set,
+        # the scheduler tick suspends queue draining (envelopes pile up
+        # but aren't dispatched). Bypass-flagged envelopes
+        # (``RequestEnvelope.bypass_pause=True``) still dispatch — the
+        # tick logic in v0.6.0 Stage 2 handles that filtering.
+        # ``_in_flight_count`` tracks how many envelopes are currently
+        # mid-dispatch to Ollama so the admin pause endpoint can wait
+        # for the scheduler to actually be idle (drain) before
+        # returning 200. Counter rather than set because RequestEnvelope
+        # isn't hashable (mutable asyncio.Event field) and the drain
+        # wait only needs the count, not envelope identity. Incremented
+        # and decremented at the ``_forward_single`` boundary; see usage
+        # in v0.6.0 Stage 2.
+        self._dispatch_paused = False
+        self._in_flight_count = 0
+
+    def is_paused(self) -> bool:
+        """Return True if dispatch is currently paused.
+
+        Reads the in-memory flag — caller does not need to acquire a
+        lock. Race: a concurrent ``pause()`` / ``resume()`` may flip
+        the flag immediately after the read, but Python's GIL makes
+        the bool read itself atomic. Callers using this for routing
+        (e.g. middleware deciding whether to apply the pause guard)
+        must accept that the value reflects the moment of the read.
+        """
+        return self._dispatch_paused
+
+    async def pause(self, drain_timeout_s: float = 60.0) -> bool:
+        """Stop dispatching from the queue and wait for in-flight to drain.
+
+        SOFT PAUSE: incoming requests still enqueue normally (no 503s).
+        The scheduler stops popping envelopes off the queue; bypass-
+        flagged envelopes (``RequestEnvelope.bypass_pause=True``)
+        continue to dispatch via the bypass path. Returns once
+        ``_in_flight_envelopes`` is empty (scheduler is idle), so
+        callers that pause to do test work can be confident no
+        production inference is mid-stream.
+
+        Idempotent — calling ``pause`` while already paused returns
+        immediately with the current drain status.
+
+        Args:
+            drain_timeout_s: Max seconds to wait for in-flight
+                dispatches to complete naturally. Long-running
+                inferences (a 5min generation) may exceed this; the
+                caller decides what to do (skip the test, retry
+                later, etc).
+
+        Returns:
+            True if drain completed within timeout, False if timeout
+            was hit (one or more envelopes still in flight).
+        """
+        self._dispatch_paused = True
+        return await self._wait_for_drain(timeout_s=drain_timeout_s)
+
+    def resume(self) -> None:
+        """Resume dispatching from the queue.
+
+        Drops the pause flag. The next scheduler tick picks up the
+        accumulated queue at full speed. Idempotent — calling
+        ``resume`` on an already-running scheduler is a no-op.
+        """
+        self._dispatch_paused = False
+
+    async def _wait_for_drain(self, timeout_s: float) -> bool:
+        """Poll until ``_in_flight_count`` is zero or timeout fires.
+
+        Polled rather than event-driven because in-flight tracking is
+        an increment/decrement pair around ``_forward_single`` —
+        adding an event-set would couple the dispatch path to the
+        pause machinery. Polling at 100ms granularity is cheap and
+        keeps the dispatch path uncoupled from pause state.
+
+        Args:
+            timeout_s: Max seconds to wait.
+
+        Returns:
+            True if the counter drained to zero, False if timeout
+            fired first.
+        """
+        deadline = time.monotonic() + timeout_s
+        while self._in_flight_count > 0:
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.1)
+        return True
+
+    def in_flight_count(self) -> int:
+        """Number of envelopes currently mid-dispatch to Ollama.
+
+        Used by ``/api/marshal/admin/pause`` response payload to
+        surface drain status (so operators see whether the scheduler
+        is actually idle when pause returns).
+        """
+        return self._in_flight_count
 
     async def start(self) -> None:
         """Start the scheduler loop."""
