@@ -164,6 +164,8 @@ def make_test_app(cfg: MarshalConfig, tmp_marshal_paths: dict[str, Path]) -> Fas
     model load. This belt-and-suspenders override catches inline
     SchedulerConfig builders that forget to set the flag.
     """
+    # model_copy bypasses root validators; relies on cfg already being
+    # a validated MarshalConfig instance (callers always pass one).
     cfg = cfg.model_copy(
         update={
             "scheduler": cfg.scheduler.model_copy(

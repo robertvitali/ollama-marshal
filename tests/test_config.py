@@ -130,6 +130,7 @@ class TestPydanticModelDefaults:
         cfg = SchedulerConfig()
         assert cfg.max_skips == 3
         assert cfg.model_detect_interval == 30
+        assert cfg.benchmark_on_startup is True
 
     def test_program_config_defaults(self):
         cfg = ProgramConfig()

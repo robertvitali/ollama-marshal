@@ -121,9 +121,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # /api/ps polls into 10s timeouts.
     benchmark_task: asyncio.Task[None] | None = None
     if _config.scheduler.benchmark_on_startup:
-        # Store the task reference per CLAUDE.md async correctness rule —
-        # without this, Python may garbage-collect the task before it runs
-        # to completion (and emit a warning on 3.12+).
         benchmark_task = asyncio.create_task(_registry.benchmark_unknown())
     await _scheduler.start()
 
