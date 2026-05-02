@@ -105,6 +105,12 @@ def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
     - ``shutdown.mode = IMMEDIATE``, ``unload_models = True`` — when
       the lifespan tears down at end of test, every loaded model gets
       unloaded so the next test starts cold.
+    - ``scheduler.benchmark_on_startup = False`` — production marshal
+      benchmarks every uncached model on startup. With per-test temp
+      registry paths the cache is always empty, so the benchmark task
+      would load every installed model through the test fault-proxy
+      (or real Ollama) on every test, saturating the upstream and
+      starving the test's own request behind ~10s+ per model load.
     - ``programs`` pre-populated with two profiles:
       - ``integration-test`` → CRITICAL (default for all tests)
       - ``integration-test-normal`` → NORMAL (opt-in for tests of
@@ -117,6 +123,7 @@ def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,  # don't write during tests
+            benchmark_on_startup=False,
         ),
         programs={
             "default": ProgramConfig(),
@@ -148,7 +155,24 @@ def make_test_app(cfg: MarshalConfig, tmp_marshal_paths: dict[str, Path]) -> Fas
 
     Sets the same per-test path overrides the ``marshal_app`` fixture
     sets, so tests using either path get identical isolation.
+
+    Also force-disables ``scheduler.benchmark_on_startup``. Per-test
+    registry paths start with an empty cache, and the production
+    benchmark sweep would otherwise load every installed model
+    through the test fault-proxy on every startup — saturating the
+    upstream and starving the test's own request behind ~10s+ per
+    model load. This belt-and-suspenders override catches inline
+    SchedulerConfig builders that forget to set the flag.
     """
+    # model_copy bypasses root validators; relies on cfg already being
+    # a validated MarshalConfig instance (callers always pass one).
+    cfg = cfg.model_copy(
+        update={
+            "scheduler": cfg.scheduler.model_copy(
+                update={"benchmark_on_startup": False}
+            )
+        }
+    )
     app = create_app(cfg)
     app.state.metrics_path = tmp_marshal_paths["metrics_path"]
     app.state.registry_path = tmp_marshal_paths["registry_path"]

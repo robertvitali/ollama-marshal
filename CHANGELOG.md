@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-01
+
 ### Added
 
 - **Per-instance state in `/api/marshal/status`** — the status payload
@@ -40,6 +42,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     daemons. Pre-loads model on q4 only; verifies routing returns
     `routing_reason=promoting_from_last_resort` with `unload_from=[q4]`
     so the scheduler cleans up the stale copy after promotion.
+- **`scheduler.benchmark_on_startup` config flag** (default `true`) —
+  controls whether marshal runs the model-size benchmark sweep on
+  lifespan startup. Production behavior unchanged. Set to `false` in
+  integration test harnesses that front Ollama with a fault-injection
+  proxy: with per-test temp registry paths the cache is always empty,
+  and the benchmark would otherwise load every installed model
+  through the proxy on every startup, saturating the upstream
+  daemon and starving the test's own request behind 10s+ per model
+  load. The integration suite's `make_test_app()` helper now
+  force-disables this regardless of what the test's inline
+  `SchedulerConfig` says.
 
 ### Changed
 

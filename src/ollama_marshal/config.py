@@ -266,6 +266,19 @@ class SchedulerConfig(BaseModel):
             "tighter recovery, higher disk I/O; higher = vice versa."
         ),
     )
+    benchmark_on_startup: bool = Field(
+        default=True,
+        description=(
+            "Run the model-size benchmark task on lifespan startup. "
+            "Probes /api/show metadata for every installed model and "
+            "loads each unbenchmarked model briefly to record its VRAM "
+            "footprint. Default ON for production so routing decisions "
+            "have accurate sizes. Disable in integration tests that use "
+            "fault-injection proxies — the benchmark would saturate the "
+            "real Ollama through the proxy and starve other test "
+            "requests."
+        ),
+    )
 
 
 class ProgramConfig(BaseModel):

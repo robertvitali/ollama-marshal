@@ -482,6 +482,7 @@ def _proxy_instances_config(
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
+            benchmark_on_startup=False,
         ),
         programs={
             "default": ProgramConfig(),
