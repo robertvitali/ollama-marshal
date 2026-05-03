@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the pre-commit hook (pinned 0.15.12) on rules like S603. Now both
   paths use the same pinned versions, so `make lint` and the
   pre-commit ruff hook always agree.
+- **v0.1.0 release date corrected** in CHANGELOG.md from
+  `2026-04-24` (initial commit date) to `2026-04-27` (PR #1 merge
+  date — the actual ship date). v0.1.0 was also retroactively
+  tagged at the PR #1 merge commit (`3ba7133`); previously the
+  repo's tag history started at v0.2.0, leaving v0.1.0 untagged.
+- **Removed unused `[[tool.mypy.overrides]] module = "tests"`**
+  from `pyproject.toml`. Both the Makefile (`uv run mypy src/`)
+  and the pre-commit hook (`mypy --strict src/`) only typecheck
+  `src/`, so the tests-module override never matched anything;
+  with `warn_unused_configs = true` it produced
+  `unused section(s): module = ['tests']` noise on every typecheck
+  run.
 
 ## [0.6.1] - 2026-05-02
 
@@ -709,7 +721,7 @@ otherwise.
 - Dashboard `log_follower` now catches `OSError` on file open/read and
   surfaces the error in `state["log_error"]` instead of silently dying.
 
-## [0.1.0] - 2026-04-24
+## [0.1.0] - 2026-04-27
 
 ### Added
 
