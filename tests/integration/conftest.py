@@ -447,7 +447,7 @@ async def marshal_subprocess(
             "127.0.0.1",
         ],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,  # avoid PIPE deadlock if marshal logs >64KB
     )
 
     try:
@@ -455,76 +455,15 @@ async def marshal_subprocess(
         yield base_url, audit_path
     finally:
         proc.terminate()
+        # Hoist the blocking proc.wait off the event loop per CLAUDE.md
+        # async correctness rules — without this the fixture's finally
+        # block stalls the loop for up to 5s while the subprocess shuts
+        # down (blocks any concurrent fixture cleanup).
         try:
-            proc.wait(timeout=5)
+            await asyncio.to_thread(proc.wait, 5)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait()
-
-
-@pytest.fixture
-async def marshal_subprocess_factory(tmp_path: Path):
-    """Factory for tests needing custom-config marshal subprocesses.
-
-    Yields a callable ``spawn(**overrides)`` that writes a per-test
-    marshal.yaml from ``build_test_config_yaml(**overrides)``, spawns
-    the subprocess, waits for ready, and returns
-    ``(base_url, audit_path)``. Tracks all spawned subprocesses for
-    teardown so a test can spawn multiple if needed.
-
-    Use when ``marshal_subprocess`` doesn't fit (different audit
-    enabled, custom idle_eviction_minutes, extra programs, etc.).
-    """
-    spawned: list[subprocess.Popen[bytes]] = []
-    spawn_index = [0]
-
-    async def spawn(**overrides: Any) -> tuple[str, Path]:
-        spawn_index[0] += 1
-        suffix = f"_{spawn_index[0]}" if spawn_index[0] > 1 else ""
-        port = _reserve_ephemeral_port()
-        base_url = f"http://127.0.0.1:{port}"
-        audit_path = tmp_path / f"audit{suffix}.jsonl"
-        config_path = tmp_path / f"marshal{suffix}.yaml"
-        config_path.write_text(
-            build_test_config_yaml(
-                port=port,
-                audit_path=audit_path,
-                registry_path=tmp_path / f"registry{suffix}.json",
-                metadata_path=tmp_path / f"metadata{suffix}.json",
-                metrics_path=tmp_path / f"metrics{suffix}.json",
-                **overrides,
-            )
-        )
-        proc = subprocess.Popen(  # noqa: S603 — args hardcoded + tmp path
-            [
-                sys.executable,
-                "-m",
-                "ollama_marshal",
-                "start",
-                "--config",
-                str(config_path),
-                "--port",
-                str(port),
-                "--host",
-                "127.0.0.1",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        spawned.append(proc)
-        await _wait_for_marshal_ready(base_url, timeout=20.0)
-        return base_url, audit_path
-
-    try:
-        yield spawn
-    finally:
-        for proc in spawned:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            await asyncio.to_thread(proc.wait)
 
 
 @pytest.fixture

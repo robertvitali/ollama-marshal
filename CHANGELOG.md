@@ -19,13 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `registry.metadata_per_model` (the architecture/max_ctx/
   kv_per_slot cache). Lets integration tests assert on marshal-
   internal state via HTTP rather than `app.state._marshal_internals`.
-- **`marshal_subprocess_factory` fixture** in
-  `tests/integration/conftest.py` for tests needing custom
-  subprocess configs. Yields a `spawn(**overrides)` callable that
-  parameterizes `build_test_config_yaml`. Tracks all spawned
-  subprocesses for teardown so a test can spawn multiple if needed
-  (e.g. multi-instance routing tests).
-
 ### Changed
 
 - **12 of 27 success integration tests migrated to the v0.6.0
@@ -42,11 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   see — sockets, headers, HTTP parsing — instead of the in-process
   ASGI shortcut.
 - `test_fail_fast::test_unknown_model_returns_404_fast` budget
-  relaxed from 500ms to 2s. The 500ms target documents the
+  relaxed from 500ms to 750ms. The 500ms target documents the
   production guarantee; subprocess tests share Ollama with whatever
   else is running, so the /api/tags probe occasionally takes longer
-  than ideal. The 2s budget still catches the pathological
-  "request sat in queue waiting for non-existent model" bug class.
+  than ideal. 750ms gives that headroom without losing
+  regression-detection power for the "request sat in queue waiting
+  for non-existent model" bug class.
 
 ### Deferred to v0.6.2
 

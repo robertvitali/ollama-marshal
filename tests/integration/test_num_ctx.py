@@ -150,14 +150,22 @@ async def test_client_num_ctx_clamped_to_model_max(marshal_subprocess_client):
     unboundedly. One bad request would brick the proxy.
     """
     client, _audit_path = marshal_subprocess_client
+    # Warm the registry first: a benign request loads the model at the
+    # default num_ctx and probes /api/show into registry metadata. Then
+    # snapshot reload_count so the assertion below measures only the
+    # reloads caused by the adversarial request, not the cold-start
+    # ones the subprocess pattern produces unavoidably.
+    await _fire_chat(client, prompt="hi")
+    await wait_for(
+        lambda: _has_allocation(client, REQUIRED_MODEL),
+        timeout=15,
+        description="allocation recorded after warm-up",
+    )
+    baseline_reloads = await _reload_count(client)
+
     # qwen3.5:0.8b-bf16's max_context_length is 262144. The clamp
     # should bring 999_999_999 down to 262144.
     await _fire_chat(client, prompt="hi", num_ctx=999_999_999)
-    await wait_for(
-        lambda: _has_allocation(client, REQUIRED_MODEL),
-        timeout=30,
-        description="allocation recorded after clamp",
-    )
     allocated = await _allocated_num_ctx(client, REQUIRED_MODEL)
     # Must be <= model max, NOT the absurd input value.
     max_ctx = await _model_max_ctx(client, REQUIRED_MODEL)
@@ -166,16 +174,13 @@ async def test_client_num_ctx_clamped_to_model_max(marshal_subprocess_client):
         f"expected clamp to model max ({max_ctx}), got {allocated}. "
         f"The trust-boundary clamp didn't fire."
     )
-    # And no reload loop — reload_count should be small + bounded,
-    # NOT growing each iteration. Subprocess startup with empty
-    # registry can produce 1-2 reloads naturally as the model loads
-    # at default num_ctx and then re-loads at the clamped value once
-    # the request's intended num_ctx is resolved. The original
-    # assertion was <=1 against a warm in-process registry; <=3
-    # accommodates the subprocess cold-start path while still
-    # catching the failure mode (reload count blows up).
-    reload_count = await _reload_count(client)
-    assert reload_count <= 3, (
-        f"reload_count grew to {reload_count} "
+    # The clamped request must trigger at most one reload-on-need
+    # (warmed-up num_ctx → max_ctx). Anything more means the clamp
+    # failed and we entered a reload loop.
+    final_reloads = await _reload_count(client)
+    delta = final_reloads - baseline_reloads
+    assert delta <= 1, (
+        f"clamped request caused {delta} reloads "
+        f"(baseline={baseline_reloads}, final={final_reloads}) "
         f"— suggests the clamp failed and we entered a reload loop."
     )

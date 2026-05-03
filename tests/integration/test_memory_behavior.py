@@ -130,15 +130,16 @@ async def cleanup_models():
     cold even if marshal's lifespan teardown failed.
 
     ORDERING NOTE: pytest-asyncio teardowns in LIFO order — this
-    fixture finalizes BEFORE ``marshal_app.__aexit__``. We therefore
-    fire keep_alive=0 while the test marshal is still polling
-    /api/ps. In practice this is harmless: the test marshal has
-    already left its assertions, and any "model gone" state observed
-    by its poller after the test body finishes is irrelevant —
-    ``shutdown.unload_models=True`` in the test config will cleanly
-    unload again at lifespan exit. 23 passing runs confirm no actual
-    interference. (Codex /review flagged this as a P1 race; verified
-    benign in practice but documented here for future readers.)
+    fixture finalizes BEFORE the marshal teardown (whether
+    ``marshal_app`` ASGI exit OR ``marshal_subprocess`` SIGTERM).
+    We therefore fire keep_alive=0 while the test marshal is still
+    polling /api/ps. In practice this is harmless: the test marshal
+    has already left its assertions, and any "model gone" state
+    observed by its poller after the test body finishes is
+    irrelevant — ``shutdown.unload_models=True`` in the test config
+    cleanly unloads again at lifespan exit. (Codex /review flagged
+    this as a P1 race on PR #9; verified benign in practice but
+    documented for future readers.)
     """
     loaded: list[str] = []
     yield loaded

@@ -40,13 +40,10 @@ _HDR = {"X-Program-ID": PROGRAM_CRITICAL}
 NEVER_PULLED_MODEL = "zzz-never-existed-bf16:latest"
 
 
-# Wall-clock budget for the fail-fast 404 path. Generous compared to
-# the 500ms target the production guarantee documents — subprocess
-# tests share Ollama with whatever else is running, so the /api/tags
-# probe occasionally takes longer than ideal. The test still fails
-# loudly if the response takes >2s, which catches the pathological
-# "request sat in queue waiting for a non-existent model" bug class.
-_FAIL_FAST_BUDGET_S = 2.0
+# Wall-clock budget for the fail-fast 404 path. Production target is
+# 500ms; 750ms gives headroom for the subprocess cold-start /api/tags
+# probe on a shared Ollama without losing regression-detection power.
+_FAIL_FAST_BUDGET_S = 0.75
 
 
 async def test_unknown_model_returns_404_fast(marshal_subprocess_client):

@@ -579,12 +579,13 @@ def _register_routes(app: FastAPI) -> None:
             for inst in _memory._instances
         }
         # Registry metadata cache — surfaces architecture/max_ctx/
-        # kv_per_slot per model. Only includes models marshal has
-        # probed (cold registry returns empty dict).
-        from dataclasses import asdict
-
+        # kv_per_slot_at_max_ctx per model. Uses to_json_dict() so
+        # the computed kv_per_slot_at_max_ctx field is included
+        # (asdict would skip it — it's a @property, not a field).
+        # Only includes models marshal has probed; cold registry
+        # returns empty dict.
         metadata_per_model = {
-            model: asdict(meta) for model, meta in _registry._metadata.items()
+            model: meta.to_json_dict() for model, meta in _registry._metadata.items()
         }
         return JSONResponse(
             {
