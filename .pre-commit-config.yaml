@@ -35,15 +35,29 @@ repos:
         args: [--strict, src/]
         pass_filenames: false
 
-      # Run the unit test suite on push (NOT every commit — keeps
-      # commits fast). The integration test suite is excluded since
-      # it requires a running Ollama; run `make test-integration`
-      # locally before opening a PR.
+      # Run the unit test suite on EVERY commit (~10s). Catches
+      # regressions before they reach the branch tip. Uses
+      # `uv run --extra dev` to match the Makefile's pinned-version
+      # invocation pattern.
+      - id: pytest-unit
+        name: pytest (unit tests, every commit)
+        entry: uv run --extra dev pytest tests/ --ignore=tests/integration -q --no-cov
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      # Run the integration test suite on push (the closest native
+      # gate to "pre-PR" — you typically push, then open a PR).
+      # Tests skipif `localhost:11434` is unreachable, so this
+      # degrades gracefully when Ollama is down. Known cross-suite
+      # contamination flake on test_bin_packing_keeps_multiple_models_loaded
+      # when sharing Ollama with prod marshal — re-push or run
+      # `make test-integration` directly to retry.
       #
       # Install push hooks via: `pre-commit install --hook-type pre-push`
-      - id: pytest-unit
-        name: pytest (unit tests, on push)
-        entry: pytest tests/ --ignore=tests/integration -q --no-cov
+      - id: pytest-integration
+        name: pytest (integration tests, on push)
+        entry: uv run --extra dev pytest tests/integration/ -m integration -q --no-cov
         language: system
         types: [python]
         pass_filenames: false

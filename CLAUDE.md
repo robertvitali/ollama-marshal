@@ -37,10 +37,10 @@ attribute injection from the server lifespan.)
 
 ```bash
 make install-dev    # install editable + dev deps + pre-commit hooks
-make test           # pytest with 95% coverage gate
-make lint           # ruff check
-make format         # ruff format
-make typecheck      # mypy --strict src/
+make test           # uv run --extra dev pytest (with 95% coverage gate)
+make lint           # uv run --extra dev ruff check
+make format         # uv run --extra dev ruff format
+make typecheck      # uv run --extra dev mypy src/
 make check          # lint + typecheck + test
 ```
 

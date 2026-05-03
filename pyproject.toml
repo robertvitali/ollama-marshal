@@ -130,7 +130,15 @@ convention = "google"
 python_version = "3.11"
 strict = true
 warn_return_any = true
-warn_unused_configs = true
+# warn_unused_configs is OFF because the Makefile + pre-commit only
+# typecheck src/, so the [tests] override below would be flagged as
+# "unused" under those invocations. The override still relaxes ~1K
+# untyped-def errors for contributors who run `mypy tests/` ad-hoc
+# (it doesn't make tests fully strict-clean — many other strict-mode
+# checks still fire — but it cuts the noisiest categories). There is
+# no per-block suppression for warn_unused_configs, so it's off
+# globally.
+warn_unused_configs = false
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
@@ -141,6 +149,15 @@ warn_unused_ignores = true
 warn_no_return = true
 follow_imports = "normal"
 show_error_codes = true
+
+[[tool.mypy.overrides]]
+# Match all test modules (tests.*) AND the tests package itself.
+# The bare form `module = "tests"` only matches the package __init__,
+# not submodules like tests.integration.test_audit, so ad-hoc
+# `mypy tests/` would still hit ~1.7K untyped-def errors.
+module = ["tests", "tests.*"]
+disallow_untyped_defs = false
+disallow_untyped_decorators = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

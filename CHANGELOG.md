@@ -11,25 +11,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`make lint` / `typecheck` / `test` / `format` now use the venv
-  ruff, mypy, and pytest** via `uv run`. Previously the Makefile
-  invoked the bare binaries on `$PATH`, which on systems with an
-  older system-wide ruff (e.g. pyenv shim 0.13.x) disagreed with
-  the pre-commit hook (pinned 0.15.12) on rules like S603. Now both
-  paths use the same pinned versions, so `make lint` and the
-  pre-commit ruff hook always agree.
+- **`make lint` now agrees with the pre-commit ruff hook** by
+  invoking ruff via `uv run --extra dev` instead of the bare
+  `ruff` binary on `$PATH`. Previously, on systems with an older
+  system-wide ruff (e.g. pyenv shim 0.13.x), `make lint` and the
+  pre-commit ruff hook (pinned 0.15.12) disagreed on rules like
+  S603. The other Makefile targets (`format`, `typecheck`, `test`,
+  `test-integration`) were updated to the same `uv run --extra dev`
+  pattern for consistency, but note that the corresponding
+  pre-commit hooks for mypy and pytest still use `language: system`
+  and resolve from `$PATH` (only the ruff hook is pinned).
 - **v0.1.0 release date corrected** in CHANGELOG.md from
   `2026-04-24` (initial commit date) to `2026-04-27` (PR #1 merge
   date — the actual ship date). v0.1.0 was also retroactively
   tagged at the PR #1 merge commit (`3ba7133`); previously the
   repo's tag history started at v0.2.0, leaving v0.1.0 untagged.
-- **Removed unused `[[tool.mypy.overrides]] module = "tests"`**
-  from `pyproject.toml`. Both the Makefile (`uv run mypy src/`)
-  and the pre-commit hook (`mypy --strict src/`) only typecheck
-  `src/`, so the tests-module override never matched anything;
-  with `warn_unused_configs = true` it produced
-  `unused section(s): module = ['tests']` noise on every typecheck
-  run.
+- **`warn_unused_configs` mypy flag flipped to `false`** in
+  `pyproject.toml`. The flag previously fired on every `make
+  typecheck` run because the `[[tool.mypy.overrides]] module =
+  "tests"` block doesn't match anything when only `src/` is being
+  analyzed (the Makefile + pre-commit invocation). The override
+  module pattern was also corrected to `["tests", "tests.*"]` so
+  it actually applies to test submodules under ad-hoc
+  `mypy tests/` (the bare `module = "tests"` form only matched the
+  package `__init__`, not its submodules). With the override
+  applied, `mypy tests/` produces ~600 errors instead of ~1.7K —
+  tests are not strict-clean (and not part of the typecheck
+  contract), but the override cuts the noisiest categories.
+  Tradeoff: lose the unused-config diagnostic globally to keep the
+  override functional across both invocation paths.
+
+### Changed
+
+- **Hook reorganization** in `.pre-commit-config.yaml`:
+  - Unit tests (`pytest tests/ --ignore=tests/integration`) now
+    run on **every commit** (was: pre-push only). Adds ~10s per
+    commit but catches regressions before they reach the branch
+    tip.
+  - Integration tests (`pytest tests/integration/ -m integration`)
+    now run on **pre-push** as the closest native gate to opening
+    a PR. Tests `skipif` `localhost:11434` is unreachable, so the
+    hook degrades gracefully when Ollama is down. Known
+    cross-suite contamination flake on
+    `test_bin_packing_keeps_multiple_models_loaded` may surface
+    occasionally — re-push or run `make test-integration`
+    directly to retry. (Flake fix is deferred alongside the v0.7.0
+    onboarding work.)
+  - Both `pytest` hooks now invoke via `uv run --extra dev pytest`
+    to match the Makefile's pinned-version pattern. The `mypy`
+    pre-commit hook still uses `language: system` (out of scope
+    for v0.6.2).
+- **New `make pre-pr` target** — runs `check` (lint + typecheck +
+  unit tests) plus `test-integration`. Mirrors what the pre-push
+  hook does; use as a manual sanity check before pushing.
+
+### Documentation
+
+- `CONTRIBUTING.md`: clarified that `uv` is **required** (not
+  "recommended") for the `make` targets after the `uv run` switch.
+- `CLAUDE.md`: updated the "Development Commands" section to
+  reflect the `uv run` invocation pattern.
+- v0.6.1's `### Deferred to v0.6.2` section renamed to `### Deferred
+  to a future release` since v0.6.2 ships as a build-tooling patch
+  and does not address those items (memory_behavior tests,
+  multi_instance, sentinel test, removing `_marshal_internals`).
+- Added missing CHANGELOG link references for `[Unreleased]` and
+  every released version (`[0.4.0]` through `[0.6.2]`) so the
+  markdown anchors resolve.
 
 ## [0.6.1] - 2026-05-02
 
@@ -66,7 +114,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regression-detection power for the "request sat in queue waiting
   for non-existent model" bug class.
 
-### Deferred to v0.6.2
+### Deferred to a future release
+
+(Originally labeled "Deferred to v0.6.2" — v0.6.2 shipped as a
+build-tooling patch and did not address these items. They remain
+deferred and will likely land alongside the v0.7.0 onboarding
+work.)
 
 The remaining 15 tests still use the in-process ASGI pattern. Each
 needs additional infrastructure that would have ballooned v0.6.1's
@@ -739,7 +792,13 @@ otherwise.
 - Structured logging via structlog (console + JSON modes)
 - 95%+ unit test coverage
 
-[Unreleased]: https://github.com/robertvitali/ollama-marshal/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/robertvitali/ollama-marshal/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/robertvitali/ollama-marshal/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/robertvitali/ollama-marshal/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/robertvitali/ollama-marshal/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/robertvitali/ollama-marshal/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/robertvitali/ollama-marshal/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/robertvitali/ollama-marshal/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/robertvitali/ollama-marshal/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/robertvitali/ollama-marshal/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/robertvitali/ollama-marshal/releases/tag/v0.1.0
