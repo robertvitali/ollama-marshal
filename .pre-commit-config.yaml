@@ -35,16 +35,23 @@ repos:
         args: [--strict, src/]
         pass_filenames: false
 
-      # Run the unit test suite on push (NOT every commit — keeps
-      # commits fast). The integration test suite is excluded since
-      # it requires a running Ollama; run `make test-integration`
-      # locally before opening a PR.
-      #
-      # Install push hooks via: `pre-commit install --hook-type pre-push`
+      # Run the unit test suite on EVERY commit (~10s). Catches
+      # regressions before they reach the branch tip. Uses
+      # `uv run --extra dev` to match the Makefile's pinned-version
+      # invocation pattern.
       - id: pytest-unit
-        name: pytest (unit tests, on push)
-        entry: pytest tests/ --ignore=tests/integration -q --no-cov
+        name: pytest (unit tests, every commit)
+        entry: uv run --extra dev pytest tests/ --ignore=tests/integration -q --no-cov
         language: system
         types: [python]
         pass_filenames: false
-        stages: [pre-push]
+
+      # NOTE: A pre-push integration test hook is INTENTIONALLY NOT
+      # configured. Integration tests share Ollama at :11434 with any
+      # local prod marshal at :11435, and the cross-suite contamination
+      # causes false-failures (and sometimes prod errors) on every push.
+      # The fix lives in v0.6.3: a pytest session-scoped fixture that
+      # pauses prod marshal via the v0.6.0 admin/pause endpoint, runs
+      # the suite, then resumes. Once that lands, the pre-push hook
+      # comes back. Until then, run `make pre-pr` manually before
+      # opening a PR.

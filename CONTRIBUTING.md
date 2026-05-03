@@ -8,7 +8,10 @@ started.
 ### Prerequisites
 
 - Python 3.11+
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- [uv](https://docs.astral.sh/uv/) — required for the `make` targets
+  (`install-dev`, `lint`, `format`, `typecheck`, `test`,
+  `test-integration`), which all invoke `uv run --extra dev <tool>`
+  to ensure pinned versions
 - [Ollama](https://ollama.com/) (for integration tests)
 
 ### Getting Started
@@ -40,6 +43,7 @@ sets up pre-commit hooks.
 | `make format`          | Auto-format code with ruff                      |
 | `make typecheck`       | Run mypy strict type checking                   |
 | `make check`           | Run lint + typecheck + test (full CI locally)    |
+| `make pre-pr`          | Run `check` + integration tests (run before pushing) |
 | `make clean`           | Remove build artifacts and caches               |
 
 ### Code Style
@@ -56,9 +60,14 @@ and re-commit.
 
 ### Testing
 
-- **Unit tests**: 95% coverage minimum. Use mocked Ollama responses.
+- **Unit tests**: 95% coverage minimum. Use mocked Ollama responses. Run on
+  every commit via the pre-commit hook.
 - **Integration tests**: Marked with `@pytest.mark.integration`. Require a
-  running Ollama instance. Not required for PRs but encouraged locally.
+  running Ollama instance on `localhost:11434`. Run them manually before
+  pushing with `make pre-pr` or `make test-integration`. (A pre-push hook
+  for these is planned for v0.6.3 once the prod-pause fixture lands —
+  until then, sharing Ollama with a local prod marshal causes false
+  failures.)
 - **Test naming**: `test_<feature>_<condition>_<expected_result>`
 
 ```bash

@@ -1,4 +1,4 @@
-.PHONY: install-dev test test-integration lint format typecheck check clean all dryrun-dashboard
+.PHONY: install-dev test test-integration lint format typecheck check pre-pr clean all dryrun-dashboard
 
 install-dev:
 	uv pip install -e ".[dev]"
@@ -6,21 +6,26 @@ install-dev:
 	pre-commit install --hook-type pre-push
 
 test:
-	pytest tests/ --ignore=tests/integration
+	uv run --extra dev pytest tests/ --ignore=tests/integration
 
 test-integration:
-	pytest tests/integration/ -m integration -v
+	uv run --extra dev pytest tests/integration/ -m integration -v
 
 lint:
-	ruff check src/ tests/
+	uv run --extra dev ruff check src/ tests/
 
 format:
-	ruff format src/ tests/
+	uv run --extra dev ruff format src/ tests/
 
 typecheck:
-	mypy src/
+	uv run --extra dev mypy src/
 
 check: lint typecheck test
+
+# Run before opening a PR. Mirrors the pre-push hook (which runs the
+# integration suite); use this target to verify locally before push so
+# the hook doesn't surprise you. Requires Ollama on localhost:11434.
+pre-pr: check test-integration
 
 clean:
 	rm -rf build/ dist/ *.egg-info .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage
