@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-05-03
+
+### Fixed
+
+- **`make lint` / `typecheck` / `test` / `format` now use the venv
+  ruff, mypy, and pytest** via `uv run`. Previously the Makefile
+  invoked the bare binaries on `$PATH`, which on systems with an
+  older system-wide ruff (e.g. pyenv shim 0.13.x) disagreed with
+  the pre-commit hook (pinned 0.15.12) on rules like S603. Now both
+  paths use the same pinned versions, so `make lint` and the
+  pre-commit ruff hook always agree.
+
 ## [0.6.1] - 2026-05-02
 
 ### Added

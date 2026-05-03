@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ollama-marshal"
-version = "0.6.1"
+version = "0.6.2"
 description = "Model-aware scheduling proxy for Ollama — eliminates model thrashing with intelligent FIFO + bin-packing scheduling"
 readme = "README.md"
 license = "Apache-2.0"

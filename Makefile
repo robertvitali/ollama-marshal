@@ -6,19 +6,19 @@ install-dev:
 	pre-commit install --hook-type pre-push
 
 test:
-	pytest tests/ --ignore=tests/integration
+	uv run pytest tests/ --ignore=tests/integration
 
 test-integration:
-	pytest tests/integration/ -m integration -v
+	uv run pytest tests/integration/ -m integration -v
 
 lint:
-	ruff check src/ tests/
+	uv run ruff check src/ tests/
 
 format:
-	ruff format src/ tests/
+	uv run ruff format src/ tests/
 
 typecheck:
-	mypy src/
+	uv run mypy src/
 
 check: lint typecheck test
 
