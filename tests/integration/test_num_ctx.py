@@ -1,11 +1,13 @@
 """Surface C1 Dim 1 integration tests — prompt-driven num_ctx sizing.
 
 Validates that marshal's num_ctx injection actually flows through to
-Ollama's slot allocation. We can't easily peek at what marshal sent
-on the wire, but we can read the resulting allocated slot via
-``app.state._marshal_internals.memory.get_allocated_num_ctx(model)`` — that's the value
-marshal told ``lifecycle.preload`` to use, which is the value Ollama
+Ollama's slot allocation. Reads marshal's allocated num_ctx via the
+v0.6.0 ``/api/marshal/debug`` endpoint
+(``memory.allocated_num_ctx_per_model``) — that's the value marshal
+told ``lifecycle.preload`` to use, which is the value Ollama
 allocated.
+
+Migrated to subprocess pattern (v0.6.1+).
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from tests.integration.conftest import (
 
 pytestmark = [
     pytest.mark.integration,
+    pytest.mark.marshal_subprocess,
     pytest.mark.skipif(
         not _ollama_reachable(),
         reason="Ollama not running on :11434",
@@ -70,26 +73,44 @@ async def _fire_chat(
     assert resp.status_code == 200, resp.text
 
 
+async def _allocated_num_ctx(client: httpx.AsyncClient, model: str) -> int | None:
+    """Fetch marshal's allocated num_ctx for ``model`` via /api/marshal/debug."""
+    resp = await client.get("/api/marshal/debug")
+    resp.raise_for_status()
+    body = resp.json()
+    return body["memory"]["allocated_num_ctx_per_model"].get(model)
+
+
+async def _model_max_ctx(client: httpx.AsyncClient, model: str) -> int | None:
+    """Fetch model's max_context_length from registry metadata via debug."""
+    resp = await client.get("/api/marshal/debug")
+    resp.raise_for_status()
+    body = resp.json()
+    meta = body["registry"]["metadata_per_model"].get(model)
+    return meta["max_context_length"] if meta else None
+
+
+async def _reload_count(client: httpx.AsyncClient) -> int:
+    resp = await client.get("/api/marshal/debug")
+    resp.raise_for_status()
+    return int(resp.json()["metrics"]["reload_count"])
+
+
 @_REQUIRES_MODEL
-async def test_short_prompt_gets_smallest_boundary(marshal_app):
+async def test_short_prompt_gets_smallest_boundary(marshal_subprocess_client):
     """A trivial prompt rounds up to the smallest power-of-2 (8192).
 
     Token math: prompt "hi" ≈ 0 tokens, + default completion budget
     4096, + safety 256 = 4352. Rounds up to 8192.
     """
-    client, app = marshal_app
+    client, _audit_path = marshal_subprocess_client
     await _fire_chat(client, prompt="hi")
     await wait_for(
-        lambda: (
-            app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL)
-            is not None
-        ),
+        lambda: _has_allocation(client, REQUIRED_MODEL),
         timeout=15,
         description="allocation recorded",
     )
-    allocated = app.state._marshal_internals.memory.get_allocated_num_ctx(
-        REQUIRED_MODEL
-    )
+    allocated = await _allocated_num_ctx(client, REQUIRED_MODEL)
     assert allocated == 8192, (
         f"expected 8192 for short prompt, got {allocated}. "
         f"Verify _resolve_num_ctx_decision rounds prompt+budget+safety "
@@ -97,62 +118,69 @@ async def test_short_prompt_gets_smallest_boundary(marshal_app):
     )
 
 
+async def _has_allocation(client: httpx.AsyncClient, model: str) -> bool:
+    """wait_for-friendly predicate: True once allocation is recorded."""
+    return (await _allocated_num_ctx(client, model)) is not None
+
+
 @_REQUIRES_MODEL
-async def test_long_prompt_gets_larger_boundary(marshal_app):
+async def test_long_prompt_gets_larger_boundary(marshal_subprocess_client):
     """A 50K-char prompt (~15K tokens) lands at a larger boundary.
 
     50_000 chars * 0.3 tokens/char = 15_000 + 4096 + 256 = 19_352.
     Next power-of-2 is 32768.
     """
-    client, app = marshal_app
+    client, _audit_path = marshal_subprocess_client
     await _fire_chat(client, prompt="x" * 50_000)
     await wait_for(
-        lambda: (
-            app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL)
-            is not None
-        ),
+        lambda: _has_allocation(client, REQUIRED_MODEL),
         timeout=15,
         description="allocation recorded",
     )
-    allocated = app.state._marshal_internals.memory.get_allocated_num_ctx(
-        REQUIRED_MODEL
-    )
+    allocated = await _allocated_num_ctx(client, REQUIRED_MODEL)
     assert allocated == 32768, f"expected 32768 for 50K-char prompt, got {allocated}"
 
 
 @_REQUIRES_MODEL
-async def test_client_num_ctx_clamped_to_model_max(marshal_app):
+async def test_client_num_ctx_clamped_to_model_max(marshal_subprocess_client):
     """Adversarial client num_ctx is clamped to model.max_context_length.
 
     Without this clamp, num_ctx=999_999_999 would trigger reload-on-need,
     fail preload, infinite-loop the scheduler, and grow reload_count
     unboundedly. One bad request would brick the proxy.
     """
-    client, app = marshal_app
+    client, _audit_path = marshal_subprocess_client
+    # Warm the registry first: a benign request loads the model at the
+    # default num_ctx and probes /api/show into registry metadata. Then
+    # snapshot reload_count so the assertion below measures only the
+    # reloads caused by the adversarial request, not the cold-start
+    # ones the subprocess pattern produces unavoidably.
+    await _fire_chat(client, prompt="hi")
+    await wait_for(
+        lambda: _has_allocation(client, REQUIRED_MODEL),
+        timeout=15,
+        description="allocation recorded after warm-up",
+    )
+    baseline_reloads = await _reload_count(client)
+
     # qwen3.5:0.8b-bf16's max_context_length is 262144. The clamp
     # should bring 999_999_999 down to 262144.
     await _fire_chat(client, prompt="hi", num_ctx=999_999_999)
-    await wait_for(
-        lambda: (
-            app.state._marshal_internals.memory.get_allocated_num_ctx(REQUIRED_MODEL)
-            is not None
-        ),
-        timeout=30,
-        description="allocation recorded after clamp",
-    )
-    allocated = app.state._marshal_internals.memory.get_allocated_num_ctx(
-        REQUIRED_MODEL
-    )
+    allocated = await _allocated_num_ctx(client, REQUIRED_MODEL)
     # Must be <= model max, NOT the absurd input value.
-    meta = app.state._marshal_internals.registry.get_metadata(REQUIRED_MODEL)
-    assert meta is not None, "registry never probed model metadata"
-    assert allocated == meta.max_context_length, (
-        f"expected clamp to model max ({meta.max_context_length}), "
-        f"got {allocated}. The trust-boundary clamp didn't fire."
+    max_ctx = await _model_max_ctx(client, REQUIRED_MODEL)
+    assert max_ctx is not None, "registry never probed model metadata"
+    assert allocated == max_ctx, (
+        f"expected clamp to model max ({max_ctx}), got {allocated}. "
+        f"The trust-boundary clamp didn't fire."
     )
-    # And no reload loop — reload_count should be 0 or 1, NOT growing.
-    reload_count = app.state._marshal_internals.scheduler.metrics.reload_count
-    assert reload_count <= 1, (
-        f"reload_count grew to {reload_count} "
+    # The clamped request must trigger at most one reload-on-need
+    # (warmed-up num_ctx → max_ctx). Anything more means the clamp
+    # failed and we entered a reload loop.
+    final_reloads = await _reload_count(client)
+    delta = final_reloads - baseline_reloads
+    assert delta <= 1, (
+        f"clamped request caused {delta} reloads "
+        f"(baseline={baseline_reloads}, final={final_reloads}) "
         f"— suggests the clamp failed and we entered a reload loop."
     )

@@ -98,28 +98,30 @@ def _read_jsonl(path) -> list[dict]:
 
 
 @_REQUIRES_MODEL
-async def test_request_served_events_recorded(tmp_marshal_paths):
-    """5 successful requests → 5 ``request.served`` records with correct fields."""
-    cfg = _build_config(tmp_paths=tmp_marshal_paths, ollama_host=DEFAULT_OLLAMA_HOST)
-    app = make_test_app(cfg, tmp_marshal_paths)
-    transport = httpx.ASGITransport(app=app)
-    async with (
-        LifespanManager(app),
-        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
-    ):
-        body = {
-            "model": REQUIRED_MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": False,
-            "options": {"num_predict": 4},
-        }
-        for _ in range(5):
-            resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=60)
-            assert resp.status_code == 200
-        # AuditLogger flushes on a 100ms timer; give it time.
-        await asyncio.sleep(0.5)
+@pytest.mark.marshal_subprocess
+async def test_request_served_events_recorded(marshal_subprocess_client):
+    """5 successful requests → 5 ``request.served`` records with correct fields.
 
-    records = _read_jsonl(tmp_marshal_paths["audit_path"])
+    Migrated to subprocess pattern (v0.6.1+). Audit file is the
+    per-test temp path the fixture wires into the subprocess config.
+    """
+    client, audit_path = marshal_subprocess_client
+    body = {
+        "model": REQUIRED_MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": False,
+        "options": {"num_predict": 4},
+    }
+    for _ in range(5):
+        resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=60)
+        assert resp.status_code == 200
+    # AuditLogger flushes on a 100ms timer + final flush on shutdown.
+    # Give it a beat AND let subprocess finalize before reading the
+    # file. The marshal_subprocess fixture's teardown handles the
+    # shutdown flush; here we just need the periodic flush to run.
+    await asyncio.sleep(0.5)
+
+    records = _read_jsonl(audit_path)
     served = [r for r in records if r.get("event") == "request.served"]
     assert len(served) == 5, f"expected 5 served records, got {len(served)}: {records}"
     for r in served:
@@ -132,7 +134,8 @@ async def test_request_served_events_recorded(tmp_marshal_paths):
 
 
 @_REQUIRES_MODEL
-async def test_no_prompt_content_in_audit_records(tmp_marshal_paths):
+@pytest.mark.marshal_subprocess
+async def test_no_prompt_content_in_audit_records(marshal_subprocess_client):
     """Privacy invariant: prompt text NEVER appears in JSONL records.
 
     The audit module's ``record()`` signature already forbids a
@@ -140,24 +143,18 @@ async def test_no_prompt_content_in_audit_records(tmp_marshal_paths):
     catches any accidental include via kwargs leak or future
     refactor.
     """
-    cfg = _build_config(tmp_paths=tmp_marshal_paths, ollama_host=DEFAULT_OLLAMA_HOST)
-    app = make_test_app(cfg, tmp_marshal_paths)
-    transport = httpx.ASGITransport(app=app)
-    async with (
-        LifespanManager(app),
-        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
-    ):
-        body = {
-            "model": REQUIRED_MODEL,
-            "messages": [{"role": "user", "content": "supersecretpassword12345"}],
-            "stream": False,
-            "options": {"num_predict": 4},
-        }
-        resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=60)
-        assert resp.status_code == 200
-        await asyncio.sleep(0.5)
+    client, audit_path = marshal_subprocess_client
+    body = {
+        "model": REQUIRED_MODEL,
+        "messages": [{"role": "user", "content": "supersecretpassword12345"}],
+        "stream": False,
+        "options": {"num_predict": 4},
+    }
+    resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=60)
+    assert resp.status_code == 200
+    await asyncio.sleep(0.5)
 
-    raw = tmp_marshal_paths["audit_path"].read_text()
+    raw = audit_path.read_text()
     assert "supersecretpassword12345" not in raw, (
         f"prompt content leaked into audit log:\n{raw}"
     )

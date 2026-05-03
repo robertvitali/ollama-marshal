@@ -3,7 +3,13 @@
 If any of these fail, every other integration test will fail. They're
 the canary: do we boot, do we round-trip, does streaming work?
 
-Each test takes ~3-5 seconds against the user's real Ollama.
+Migrated to the subprocess pattern (v0.6.1+) — each test spawns a
+real ``ollama-marshal start`` subprocess on an ephemeral port. Tests
+exercise the full wire format (sockets, headers, HTTP parsing) that
+prod operators see, not the in-process ASGI shortcut.
+
+Each test takes ~5-8 seconds against the user's real Ollama (3s
+subprocess startup + actual round-trip).
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ from tests.integration.conftest import (
 
 pytestmark = [
     pytest.mark.integration,
+    pytest.mark.marshal_subprocess,
     pytest.mark.skipif(
         not _ollama_reachable(),
         reason="Ollama not running on :11434",
@@ -51,14 +58,14 @@ _REQUIRES_MODEL = pytest.mark.skipif(
 )
 
 
-async def test_app_starts_and_status_endpoint_works(marshal_app):
-    """Marshal lifespan boots cleanly and /api/marshal/status returns valid JSON.
+async def test_app_starts_and_status_endpoint_works(marshal_subprocess_client):
+    """Marshal subprocess boots cleanly and /api/marshal/status returns valid JSON.
 
-    Uses no real Ollama traffic — just verifies the app comes up and
-    responds. If THIS fails, every subsequent test will also fail and
-    the whole suite is invalid.
+    Uses no real Ollama traffic — just verifies the subprocess comes
+    up and responds. If THIS fails, every subsequent test will also
+    fail and the whole suite is invalid.
     """
-    client, _app = marshal_app
+    client, _audit_path = marshal_subprocess_client
     resp = await client.get("/api/marshal/status")
     assert resp.status_code == 200
     body = resp.json()
@@ -107,15 +114,15 @@ async def test_app_starts_and_status_endpoint_works(marshal_app):
 
 
 @_REQUIRES_MODEL
-async def test_real_chat_round_trip(marshal_app):
+async def test_real_chat_round_trip(marshal_subprocess_client):
     """Real /api/chat with a tiny prompt completes and loads the model.
 
-    Verifies the full path: marshal accepts the request, scheduler
-    dispatches it, lifecycle preloads the model, stream module forwards
-    to Ollama, response comes back. Uses CRITICAL priority program ID
-    (the default for tests).
+    Verifies the full path: subprocess marshal accepts the request,
+    scheduler dispatches it, lifecycle preloads the model, stream
+    module forwards to Ollama, response comes back. Uses CRITICAL
+    priority program ID (the default for tests).
     """
-    client, _app = marshal_app
+    client, _audit_path = marshal_subprocess_client
     body = {
         "model": REQUIRED_MODEL,
         "messages": [{"role": "user", "content": "hi"}],
@@ -150,17 +157,17 @@ async def test_real_chat_round_trip(marshal_app):
 
 
 @_REQUIRES_MODEL
-async def test_real_generate_streaming_round_trip(marshal_app):
+async def test_real_generate_streaming_round_trip(marshal_subprocess_client):
     """Real /api/generate with stream=true yields ordered NDJSON chunks.
 
-    Verifies the streaming path through the proxy: marshal forwards
+    Verifies the streaming path through the subprocess: marshal forwards
     Ollama's chunked NDJSON without buffering, chunks arrive in order,
     final chunk has done=true. The smallest qwen3.5 model is a
     reasoning model — its tokens may land in the ``thinking`` field
     rather than ``response``. Either is fine for verifying the
     streaming pipe; this test is about the transport, not the content.
     """
-    client, _app = marshal_app
+    client, _audit_path = marshal_subprocess_client
     body = {
         "model": REQUIRED_MODEL,
         "prompt": "Write the word hello.",

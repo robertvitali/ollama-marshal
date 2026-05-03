@@ -447,7 +447,7 @@ async def marshal_subprocess(
             "127.0.0.1",
         ],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,  # avoid PIPE deadlock if marshal logs >64KB
     )
 
     try:
@@ -455,11 +455,15 @@ async def marshal_subprocess(
         yield base_url, audit_path
     finally:
         proc.terminate()
+        # Hoist the blocking proc.wait off the event loop per CLAUDE.md
+        # async correctness rules — without this the fixture's finally
+        # block stalls the loop for up to 5s while the subprocess shuts
+        # down (blocks any concurrent fixture cleanup).
         try:
-            proc.wait(timeout=5)
+            await asyncio.to_thread(proc.wait, 5)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait()
+            await asyncio.to_thread(proc.wait)
 
 
 @pytest.fixture
