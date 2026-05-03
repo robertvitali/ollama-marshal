@@ -48,22 +48,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     run on **every commit** (was: pre-push only). Adds ~10s per
     commit but catches regressions before they reach the branch
     tip.
-  - Integration tests (`pytest tests/integration/ -m integration`)
-    now run on **pre-push** as the closest native gate to opening
-    a PR. Tests `skipif` `localhost:11434` is unreachable, so the
-    hook degrades gracefully when Ollama is down. Known
-    cross-suite contamination flake on
-    `test_bin_packing_keeps_multiple_models_loaded` may surface
-    occasionally — re-push or run `make test-integration`
-    directly to retry. (Flake fix is deferred alongside the v0.7.0
-    onboarding work.)
-  - Both `pytest` hooks now invoke via `uv run --extra dev pytest`
-    to match the Makefile's pinned-version pattern. The `mypy`
-    pre-commit hook still uses `language: system` (out of scope
-    for v0.6.2).
+  - Hook invokes via `uv run --extra dev pytest` to match the
+    Makefile's pinned-version pattern. The `mypy` pre-commit hook
+    still uses `language: system` (out of scope for v0.6.2).
+  - A pre-push **integration** test hook is intentionally NOT
+    added in this release. The cross-suite contamination caused
+    by sharing Ollama with a local prod marshal at `:11435` makes
+    every push hit false-failures (and can spike real prod
+    errors). The fix lands in v0.6.3 as a pytest session-scoped
+    fixture that pauses prod marshal via the v0.6.0
+    `admin/pause` endpoint during the suite. Once that lands, the
+    pre-push hook returns. Until then, use `make pre-pr` as the
+    manual gate.
 - **New `make pre-pr` target** — runs `check` (lint + typecheck +
-  unit tests) plus `test-integration`. Mirrors what the pre-push
-  hook does; use as a manual sanity check before pushing.
+  unit tests) plus `test-integration`. The interim manual gate for
+  pre-PR integration test enforcement until v0.6.3's prod-pause
+  fixture lands.
 
 ### Documentation
 

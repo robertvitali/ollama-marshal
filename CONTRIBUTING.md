@@ -63,9 +63,11 @@ and re-commit.
 - **Unit tests**: 95% coverage minimum. Use mocked Ollama responses. Run on
   every commit via the pre-commit hook.
 - **Integration tests**: Marked with `@pytest.mark.integration`. Require a
-  running Ollama instance on `localhost:11434`. Run on every push via the
-  pre-push hook (skipped cleanly if Ollama is unreachable). Run them
-  manually before pushing with `make pre-pr` or `make test-integration`.
+  running Ollama instance on `localhost:11434`. Run them manually before
+  pushing with `make pre-pr` or `make test-integration`. (A pre-push hook
+  for these is planned for v0.6.3 once the prod-pause fixture lands —
+  until then, sharing Ollama with a local prod marshal causes false
+  failures.)
 - **Test naming**: `test_<feature>_<condition>_<expected_result>`
 
 ```bash
