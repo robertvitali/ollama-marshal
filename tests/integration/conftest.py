@@ -61,6 +61,13 @@ REQUIRED_MODEL = "qwen3.5:0.8b-bf16"
 # Default Ollama host the suite expects to be reachable.
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 
+# Forward-timeout used by every integration test config. v0.6.6 bumped from
+# 90s to absorb cross-suite contention (autouse pause stops new dispatches but
+# in-flight Ollama work — large model loads, multi-second inferences — can
+# still queue test requests behind it on a contended box). Single source of
+# truth so future tuning lands in one place.
+INTEGRATION_FORWARD_TIMEOUT_S = 120
+
 # Program ID conventions — tests use these via the X-Program-ID header.
 # integration-test (critical) is the default; integration-test-normal
 # is for tests of normal-priority paths (drain-before-evict, etc.).
@@ -104,12 +111,9 @@ def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
 
     Test defaults that differ from production:
 
-    - ``scheduler.ollama_forward_timeout_s = 90`` — generous enough
-      that cold first-loads on a busy machine (Ollama under memory
-      pressure while another marshal is also using it) don't surface
-      as timeouts. Bounded so stuck Ollama forwards still fail. v0.6.4
-      replaced ``proxy.request_timeout_s`` (Hop 1 cap, removed) with
-      this Hop 2 budget.
+    - ``scheduler.ollama_forward_timeout_s = INTEGRATION_FORWARD_TIMEOUT_S``
+      (currently 120s) — see the constant's docstring at module top
+      for the rationale and tuning history.
     - ``memory.poll_interval = 1`` — speed up unexpected-unload tests.
       Real production uses 5s.
     - ``shutdown.mode = IMMEDIATE``, ``unload_models = True`` — when
@@ -134,7 +138,7 @@ def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,  # don't write during tests
             benchmark_on_startup=False,
-            ollama_forward_timeout_s=90,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
         ),
         programs={
             "default": ProgramConfig(),
@@ -386,7 +390,7 @@ def build_test_config_yaml(
         "scheduler:",
         "  benchmark_on_startup: false",
         "  metrics_persist_interval_s: 3600",
-        "  ollama_forward_timeout_s: 90",
+        f"  ollama_forward_timeout_s: {INTEGRATION_FORWARD_TIMEOUT_S}",
         f"  idle_eviction_minutes: {idle_eviction_minutes}",
         "shutdown:",
         '  mode: "immediate"',
@@ -656,24 +660,35 @@ async def pause_local_prod_marshal() -> AsyncIterator[bool]:
     ``discover_admin_token`` reads it directly when env is unset.
     """
     if os.environ.get(SKIP_PAUSE_ENV) == "1":
+        _log.info("prod_pause.skipped_via_env", env_var=SKIP_PAUSE_ENV)
         yield False
         return
     if not _prod_marshal_reachable():
+        _log.info("prod_pause.not_reachable", url=PROD_MARSHAL_URL)
         yield False
         return
     token = discover_admin_token()
     if not token:
+        _log.info("prod_pause.no_admin_token")
         yield False
         return
 
     if not await _prod_pause(token):
+        _log.info("prod_pause.pause_call_failed")
         yield False
         return
 
+    _log.info(
+        "prod_pause.engaged",
+        url=PROD_MARSHAL_URL,
+        drain_timeout_s=PAUSE_DRAIN_TIMEOUT_S,
+        auto_resume_after_seconds=PAUSE_AUTO_RESUME_S,
+    )
     try:
         yield True
     finally:
         await _prod_resume(token)
+        _log.info("prod_pause.released", url=PROD_MARSHAL_URL)
 
 
 @pytest_asyncio.fixture(loop_scope="session", scope="session")

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Multi-instance integration test contamination.** Tests in
+  `tests/integration/test_multi_instance.py` exercise routing that
+  observes `/api/ps` state on real Ollama daemons (the fault-proxy
+  tests pass `/api/ps` through to the upstream when no
+  `fake_response` is queued, and the legacy single-instance test
+  fires real inference at `:11434`). A leaked load from an earlier
+  test in the same suite produced cross-test failures —
+  `test_fault_proxy_per_instance_polling_independent` and
+  `test_legacy_single_instance_config_still_works` both passed in
+  isolation but failed under full-suite ordering. Added an autouse
+  function-scoped pytest fixture that unloads the integration
+  suite's required model from every reachable Ollama instance
+  before each test in this module. Unreachable instances are
+  silently skipped. Affects integration test infrastructure only —
+  no production code change.
+
 ### Documentation
 
 - `CLAUDE.md`: added "Per-Issue Dev Workflow" section documenting

@@ -46,6 +46,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import pytest_asyncio
 
 from ollama_marshal.config import (
     TIER_FALLBACK,
@@ -65,6 +66,7 @@ from ollama_marshal.config import (
 )
 from tests.integration.conftest import (
     DEFAULT_OLLAMA_HOST,
+    INTEGRATION_FORWARD_TIMEOUT_S,
     PROGRAM_CRITICAL,
     REQUIRED_MODEL,
     _ollama_reachable,
@@ -168,7 +170,7 @@ def _multi_instance_config(tmp_paths: dict[str, Path], audit_enabled: bool = Fal
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
-            ollama_forward_timeout_s=90,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
         ),
         programs={
             "default": ProgramConfig(),
@@ -187,14 +189,23 @@ def _multi_instance_config(tmp_paths: dict[str, Path], audit_enabled: bool = Fal
 
 
 async def _unload_on_instance(host: str, model: str) -> None:
-    """Force-unload ``model`` from a specific instance via keep_alive=0."""
+    """Force-unload ``model`` from a specific instance via keep_alive=0.
+
+    Catches both ``httpx.HTTPError`` AND ``OSError`` to match
+    ``_ollama_reachable``/``_q8_has_model`` patterns elsewhere in
+    this suite — connection-reset / EPIPE on a daemon shutting down
+    can surface as a bare ``OSError`` outside httpx wrapping. With
+    the autouse fixture below using ``asyncio.gather`` to run three
+    of these concurrently, an unwrapped error here would propagate
+    and abort fixture setup for every test in the module.
+    """
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
                 f"{host}/api/generate",
                 json={"model": model, "prompt": "", "keep_alive": "0"},
             )
-    except httpx.HTTPError:
+    except (httpx.HTTPError, OSError):
         pass  # best-effort cleanup
 
 
@@ -217,6 +228,68 @@ async def _is_loaded_on(host: str, model: str) -> bool:
             return any(m.get("name") == model for m in data.get("models", []))
     except httpx.HTTPError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Cold-start invariant — autouse per-test fixture
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _cold_start_required_model(
+    pause_local_prod_marshal: bool,
+) -> None:
+    """Unload ``REQUIRED_MODEL`` from every Ollama instance before each test.
+
+    The fault-proxy tests in this module pass ``/api/ps`` through to
+    the upstream when no ``fake_response`` is queued (the proxy is
+    transparent by default). When the user's prod marshal at :11435
+    has ``REQUIRED_MODEL`` loaded — common after any recent use of
+    that model on the workstation — the autouse session pause stops
+    prod from dispatching new requests, but the model is still
+    physically loaded on real Ollama at :11434. The fault proxy
+    forwards ``/api/ps`` and surfaces it as "loaded on f16", which
+    breaks tests that assert the model is NOT loaded on f16. The
+    legacy single-instance test similarly inherits a stale /api/ps
+    from prod's loaded models.
+
+    The ``pause_local_prod_marshal`` parameter is unused in the body
+    — it exists to declare an explicit dependency on the
+    session-scoped pause fixture so pytest resolves them in the
+    right order. Without prod paused, prod's lifecycle loop can
+    re-issue a load between this fixture's unload and the test's
+    first /api/ps poll, silently violating the cold-start invariant.
+
+    Setup-only — no post-test teardown. The lifespan
+    ``shutdown.unload_models=True`` already unloads everything the
+    test marshal owns when the lifespan exits. Models loaded by
+    prior tests in this module are cleaned by the next test's run
+    of THIS fixture; the module ends with prod's pre-suite state
+    restored by ``pause_local_prod_marshal``'s session-scope
+    teardown.
+
+    Best-effort and concurrent — unreachable instances (q4 not
+    running on this machine) are silently skipped via the
+    ``(httpx.HTTPError, OSError)`` swallow inside
+    ``_unload_on_instance``. The decorator is
+    ``@pytest_asyncio.fixture`` (not bare ``@pytest.fixture``) to
+    match conftest.py's pattern and to remain robust to a future
+    pytest-asyncio mode flip — under strict mode, a bare
+    ``@pytest.fixture`` on an async-def fixture body would never
+    execute, silently regressing Bug 7 the moment somebody changes
+    the asyncio_mode setting.
+
+    Scope note: only ``test_multi_instance.py`` is affected by this
+    contamination class. Other integration test files using
+    ``_fault_proxy`` set ``fake_response("/api/ps", ...)`` instead
+    of relying on transparent passthrough, so they never observe
+    real Ollama's loaded-models state through the proxy.
+    """
+    await asyncio.gather(
+        _unload_on_instance(DEFAULT_OLLAMA_HOST, REQUIRED_MODEL),
+        _unload_on_instance(Q8_OLLAMA_HOST, REQUIRED_MODEL),
+        _unload_on_instance(Q4_OLLAMA_HOST, REQUIRED_MODEL),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +557,7 @@ def _proxy_instances_config(
             metrics_path=str(tmp_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
             benchmark_on_startup=False,
-            ollama_forward_timeout_s=90,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
         ),
         programs={
             "default": ProgramConfig(),
@@ -761,7 +834,7 @@ async def test_fault_proxy_routing_decision_observes_q4_load(tmp_marshal_paths):
             scheduler=SchedulerConfig(
                 metrics_path=str(tmp_marshal_paths["metrics_path"]),
                 metrics_persist_interval_s=3600,
-                ollama_forward_timeout_s=90,
+                ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
             ),
             programs={
                 "default": ProgramConfig(),
@@ -893,7 +966,7 @@ async def test_legacy_single_instance_config_still_works(tmp_marshal_paths):
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
-            ollama_forward_timeout_s=90,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
         ),
         programs={
             "default": ProgramConfig(),
@@ -1140,7 +1213,7 @@ async def test_a_rule_strict_q8_to_q4_fallback(tmp_marshal_paths):
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
-            ollama_forward_timeout_s=120,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
         ),
         programs={
             "default": ProgramConfig(),
@@ -1279,7 +1352,7 @@ async def test_q4_only_promotes_to_higher_tier_when_room(tmp_marshal_paths):
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
-            ollama_forward_timeout_s=120,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
         ),
         programs={
             "default": ProgramConfig(),
