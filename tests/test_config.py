@@ -277,15 +277,34 @@ class TestApplyEnvOverrides:
         assert result["scheduler"]["max_skips"] == 10
         assert isinstance(result["scheduler"]["max_skips"], int)
 
-    def test_request_timeout_s_is_int_typed(self, monkeypatch):
-        # Added to the int-coercion list in v0.2.0 alongside the field's
-        # introduction. Pydantic would coerce anyway, but this keeps the
-        # dict consistent with port/poll_interval/etc.
-        monkeypatch.setenv("MARSHAL_PROXY_REQUEST_TIMEOUT_S", "1800")
+    def test_ollama_forward_timeout_s_is_int_typed(self, monkeypatch):
+        # v0.6.4: replaces the v0.2.0-era ``proxy.request_timeout_s``
+        # int-coercion test. The field moved to ``scheduler`` and was
+        # repurposed from "Hop 1 wait cap" to "Hop 2 forward budget".
+        monkeypatch.setenv("MARSHAL_SCHEDULER_OLLAMA_FORWARD_TIMEOUT_S", "1800")
         data: dict[str, Any] = {}
         result = _apply_env_overrides(data)
-        assert result["proxy"]["request_timeout_s"] == 1800
-        assert isinstance(result["proxy"]["request_timeout_s"], int)
+        assert result["scheduler"]["ollama_forward_timeout_s"] == 1800
+        assert isinstance(result["scheduler"]["ollama_forward_timeout_s"], int)
+
+    def test_preload_backoff_floats_are_typed(self, monkeypatch):
+        # v0.6.4 preload-backoff floats coerce to float in env-var
+        # parsing so a string "2.5" doesn't propagate as a string.
+        monkeypatch.setenv("MARSHAL_SCHEDULER_PRELOAD_BACKOFF_BASE_S", "2.5")
+        monkeypatch.setenv("MARSHAL_SCHEDULER_PRELOAD_BACKOFF_MAX_S", "60.0")
+        data: dict[str, Any] = {}
+        result = _apply_env_overrides(data)
+        assert result["scheduler"]["preload_backoff_base_s"] == 2.5
+        assert isinstance(result["scheduler"]["preload_backoff_base_s"], float)
+        assert result["scheduler"]["preload_backoff_max_s"] == 60.0
+        assert isinstance(result["scheduler"]["preload_backoff_max_s"], float)
+
+    def test_preload_max_consecutive_failures_is_int_typed(self, monkeypatch):
+        monkeypatch.setenv("MARSHAL_SCHEDULER_PRELOAD_MAX_CONSECUTIVE_FAILURES", "8")
+        data: dict[str, Any] = {}
+        result = _apply_env_overrides(data)
+        assert result["scheduler"]["preload_max_consecutive_failures"] == 8
+        assert isinstance(result["scheduler"]["preload_max_consecutive_failures"], int)
 
     def test_idle_eviction_minutes_is_int_typed(self, monkeypatch):
         monkeypatch.setenv("MARSHAL_SCHEDULER_IDLE_EVICTION_MINUTES", "30")

@@ -127,7 +127,7 @@ async def call_with_retry(
                     error_type=type(exc).__name__,
                 )
                 raise
-            delay = _backoff_delay(attempt, base_delay_s, max_delay_s)
+            delay = backoff_delay(attempt, base_delay_s, max_delay_s)
             logger.info(
                 "retry.attempt_failed",
                 request_id=request_id,
@@ -162,7 +162,7 @@ async def call_with_retry(
                 # exhausted=True signals "retry budget burned, this is
                 # NOT a successful retry" so metrics stay honest.
                 return result, attempt, True
-            delay = _backoff_delay(attempt, base_delay_s, max_delay_s)
+            delay = backoff_delay(attempt, base_delay_s, max_delay_s)
             logger.info(
                 "retry.status_failed",
                 request_id=request_id,
@@ -191,13 +191,17 @@ async def call_with_retry(
     raise RuntimeError(msg)
 
 
-def _backoff_delay(attempt: int, base_delay_s: float, max_delay_s: float) -> float:
+def backoff_delay(attempt: int, base_delay_s: float, max_delay_s: float) -> float:
     """Exponential backoff with full jitter.
 
     Full jitter (uniform random in [0, exp_delay]) reduces thundering
     herd on simultaneous-failure recovery (e.g., if Ollama briefly
     flapped, every queued request would otherwise retry at the same
     millisecond).
+
+    Public symbol — also consumed by ``scheduler.py`` for per-model
+    preload-failure backoff so retry and preload share the same jitter
+    math.
     """
     exp_delay = min(base_delay_s * (2 ** (attempt - 1)), max_delay_s)
     # Backoff jitter — security context is irrelevant here.

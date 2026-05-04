@@ -321,7 +321,7 @@ async def test_marshal_eviction_drains_then_unloads(tmp_marshal_paths):
     # Custom config: 2.5GB available, both models together (~2.8GB) won't fit.
     cfg = MarshalConfig(
         ollama=OllamaConfig(host=DEFAULT_OLLAMA_HOST),
-        proxy=ProxyConfig(host="127.0.0.1", port=11436, request_timeout_s=120),
+        proxy=ProxyConfig(host="127.0.0.1", port=11436),
         memory=MemoryConfig(
             total_ram="2500MB",
             os_overhead="0B",
@@ -331,6 +331,7 @@ async def test_marshal_eviction_drains_then_unloads(tmp_marshal_paths):
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
+            ollama_forward_timeout_s=120,
         ),
         programs={
             "default": ProgramConfig(),
@@ -488,11 +489,12 @@ async def test_reload_does_not_drain_triggering_request(tmp_marshal_paths):
     """
     cfg = MarshalConfig(
         ollama=OllamaConfig(host=DEFAULT_OLLAMA_HOST),
-        proxy=ProxyConfig(host="127.0.0.1", port=11436, request_timeout_s=120),
+        proxy=ProxyConfig(host="127.0.0.1", port=11436),
         memory=MemoryConfig(poll_interval=1),
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
+            ollama_forward_timeout_s=120,
         ),
         programs={
             "default": ProgramConfig(),
@@ -672,11 +674,12 @@ async def test_unexpected_unload_detection(tmp_marshal_paths, cleanup_models):
     async with fault_proxy() as proxy:
         cfg = MarshalConfig(
             ollama=OllamaConfig(host=proxy.url),
-            proxy=ProxyConfig(host="127.0.0.1", port=11436, request_timeout_s=60),
+            proxy=ProxyConfig(host="127.0.0.1", port=11436),
             memory=MemoryConfig(poll_interval=1),
             scheduler=SchedulerConfig(
                 metrics_path=str(tmp_marshal_paths["metrics_path"]),
                 metrics_persist_interval_s=3600,
+                ollama_forward_timeout_s=60,
             ),
             programs={
                 "default": ProgramConfig(),
@@ -742,12 +745,13 @@ async def test_idle_eviction_marks_intended_unload(tmp_marshal_paths, cleanup_mo
     # Set idle threshold to ~3 seconds (0.05 minutes) so the test is fast.
     cfg = MarshalConfig(
         ollama=OllamaConfig(host=DEFAULT_OLLAMA_HOST),
-        proxy=ProxyConfig(host="127.0.0.1", port=11436, request_timeout_s=60),
+        proxy=ProxyConfig(host="127.0.0.1", port=11436),
         memory=MemoryConfig(poll_interval=1),
         scheduler=SchedulerConfig(
             idle_eviction_minutes=1,  # scheduler treats <1 as disabled, so 1 min
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
+            ollama_forward_timeout_s=60,
         ),
         programs={
             "default": ProgramConfig(),

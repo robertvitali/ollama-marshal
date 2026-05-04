@@ -11,7 +11,7 @@ from ollama_marshal.retry import (
     RETRYABLE_STATUS_CODES,
     SAFE_RETRY_EXCEPTIONS,
     UNSAFE_RETRY_EXCEPTIONS,
-    _backoff_delay,
+    backoff_delay,
     call_with_retry,
 )
 
@@ -324,26 +324,26 @@ class TestCallWithRetryArgs:
 
 
 # ---------------------------------------------------------------------------
-# _backoff_delay
+# backoff_delay
 # ---------------------------------------------------------------------------
 
 
 class TestBackoffDelay:
     def test_is_bounded_by_base_on_first_attempt(self):
         for _ in range(20):
-            d = _backoff_delay(1, base_delay_s=1.0, max_delay_s=10.0)
+            d = backoff_delay(1, base_delay_s=1.0, max_delay_s=10.0)
             assert 0.0 <= d <= 1.0
 
     def test_doubles_until_max_delay(self):
         # Full jitter is uniform [0, exp_delay], so the upper bound
         # doubles each attempt up to max_delay_s.
         for _ in range(20):
-            d2 = _backoff_delay(2, base_delay_s=1.0, max_delay_s=10.0)
+            d2 = backoff_delay(2, base_delay_s=1.0, max_delay_s=10.0)
             assert d2 <= 2.0
 
     def test_capped_at_max_delay(self):
         for _ in range(20):
-            d = _backoff_delay(20, base_delay_s=1.0, max_delay_s=5.0)
+            d = backoff_delay(20, base_delay_s=1.0, max_delay_s=5.0)
             assert d <= 5.0
 
 

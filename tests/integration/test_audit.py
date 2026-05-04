@@ -73,11 +73,12 @@ _HDR = {"X-Program-ID": PROGRAM_CRITICAL}
 def _build_config(*, tmp_paths: dict, ollama_host: str) -> MarshalConfig:
     return MarshalConfig(
         ollama=OllamaConfig(host=ollama_host),
-        proxy=ProxyConfig(host="127.0.0.1", port=11436, request_timeout_s=60),
+        proxy=ProxyConfig(host="127.0.0.1", port=11436),
         memory=MemoryConfig(poll_interval=1),
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
+            ollama_forward_timeout_s=60,
         ),
         programs={
             "default": ProgramConfig(),

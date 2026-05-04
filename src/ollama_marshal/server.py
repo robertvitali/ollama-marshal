@@ -1003,12 +1003,17 @@ def _parse_retry_max_header(request: Request) -> int | None:
     return min(v, cap)
 
 
-def _resolve_timeout(request: Request) -> int:
-    """Resolve the wait-for-scheduler timeout for this request.
+def _resolve_forward_timeout(request: Request) -> int:
+    """Resolve the marshal→Ollama (Hop 2) wall-clock budget for this request.
 
     Per-request override via `X-Request-Timeout: <seconds>` header wins;
-    otherwise fall back to `proxy.request_timeout_s` from marshal.yaml.
-    Defaults to 3600s (1h) if no config is reachable (defensive).
+    otherwise fall back to `scheduler.ollama_forward_timeout_s` from
+    marshal.yaml. Defaults to 3600s (1h) if no config is reachable
+    (defensive — only happens in test paths that bypass lifespan).
+
+    Semantics changed in v0.6.4: previously this header gated the
+    client→marshal wait time (Hop 1, now unbounded). It now sizes the
+    marshal→Ollama HTTP call. See CHANGELOG for migration notes.
     """
     hdr = request.headers.get("x-request-timeout")
     if hdr:
@@ -1018,10 +1023,9 @@ def _resolve_timeout(request: Request) -> int:
                 return v
         except ValueError:
             pass
-    # Read from app.state (set in create_app), with a sane default if missing.
     cfg = getattr(request.app.state, "config", None)
     if cfg is not None:
-        return int(cfg.proxy.request_timeout_s)
+        return int(cfg.scheduler.ollama_forward_timeout_s)
     return 3600
 
 
@@ -1043,13 +1047,12 @@ async def _enqueue_inference(
     model = body.get("model", "")
     stream = body.get("stream", False)
     program_id = _normalize_program_id(request.headers.get("x-program-id"))
-    timeout_s = _resolve_timeout(request)
+    forward_timeout_s = _resolve_forward_timeout(request)
 
     # Fail-fast on unknown models. Without this, marshal would let the
-    # request sit in the queue for proxy.request_timeout_s (default 1h)
-    # while lifecycle.preload retries every ~2 min trying to load a
-    # model Ollama doesn't have. Better to return 404 in milliseconds
-    # so the client gets a clear, fast error.
+    # request sit in the queue indefinitely while lifecycle.preload
+    # retries trying to load a model Ollama doesn't have. Better to
+    # return 404 in milliseconds so the client gets a clear, fast error.
     if model and not await _is_known_model(model):
         logger.warning(
             "server.request_rejected_unknown_model",
@@ -1086,6 +1089,7 @@ async def _enqueue_inference(
         stream=stream,
         retry_max_override=_parse_retry_max_header(request),
         bypass_pause=_is_bypass_pause(request),
+        ollama_forward_timeout_s=forward_timeout_s,
     )
 
     # Defensive: a client sending `options: null` (the JSON literal, not
@@ -1098,24 +1102,16 @@ async def _enqueue_inference(
         program=program_id,
         endpoint=endpoint,
         stream=stream,
-        timeout_s=timeout_s,
+        forward_timeout_s=forward_timeout_s,
         num_ctx=options.get("num_ctx") if isinstance(options, dict) else None,
     )
 
     await _queues.enqueue(envelope)
-    try:
-        await asyncio.wait_for(envelope.done_event.wait(), timeout=timeout_s)
-    except TimeoutError:
-        logger.error(
-            "server.request_timeout",
-            model=model,
-            program=program_id,
-            wait_s=timeout_s,
-        )
-        return JSONResponse(
-            {"error": "Request timed out waiting for model scheduling"},
-            status_code=504,
-        )
+    # Hop 1 (client→marshal wait) is unbounded as of v0.6.4. Async
+    # clients wait until the response or an error arrives. Hop 2
+    # (marshal→Ollama) is bounded by ``ollama_forward_timeout_s`` on
+    # the envelope.
+    await envelope.done_event.wait()
 
     if envelope.error:
         logger.error(
@@ -1169,7 +1165,7 @@ async def _enqueue_and_wait(
         Parsed response dict, or a Response for streaming/errors.
     """
     program_id = _normalize_program_id(request.headers.get("x-program-id"))
-    timeout_s = _resolve_timeout(request)
+    forward_timeout_s = _resolve_forward_timeout(request)
 
     # Same fail-fast unknown-model check as _enqueue_inference. OpenAI
     # clients are especially likely to mis-name models since they
@@ -1214,16 +1210,14 @@ async def _enqueue_and_wait(
         stream=stream,
         retry_max_override=_parse_retry_max_header(request),
         bypass_pause=_is_bypass_pause(request),
+        ollama_forward_timeout_s=forward_timeout_s,
     )
 
     await _queues.enqueue(envelope)
-    try:
-        await asyncio.wait_for(envelope.done_event.wait(), timeout=timeout_s)
-    except TimeoutError:
-        return JSONResponse(
-            {"error": {"message": "Request timed out", "type": "timeout"}},
-            status_code=504,
-        )
+    # Hop 1 (client→marshal wait) is unbounded as of v0.6.4. The Hop 2
+    # forward call is bounded by ``ollama_forward_timeout_s`` on the
+    # envelope and surfaces as a forward-side error if exceeded.
+    await envelope.done_event.wait()
 
     if envelope.error:
         return JSONResponse(

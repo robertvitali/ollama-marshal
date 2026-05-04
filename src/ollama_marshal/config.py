@@ -149,15 +149,6 @@ class ProxyConfig(BaseModel):
 
     host: str = Field(default="127.0.0.1", description="Proxy bind address")
     port: int = Field(default=11435, description="Proxy listen port")
-    request_timeout_s: int = Field(
-        default=3600,
-        description=(
-            "Server-side max wait for a queued request to be served, in seconds. "
-            "Default is 1 hour — generous enough for big-model loads. "
-            "Returns 504 if exceeded. Clients can override per-request via the "
-            "X-Request-Timeout header (value in seconds, must be > 0)."
-        ),
-    )
 
 
 class MemoryConfig(BaseModel):
@@ -277,6 +268,56 @@ class SchedulerConfig(BaseModel):
             "fault-injection proxies — the benchmark would saturate the "
             "real Ollama through the proxy and starve other test "
             "requests."
+        ),
+    )
+    ollama_forward_timeout_s: int = Field(
+        default=3600,
+        ge=1,
+        description=(
+            "Wall-clock budget for a single marshal→Ollama HTTP forward, "
+            "in seconds. Default 3600 (1h) — generous enough for big-"
+            "model long-context inference. Catches a hung Ollama "
+            "process so the request fails with a clear 504 instead of "
+            "blocking the queue forever. Per-request override via the "
+            "``X-Request-Timeout`` header. Replaces the v0.6.3 "
+            "``proxy.request_timeout_s`` field which gated the "
+            "client→marshal hop (now unbounded — async clients wait "
+            "indefinitely)."
+        ),
+    )
+    preload_backoff_base_s: float = Field(
+        default=1.0,
+        gt=0,
+        description=(
+            "Initial backoff after a preload failure, in seconds. The "
+            "scheduler tracks per-model preload failure state; the "
+            "first failure parks future preload attempts on that model "
+            "for ``base_s`` (with full jitter), the second for ``base_s "
+            "* 2``, etc., capped at ``preload_backoff_max_s``. Without "
+            "this, the 0.1s scheduler tick would hammer a recovering "
+            "Ollama with ~10 preload calls/sec while it's unreachable."
+        ),
+    )
+    preload_backoff_max_s: float = Field(
+        default=30.0,
+        gt=0,
+        description=(
+            "Cap on a single preload backoff sleep, in seconds. "
+            "Bounds geometric growth so the backoff doesn't drift to "
+            "minutes after many failures."
+        ),
+    )
+    preload_max_consecutive_failures: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "After this many consecutive preload failures for the same "
+            "model, give up and fail every queued envelope for that "
+            "model with ``PreloadFailedError`` (surfaced to clients as "
+            "a 502). Without this, a permanently-unreachable model "
+            "would leave its envelopes parked in the queue forever. "
+            "Per-model failure state resets on the next successful "
+            "preload."
         ),
     )
 
@@ -733,7 +774,6 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 "max_skips",
                 "model_detect_interval",
                 "drain_timeout",
-                "request_timeout_s",
                 "idle_eviction_minutes",
                 "parallel_per_model",
                 "burst_hint_cap_multiplier",
@@ -746,6 +786,9 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 "max_per_request_attempts",
                 "default_completion_budget",
                 "safety_buffer_tokens",
+                # v0.6.4: Hop 2 forward timeout + preload backoff giveup
+                "ollama_forward_timeout_s",
+                "preload_max_consecutive_failures",
             ):
                 data[section][field] = int(value)
             elif field in (
@@ -754,6 +797,9 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
                 # v0.4.0: retry float fields
                 "base_delay_s",
                 "max_delay_s",
+                # v0.6.4: preload backoff floats
+                "preload_backoff_base_s",
+                "preload_backoff_max_s",
             ):
                 data[section][field] = float(value)
             elif field in (

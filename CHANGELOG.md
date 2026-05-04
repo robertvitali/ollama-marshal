@@ -7,6 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-05-03
+
+P0 stability release. Two production-impacting fixes identified
+during the v0.6.2 retrospective and verified against
+`BUGFIX-NOTES.txt` evidence (qwen3.5 experiment logs, 1531 threads,
+67 errors).
+
+### Changed (BREAKING)
+
+- **`proxy.request_timeout_s` removed.** Marshal no longer caps the
+  client→marshal wait. Async clients wait indefinitely for a response
+  or error. Configs that still set this field will fail validation
+  with a clear pydantic error — remove it. The motivation: the field
+  was misnamed and surface-confusing. It gated Hop 1 (the queued
+  request's wait time inside marshal) but never propagated to Hop 2
+  (the actual marshal→Ollama HTTP call), so a 5-min ReadTimeout on
+  the forward could fire even when `request_timeout_s=3600`. Splitting
+  the surface into "Hop 1 unbounded, Hop 2 explicit knob" makes the
+  semantics matched to the actual failure modes.
+- **`X-Request-Timeout` header repurposed.** Previously meant "max
+  wait for marshal to start serving the request" (Hop 1). Now means
+  "Ollama forward call budget" (Hop 2) — the wall-clock timeout
+  marshal applies to the httpx call to Ollama. Most callers will
+  want the new behavior; if you depended on the old semantics, set a
+  client-side socket timeout instead. Pre-1.0 break documented under
+  the v0.6.4 versioning policy.
+
+### Fixed
+
+- **Hop 2 forward timeout is now configurable + per-request
+  overridable.** `src/ollama_marshal/stream.py` and
+  `src/ollama_marshal/lifecycle.py` previously hardcoded
+  `timeout=300` (5 min) for marshal→Ollama HTTP calls. For long-
+  context inference on bigger models (e.g. 70B with 32K+ tokens),
+  Ollama can legitimately need 5+ minutes; marshal would kill the
+  connection at 5 min and return 502 to the client. Per
+  `BUGFIX-NOTES.txt`: 477 ReadTimeout occurrences in one experiment
+  run (some amplified by Bug 2 below; remainder is real big-model
+  long-context behavior). The hardcoded constants are gone — the
+  scheduler threads `scheduler.ollama_forward_timeout_s` (default
+  3600 s = 1 h) through `forward_request` and
+  `lifecycle.preload`. Per-request override via the repurposed
+  `X-Request-Timeout` header.
+- **Per-model preload backoff prevents the 313-failures-in-30s
+  cascade.** When Ollama crashes/restarts, `lifecycle.preload`
+  returns False on every attempt while Ollama is unreachable. The
+  `_SCHEDULER_TICK = 0.1` loop kept calling `preload` immediately
+  on the next tick, generating ~10 preload attempts per second,
+  hammering the recovering Ollama, spamming logs, and likely slowing
+  recovery. Per `BUGFIX-NOTES.txt`: 313 `lifecycle.preload_failed`
+  log entries in ~30 s during one Ollama crash recovery. Now: each
+  model has independent failure tracking
+  (`Scheduler._preload_failures`), exponential backoff with full
+  jitter (1 s → 2 s → 4 s → ... up to 30 s by default), and after
+  5 consecutive failures the queued envelopes for that model fail
+  with `PreloadFailedError` (surfaced as 502) rather than waiting
+  forever. Failure state clears on the next successful preload — the
+  giveup is per-batch, not permanent.
+
+### Added
+
+- `scheduler.ollama_forward_timeout_s` (default 3600) — wall-clock
+  budget for a single marshal→Ollama HTTP forward, in seconds.
+  Threaded through `forward_request` and `lifecycle.preload` so both
+  the inference call and the load call share the same configurable
+  budget. Override per-request via `X-Request-Timeout`.
+- `scheduler.preload_backoff_base_s` (default 1.0) — initial backoff
+  delay after a preload failure.
+- `scheduler.preload_backoff_max_s` (default 30.0) — cap on a single
+  preload backoff sleep.
+- `scheduler.preload_max_consecutive_failures` (default 5) — give up
+  + fail queued envelopes after N consecutive failures for the same
+  model.
+- `PreloadFailedError` exception (in `ollama_marshal.queue`) —
+  surfaced as `RequestEnvelope.error` when the scheduler exhausts
+  its per-model preload retry budget. Currently maps to a generic
+  502 in the response body; v0.6.5's Bug 3 will propagate the
+  class name and reason into the error body for clearer client
+  diagnostics.
+- `scheduler.preload_failure_recorded`,
+  `scheduler.preload_failure_cleared`, and
+  `scheduler.preload_giving_up` log events — emitted by the new
+  per-model backoff state machine. Pair with
+  `scheduler.preload_giving_up` audit-log entries when audit is
+  enabled.
+
+### Documentation
+
+- `marshal.example.yaml`: removed the `proxy.request_timeout_s`
+  entry (replaced with a migration note pointing at
+  `scheduler.ollama_forward_timeout_s`); added annotated entries
+  for the four new `scheduler.*` fields.
+- `CHANGELOG.md`: documented the breaking-change rationale at
+  the top of v0.6.4 so operators upgrading from v0.6.3 can see
+  the migration path before reading the field docs.
+
 ## [0.6.3] - 2026-05-03
 
 ### Fixed

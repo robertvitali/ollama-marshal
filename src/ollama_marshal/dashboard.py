@@ -42,11 +42,11 @@ DEFAULT_REFRESH_HZ = 2.0  # render rate, clamped to [0.5, 10.0]
 _MAX_POLL_HZ = 5.0
 _MIN_REFRESH_HZ = 0.5
 _MAX_REFRESH_HZ = 10.0
-# Status-poll request timeout. Distinct from `proxy.request_timeout_s`
-# (inference timeout) — this is a UI-side budget for "is marshal alive
-# right now?" snapshot fetches. 2s is generous for a localhost JSON GET;
-# beyond that we'd rather show a stale snapshot than block the render
-# loop.
+# Status-poll request timeout. Distinct from the inference Hop 2
+# budget (``scheduler.ollama_forward_timeout_s``) — this is a UI-side
+# budget for "is marshal alive right now?" snapshot fetches. 2s is
+# generous for a localhost JSON GET; beyond that we'd rather show a
+# stale snapshot than block the render loop.
 _STATUS_POLL_TIMEOUT_S = 2.0
 
 # Match the lifecycle and scheduling events worth showing.

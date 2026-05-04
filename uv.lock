@@ -490,7 +490,7 @@ wheels = [
 
 [[package]]
 name = "ollama-marshal"
-version = "0.6.3"
+version = "0.6.4"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

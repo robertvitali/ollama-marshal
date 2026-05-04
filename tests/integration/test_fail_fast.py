@@ -2,8 +2,8 @@
 
 Validates the v0.4.0 surface: marshal returns 404 in milliseconds for
 models that aren't in Ollama's `/api/tags`, instead of letting the
-request sit in the queue for `proxy.request_timeout_s` while
-`lifecycle.preload` retries forever.
+request sit in the queue indefinitely (Hop 1 became unbounded in
+v0.6.4) while `lifecycle.preload` retries forever.
 
 Both tests run against the user's live Ollama. The first uses a model
 name that's almost certainly NOT pulled. The second exercises the
@@ -49,9 +49,11 @@ _FAIL_FAST_BUDGET_S = 0.75
 async def test_unknown_model_returns_404_fast(marshal_subprocess_client):
     """Marshal returns 404 fast for a missing model.
 
-    Without this surface, the request would sit in the queue for the
-    proxy.request_timeout_s (default 1h) while lifecycle.preload
-    retries every ~2min trying to load a model Ollama doesn't have.
+    Without this surface, the request would sit in the queue
+    indefinitely (Hop 1 became unbounded in v0.6.4) while
+    ``lifecycle.preload`` keeps retrying — eventually firing the new
+    ``preload_max_consecutive_failures`` giveup, but only after
+    serving the client a confused error instead of a clear 404.
     """
     client, _audit_path = marshal_subprocess_client
     body = {
@@ -68,7 +70,7 @@ async def test_unknown_model_returns_404_fast(marshal_subprocess_client):
     # Error body should mention the offending model name + the fix.
     assert NEVER_PULLED_MODEL in payload.get("error", "")
     assert "ollama pull" in payload.get("error", "").lower()
-    # Wall-clock under the budget — much faster than request_timeout_s.
+    # Wall-clock under the budget — much faster than the preload+giveup loop.
     assert elapsed < _FAIL_FAST_BUDGET_S, (
         f"fail-fast took {elapsed:.3f}s, expected <{_FAIL_FAST_BUDGET_S}s"
     )

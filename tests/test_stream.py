@@ -118,14 +118,34 @@ class TestForwardResponse:
 
         assert mock_client.post.call_args[1]["json"] == body
 
-    async def test_timeout_is_set(self):
+    async def test_default_timeout_is_3600(self):
+        # v0.6.4 raised the default Hop 2 timeout from 300s to 3600s so
+        # big-model long-context inference doesn't trip a spurious 502.
+        # Production callers pass an explicit ``timeout_s`` resolved
+        # from the X-Request-Timeout header or
+        # ``scheduler.ollama_forward_timeout_s``.
         mock_response = MagicMock(spec=httpx.Response)
         mock_client = _make_mock_client(mock_response)
 
         with patch("ollama_marshal.stream.httpx.AsyncClient", return_value=mock_client):
             await _forward_response(OLLAMA_HOST, "/api/chat", {"model": "m"})
 
-        assert mock_client.post.call_args[1]["timeout"] == 300
+        assert mock_client.post.call_args[1]["timeout"] == 3600
+
+    async def test_explicit_timeout_threads_through(self):
+        # Production scheduler call site passes the per-envelope
+        # ``ollama_forward_timeout_s`` through ``forward_request`` →
+        # ``_forward_response``; verify the kwarg actually lands on the
+        # httpx call.
+        mock_response = MagicMock(spec=httpx.Response)
+        mock_client = _make_mock_client(mock_response)
+
+        with patch("ollama_marshal.stream.httpx.AsyncClient", return_value=mock_client):
+            await _forward_response(
+                OLLAMA_HOST, "/api/chat", {"model": "m"}, timeout_s=42
+            )
+
+        assert mock_client.post.call_args[1]["timeout"] == 42
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +271,10 @@ class TestForwardPassthrough:
         assert call_kwargs["content"] is None
         assert call_kwargs["headers"] is None
 
-    async def test_timeout_is_set(self):
+    async def test_default_timeout_is_3600(self):
+        # Same v0.6.4 default as the inference path
+        # (``_DEFAULT_FORWARD_TIMEOUT_S``); passthrough callers can
+        # override per-call via the ``timeout_s`` kwarg.
         mock_response = MagicMock(spec=httpx.Response)
         mock_client = _make_mock_client(mock_response)
 
@@ -259,7 +282,7 @@ class TestForwardPassthrough:
             await forward_passthrough(OLLAMA_HOST, "GET", "/api/ps")
 
         call_kwargs = mock_client.request.call_args[1]
-        assert call_kwargs["timeout"] == 300
+        assert call_kwargs["timeout"] == 3600
 
     async def test_constructs_correct_url(self):
         mock_response = MagicMock(spec=httpx.Response)

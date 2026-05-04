@@ -37,10 +37,13 @@ ollama:
 proxy:
   host: "0.0.0.0"                  # MARSHAL_PROXY_HOST
   port: 11435                       # MARSHAL_PROXY_PORT
-  request_timeout_s: 3600          # MARSHAL_PROXY_REQUEST_TIMEOUT_S — server-side max
-                                    # wait for a queued request, in seconds. Default 1h.
-                                    # Returns 504 if exceeded. Clients can override
-                                    # per-request via the X-Request-Timeout header.
+  # NOTE: ``proxy.request_timeout_s`` was removed in v0.6.4. Hop 1
+  # (client→marshal wait) is now unbounded — async clients wait
+  # indefinitely for a response or error. Configs that still set this
+  # field will fail validation. The Hop 2 forward budget moved to
+  # ``scheduler.ollama_forward_timeout_s`` (see below). The
+  # ``X-Request-Timeout`` header was repurposed as the per-request
+  # Hop 2 override; see the scheduler entry for migration notes.
 
 # Memory management
 memory:
@@ -87,6 +90,30 @@ scheduler:
                                     # footprint. Default ON so routing has accurate sizes.
                                     # Disable in integration test harnesses that front Ollama
                                     # with a fault-injection proxy.
+  ollama_forward_timeout_s: 3600   # MARSHAL_SCHEDULER_OLLAMA_FORWARD_TIMEOUT_S — wall-clock
+                                    # budget for a single marshal→Ollama HTTP forward, in
+                                    # seconds. Default 3600 (1h) — generous enough for big-
+                                    # model long-context inference. Catches a hung Ollama so
+                                    # the request fails clearly instead of blocking forever.
+                                    # Per-request override via the X-Request-Timeout header.
+                                    # NOTE (v0.6.4): replaces the v0.6.3 proxy.request_timeout_s
+                                    # field, and the X-Request-Timeout header now sizes the
+                                    # Ollama forward call (previously the client→marshal wait).
+  preload_backoff_base_s: 1.0      # MARSHAL_SCHEDULER_PRELOAD_BACKOFF_BASE_S — initial
+                                    # backoff after a preload failure. Doubles on each
+                                    # subsequent failure with full jitter, capped at
+                                    # preload_backoff_max_s. Without this, the 0.1s scheduler
+                                    # tick would hammer a recovering Ollama with ~10 preload
+                                    # calls/sec while it's unreachable.
+  preload_backoff_max_s: 30.0      # MARSHAL_SCHEDULER_PRELOAD_BACKOFF_MAX_S — cap on a
+                                    # single preload backoff sleep. Bounds geometric growth.
+  preload_max_consecutive_failures: 5  # MARSHAL_SCHEDULER_PRELOAD_MAX_CONSECUTIVE_FAILURES —
+                                        # after this many consecutive preload failures for the
+                                        # same model, drop pending envelopes for that model
+                                        # with PreloadFailedError (surfaced as a 502) so the
+                                        # client gets clear feedback instead of waiting forever.
+                                        # Per-model failure state resets on the next successful
+                                        # preload — the giveup is per-batch, not permanent.
 
 # Per-program configuration
 # Programs identify themselves via the X-Program-ID header.
