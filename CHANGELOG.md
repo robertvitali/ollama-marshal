@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- `CLAUDE.md`: added "Per-Issue Dev Workflow" section documenting
+  the iterate-test-review-commit cadence for multi-issue releases,
+  the verify-item handling, and the ordering principle (test infra
+  before production code, verification last). Lives between "Code
+  Review — Local Only" and "Versioning".
+
 ## [0.6.5] - 2026-05-03
 
 P1 observability + correctness release. Closes out the

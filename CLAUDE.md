@@ -252,6 +252,71 @@ inherit via `git fetch origin main && git rebase origin/main`. The
 blocks feature PRs from re-adding any `claude-*.yml` file unless on
 a `chore/ci-*` branch.
 
+## Per-Issue Dev Workflow
+
+For multi-issue releases (a v0.X.Y with several sub-bugs under one
+parent task), iterate **per issue** rather than batching every change
+into one sweep. Each issue gets its own commit on the release feature
+branch and its own pass through review. The cadence catches
+regressions early and produces a reviewable history.
+
+### For code or test-coverage issues
+
+1. Read the affected code paths first; understand existing behavior
+   before changing it.
+2. Implement the fix or new test.
+3. Update unit tests (`tests/test_*.py`) to cover the new behavior.
+4. Author new integration tests where the change crosses the
+   scheduler ↔ memory ↔ lifecycle boundary or hits a wire-level path
+   not exercised by the unit suite (`tests/integration/test_*.py`).
+5. Run `make test` + `make test-integration`. Fix anything that
+   fails.
+6. Run `/review` (gstack skill — runs Claude structured + Claude
+   adversarial + Codex adversarial passes, plus Codex structured
+   review automatically when the diff is ≥ 200 LOC). For high-stakes
+   changes under 200 LOC, ask `/review` for "full review" / "P1
+   gate" to force the Codex structured pass.
+7. Fix any issues `/review` surfaced.
+8. Re-run `make test` + `make test-integration` to confirm review
+   fixes didn't regress anything.
+9. Commit on the release feature branch (e.g. `feat/v0.6.6`). Add a
+   CHANGELOG.md entry under `[Unreleased]` for any user-visible
+   change.
+10. Update the corresponding Asana subtask: mark complete, and
+    append any review-discovered follow-ups as new subtasks at the
+    end of the parent release task.
+
+### For verify-only items (load tests, workload re-runs)
+
+Verify items don't produce a code diff. They produce artifacts —
+logs, percentile numbers, error counts.
+
+1. Run the verification.
+2. Capture artifacts to the Asana subtask body (timestamps, key
+   numbers, before/after deltas).
+3. If clean, mark the subtask complete.
+4. If the verification surfaces an active issue, file it as a new
+   subtask under the same release parent task and run the
+   code/test-coverage workflow above on the new subtask.
+
+### Ordering inside a release
+
+Sequence subtasks so test infrastructure and coverage land before
+production code changes. A stable green test suite is a precondition
+for trustworthy verification of subsequent changes. General order:
+
+1. Test-isolation / flake fixes
+2. New integration test coverage for shipped-but-uncovered features
+3. Production code changes
+4. Verification runs (load tests, workload re-runs)
+
+### Release branch and shipping
+
+Per-issue commits accumulate on the release feature branch (e.g.
+`feat/v0.6.6`). The branch ships as a single PR via `/ship`.
+"Doing this as v0.6.X" claims the slot but does not ship — commits
+stay on the branch until the user gives the explicit ship verb.
+
 ## Versioning
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
