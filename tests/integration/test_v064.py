@@ -196,11 +196,15 @@ async def test_preload_storm_eliminated_when_ollama_disconnects(tmp_marshal_path
             # fails the test deterministically.
             resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=15)
 
-            # The preload giveup path fails the envelope, which the
-            # server maps to a 502 (generic proxy error). v0.6.5's
-            # Bug 3 will propagate the PreloadFailedError class name
-            # in the body; for now the status code is the assertion.
-            assert resp.status_code == 502, resp.text
+            # v0.6.5 Bug 3: PreloadFailedError now maps to 503 (Service
+            # Unavailable — model couldn't be loaded after backoff
+            # giveup) and the body propagates the actual class name +
+            # message instead of an opaque 502 / "Internal proxy error".
+            assert resp.status_code == 503, resp.text
+            payload = resp.json()
+            assert payload["error_type"] == "PreloadFailedError", payload
+            assert REQUIRED_MODEL in payload["error"], payload
+            assert payload["model"] == REQUIRED_MODEL, payload
 
             # Failure state cleared after giveup — the next request can
             # try again from scratch, per the per-batch giveup design.

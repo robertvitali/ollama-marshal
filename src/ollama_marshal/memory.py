@@ -126,6 +126,22 @@ class MemoryManager:
         # unexpected unload on ANY instance. The scheduler reads + zeros
         # this to roll the value into SchedulerMetrics.unexpected_unloads.
         self.unexpected_unloads_observed: int = 0
+        # Per-(model, instance_url) record of evictions detected since
+        # the scheduler last drained. The scheduler drains in its tick
+        # loop (every ~100 ms) and forces a fresh preload before any
+        # pending request dispatches to that (model, instance) — closing
+        # the up-to-5s window in which marshal would otherwise dispatch
+        # against a phantom-loaded model. Populated synchronously inside
+        # ``_update_from_ps`` so the per-model record is visible the
+        # instant the poll observes the eviction.
+        self._recent_unexpected_unloads: set[tuple[str, str]] = set()
+        # Non-draining ledger of every (model, instance_url) eviction
+        # observed since startup. Used by tests to assert "this specific
+        # eviction was detected" without racing the scheduler-tick drain
+        # of ``_recent_unexpected_unloads``. Bounded only by the number
+        # of distinct (model, instance) pairs ever evicted in a process
+        # lifetime — finite and small in practice.
+        self._observed_unexpected_unloads: set[tuple[str, str]] = set()
         # Per-instance reachability — flips True after the first
         # successful /api/ps poll, False after a poll error. Surfaces
         # in the /api/marshal/status payload so operators can see at a
@@ -301,6 +317,8 @@ class MemoryManager:
                 intended.discard(name)
             else:
                 self.unexpected_unloads_observed += 1
+                self._recent_unexpected_unloads.add((name, instance_url))
+                self._observed_unexpected_unloads.add((name, instance_url))
                 logger.warning(
                     "memory.unexpected_unload",
                     instance=instance_url,
@@ -634,3 +652,28 @@ class MemoryManager:
         n = self.unexpected_unloads_observed
         self.unexpected_unloads_observed = 0
         return n
+
+    def take_recent_unexpected_unloads(self) -> set[tuple[str, str]]:
+        """Drain + return per-(model, instance_url) evictions since last call.
+
+        Called by the scheduler at the top of every tick. Each returned
+        pair is a model that Ollama silently evicted; the scheduler
+        marks it as needing a fresh preload before any pending request
+        dispatches to it. Drains so subsequent ticks don't re-process
+        the same eviction.
+        """
+        out = self._recent_unexpected_unloads
+        self._recent_unexpected_unloads = set()
+        return out
+
+    def peek_recent_unexpected_unloads(self) -> set[tuple[str, str]]:
+        """Read-only snapshot of every eviction observed since startup.
+
+        Backed by a separate non-draining accumulator so callers (tests,
+        diagnostics) can assert "this (model, instance) pair was
+        detected as unexpectedly unloaded" without racing the
+        scheduler-tick drain of the take-set. Returns the union across
+        the process lifetime — bounded by the number of distinct
+        (model, instance) pairs ever evicted.
+        """
+        return set(self._observed_unexpected_unloads)

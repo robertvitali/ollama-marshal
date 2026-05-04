@@ -1,4 +1,4 @@
-.PHONY: install-dev test test-integration lint format typecheck check pre-pr clean all dryrun-dashboard
+.PHONY: install-dev test test-integration load-test lint format typecheck check pre-pr clean all dryrun-dashboard
 
 install-dev:
 	uv pip install -e ".[dev]"
@@ -10,6 +10,15 @@ test:
 
 test-integration:
 	uv run --extra dev pytest tests/integration/ -m integration -v
+
+# Long-running load tests — opt-in only. Excluded from `pre-pr` and
+# default `make test-integration` because each scenario runs for
+# minutes against real Ollama. Run before each release as a sanity
+# check on the v0.6.4 Hop 1 unbounded design (no client→marshal wait
+# cap → uvicorn worker pool must not be exhausted by patient
+# clients).
+load-test:
+	uv run --extra dev pytest tests/integration/ -m load -v
 
 lint:
 	uv run --extra dev ruff check src/ tests/

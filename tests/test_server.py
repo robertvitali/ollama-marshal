@@ -5,14 +5,16 @@ import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import pytest
 from fastapi import FastAPI
 from starlette.routing import Route
 
 import ollama_marshal.server as server_mod
 from ollama_marshal.config import MarshalConfig, ShutdownConfig, ShutdownMode
 from ollama_marshal.memory import LoadedModel, MemoryBudget
-from ollama_marshal.queue import ModelQueues
-from ollama_marshal.server import create_app
+from ollama_marshal.queue import ModelQueues, PreloadFailedError
+from ollama_marshal.server import _http_status_for_error, create_app
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -223,6 +225,57 @@ class TestResolveForwardTimeout:
 
 
 # ---------------------------------------------------------------------------
+# _http_status_for_error  (Bug 3, v0.6.5)
+# ---------------------------------------------------------------------------
+
+
+class TestHttpStatusForError:
+    """Map forward-side exceptions to granular HTTP status codes.
+
+    Pre-v0.6.5 every failure surfaced as 502; the new helper splits
+    timeout/connect/preload-failed/protocol so operators can triage
+    from the status code alone. Covers the full httpx subclass tree
+    (TimeoutException + NetworkError parents), not just the obvious
+    ``ReadTimeout`` / ``ConnectError`` siblings — these were the
+    silent-fall-through cases pre-fix.
+    """
+
+    @pytest.mark.parametrize(
+        ("exc_factory", "expected_status"),
+        [
+            (lambda: httpx.ReadTimeout("slow"), 504),
+            (lambda: httpx.ConnectTimeout("connect timed out"), 504),
+            (lambda: httpx.WriteTimeout("write timed out"), 504),
+            (lambda: httpx.PoolTimeout("pool exhausted"), 504),
+            (lambda: httpx.ConnectError("refused"), 503),
+            (
+                lambda: httpx.ReadError(
+                    "read failed", request=MagicMock(spec=httpx.Request)
+                ),
+                503,
+            ),
+            (
+                lambda: httpx.WriteError(
+                    "write failed", request=MagicMock(spec=httpx.Request)
+                ),
+                503,
+            ),
+            (lambda: PreloadFailedError("model X"), 503),
+            (
+                lambda: httpx.RemoteProtocolError(
+                    "bad protocol", request=MagicMock(spec=httpx.Request)
+                ),
+                502,
+            ),
+            (lambda: RuntimeError("???"), 502),
+            (lambda: ValueError("???"), 502),
+        ],
+    )
+    def test_status_mapping(self, exc_factory, expected_status):
+        assert _http_status_for_error(exc_factory()) == expected_status
+
+
+# ---------------------------------------------------------------------------
 # _enqueue_inference
 # ---------------------------------------------------------------------------
 
@@ -287,8 +340,13 @@ class TestEnqueueInference:
 
         try:
             result = await server_mod._enqueue_inference(request, body, "/api/chat")
-            # Should be a 502 JSONResponse
+            # RuntimeError → default 502 (no specific httpx mapping).
+            # v0.6.5 also propagates error_type + message in the body.
             assert result.status_code == 502
+            payload = json.loads(bytes(result.body))
+            assert payload["error"] == "ollama down"
+            assert payload["error_type"] == "RuntimeError"
+            assert payload["model"] == "llama3:latest"
         finally:
             task.cancel()
             try:
@@ -447,7 +505,17 @@ class TestEnqueueAndWait:
             from fastapi.responses import JSONResponse
 
             assert isinstance(result, JSONResponse)
+            # RuntimeError → default 502. v0.6.5 keeps the OpenAI-spec
+            # ``error.type = "proxy_error"`` slug (so OpenAI-compat
+            # clients matching on the documented type don't break) and
+            # exposes the actual exception class on the new
+            # ``error.exception_type`` field.
             assert result.status_code == 502
+            payload = json.loads(bytes(result.body))
+            assert payload["error"]["message"] == "boom"
+            assert payload["error"]["type"] == "proxy_error"
+            assert payload["error"]["code"] == "proxy_error"
+            assert payload["error"]["exception_type"] == "RuntimeError"
         finally:
             task.cancel()
             try:

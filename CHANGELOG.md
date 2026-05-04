@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-05-03
+
+P1 observability + correctness release. Closes out the
+`BUGFIX-NOTES.txt` fixes started in v0.6.4. None of these are active
+production failures; they improve diagnostic clarity, scheduler
+reactivity, and confidence in the v0.6.4 Hop 1 unbounded design.
+
+### Fixed
+
+- **Error responses now propagate the actual exception class and
+  message** instead of a generic `{"error": "Internal proxy error"}`
+  502 for every failure. When marshal's call to Ollama fails:
+  - **Ollama-native endpoints** (`/api/chat`, `/api/generate`,
+    `/api/embeddings`) return `{"error": "<actual message>",
+    "error_type": "<class>", "model": "<name>"}`.
+  - **OpenAI-compat endpoints** (`/v1/chat/completions`,
+    `/v1/completions`, `/v1/embeddings`) return `{"error":
+    {"message": "...", "type": "proxy_error", "code": "proxy_error",
+    "exception_type": "<class>"}}` — the OpenAI-spec `type` slug stays
+    `"proxy_error"` for backwards compatibility with clients matching
+    on it, and the actual Python exception class moves to a new
+    `exception_type` field.
+  - **Status codes** map by exception class hierarchy:
+    `httpx.TimeoutException` (parent of `ReadTimeout`,
+    `ConnectTimeout`, `WriteTimeout`, `PoolTimeout`) → **504**;
+    `httpx.NetworkError` (parent of `ConnectError`, `ReadError`,
+    `WriteError`) and `PreloadFailedError` → **503**; everything else
+    (`RemoteProtocolError`, unknown exceptions) → **502**.
+  - **Operators triaging from a client error body alone** can now
+    distinguish "Ollama took too long" (504) from "can't reach Ollama
+    or model couldn't be loaded" (503) from "protocol or unknown
+    failure" (502).
+
+  Localhost-only deployments today: httpx exception messages may
+  include the upstream URL (e.g., `http://localhost:11434`) — this
+  is non-sensitive in the local-only architecture but is documented
+  here so any future remote-Ollama support triggers a re-review of
+  the error-message exposure path.
+- **Scheduler reacts to Ollama-side LRU evictions within ~100 ms**
+  (one scheduler tick) instead of waiting up to 5 s for the next
+  `/api/ps` poll. When Ollama silently evicts a loaded model
+  (memory pressure, internal cleanup), marshal previously kept
+  dispatching requests to a model that no longer existed in VRAM,
+  triggering surprise cold-start loads. Now the memory poller surfaces
+  evictions for the scheduler's next tick to consume; dispatch finds
+  the model marked-for-reload and forces a fresh preload before
+  forwarding. Per `BUGFIX-NOTES.txt`: 84 `memory.unexpected_unload`
+  events in one experiment run — each previously imposed up to 5 s of
+  stale-state scheduling.
+- **`test_unexpected_unload_detection` integration flake eliminated.**
+  Previous assertion read the process-wide `scheduler.metrics.
+  unexpected_unloads` counter, which (a) collided with the prod
+  marshal's eviction noise (cross-model counter pollution) and (b)
+  raced the scheduler-tick drain (counter is the drained-into metric;
+  test's `wait_for(not is_loaded)` returned before the next tick had
+  drained). The new per-model `_recent_unexpected_unloads` record
+  (added for the reactivity feature above) gives the test a
+  per-model handle that doesn't collide and is populated synchronously
+  inside `_update_from_ps`, so no tick-drain race.
+
+### Added
+
+- **Load test suite** at `tests/integration/test_load.py` marked with
+  `@pytest.mark.load` (excluded from default `make test-integration`
+  and `make pre-pr`). Run with `make load-test`. Verifies marshal's
+  Hop 1 unbounded behavior is healthy under sustained queue pressure
+  (50 concurrent clients), mixed-model contention, latency
+  percentiles (p50/p95/p99), and pause/resume recovery under load.
+  Designed as a pre-release sanity check rather than a per-commit
+  gate.
+
 ## [0.6.4] - 2026-05-03
 
 P0 stability release. Two production-impacting fixes identified

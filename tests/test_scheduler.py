@@ -111,6 +111,11 @@ def _make_scheduler(
         memory.needs_reload.return_value = False
         memory.get_allocated_num_ctx.return_value = None
         memory.take_unexpected_unload_count.return_value = 0
+        # v0.6.5 (Bug 4): scheduler ``_tick`` drains the per-(model,
+        # instance) eviction set into ``_needs_reload``. Default to
+        # empty so tests not exercising the reactivity path don't
+        # accidentally inject phantom evictions.
+        memory.take_recent_unexpected_unloads.return_value = set()
         memory.mark_intended_unload = MagicMock()
         memory.record_allocated_num_ctx = MagicMock()
     if registry is None:
@@ -2894,3 +2899,151 @@ class TestPreloadBackoffStateMachine:
         # short-circuit happens before any eviction work.
         sched.lifecycle.preload.assert_not_called()
         sched.lifecycle.unload.assert_not_called()
+
+
+class TestUnexpectedUnloadReactivity:
+    """v0.6.5 Bug 4: scheduler reacts to Ollama-side evictions on next tick.
+
+    Memory poller surfaces evictions in
+    ``_recent_unexpected_unloads``; scheduler ``_tick`` drains them
+    into ``_needs_reload``; bin-packing then bypasses the per-model
+    preload cooldown for the just-evicted model so a preload-failure
+    cooldown from an unrelated earlier failure can't delay the
+    eviction-triggered reload.
+    """
+
+    async def test_tick_drains_recent_evictions_into_needs_reload(self):
+        sched = _make_scheduler()
+        # Simulate the memory poller having detected an eviction —
+        # take_recent_unexpected_unloads returns the (model, instance)
+        # pair, drains internally on the memory side.
+        sched.memory.take_recent_unexpected_unloads.return_value = {
+            ("llama3:latest", _PRIMARY_INSTANCE_URL),
+        }
+        # Make the rest of the tick a no-op so the assertion is solely
+        # about the Step 0 drain.
+        sched._forward_loaded_model_requests = AsyncMock()
+        sched._handle_critical_preemption = AsyncMock()
+        sched._handle_unskippable_requests = AsyncMock()
+        sched._bin_pack_models = AsyncMock()
+        sched._idle_evict_unused_models = AsyncMock()
+
+        await sched._tick()
+
+        assert ("llama3:latest", _PRIMARY_INSTANCE_URL) in sched._needs_reload
+        sched.memory.take_recent_unexpected_unloads.assert_called_once()
+
+    async def test_needs_reload_bypasses_cooldown_in_bin_pack(self):
+        """A just-evicted model preloads immediately, even if its cooldown is active.
+
+        Reproduces the exact scenario the reactivity feature exists for:
+        a model has a stale preload-failure cooldown (from an earlier
+        unrelated failure window) AND just got Ollama-side evicted. The
+        cooldown would normally skip the bin-pack attempt, leaving
+        pending requests for the evicted model parked. Bug 4's
+        ``_needs_reload`` set bypasses the cooldown so the model
+        reloads on this tick.
+        """
+        from ollama_marshal.scheduler import _PreloadFailureState
+
+        sched = _make_scheduler()
+        sched.lifecycle.preload = AsyncMock(return_value=True)
+        # Plant a fresh cooldown that would normally block bin-pack.
+        sched._preload_failures["llama3:latest"] = _PreloadFailureState(
+            consecutive_failures=2,
+            cooldown_until=time.monotonic() + 60.0,
+        )
+        # Mark as needing reload (eviction-triggered).
+        sched._needs_reload.add(("llama3:latest", _PRIMARY_INSTANCE_URL))
+        # Queue a pending envelope so bin-pack picks the model.
+        await sched.queues.enqueue(_make_envelope(model="llama3:latest"))
+        sched.memory.is_loaded.return_value = False
+
+        await sched._bin_pack_models()
+
+        # Cooldown was bypassed → preload was actually attempted.
+        sched.lifecycle.preload.assert_called_once()
+        # Successful preload clears the (model, instance) entry so
+        # subsequent ticks don't re-force on the same instance.
+        assert ("llama3:latest", _PRIMARY_INSTANCE_URL) not in sched._needs_reload
+
+    async def test_needs_reload_cleared_on_preload_failure(self):
+        """Failed preload still drops the entry so cooldown-bypass doesn't loop.
+
+        Without this drop, a flapping Ollama would: bypass cooldown →
+        attempt preload → fail → record_preload_failure → next tick
+        bypass cooldown again → attempt preload → fail again. That
+        converts v0.6.4's jittered exponential backoff into per-tick
+        (~100 ms) hammering, defeating the storm protection.
+        Dropping on failure forces subsequent attempts back through
+        the normal cooldown gate.
+        """
+        from ollama_marshal.scheduler import _PreloadFailureState
+
+        sched = _make_scheduler()
+        sched.lifecycle.preload = AsyncMock(return_value=False)
+        sched._preload_failures["llama3:latest"] = _PreloadFailureState(
+            consecutive_failures=1,
+            cooldown_until=time.monotonic() + 60.0,
+        )
+        sched._needs_reload.add(("llama3:latest", _PRIMARY_INSTANCE_URL))
+        await sched.queues.enqueue(_make_envelope(model="llama3:latest"))
+        sched.memory.is_loaded.return_value = False
+
+        await sched._bin_pack_models()
+
+        sched.lifecycle.preload.assert_called_once()
+        # Entry dropped despite failure — next tick honors the cooldown.
+        assert ("llama3:latest", _PRIMARY_INSTANCE_URL) not in sched._needs_reload
+
+    async def test_needs_reload_only_drops_matching_instance(self):
+        """Multi-instance: success on instance A leaves (model, B) intact.
+
+        Reactivity is per-(model, instance). When Ollama evicts model X
+        on both instance A and instance B, marshal records two entries.
+        Reloading X on A only must NOT silently drop the B entry —
+        otherwise B would never get its eviction-triggered reload, and
+        a future request routed to B would dispatch against a phantom-
+        loaded model.
+        """
+        sched = _make_scheduler()
+        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched._needs_reload.add(("llama3:latest", _PRIMARY_INSTANCE_URL))
+        sched._needs_reload.add(("llama3:latest", "http://other:11434"))
+        await sched.queues.enqueue(_make_envelope(model="llama3:latest"))
+        sched.memory.is_loaded.return_value = False
+
+        await sched._bin_pack_models()
+
+        # Primary entry dropped (bin-pack picked _PRIMARY_INSTANCE_URL).
+        assert ("llama3:latest", _PRIMARY_INSTANCE_URL) not in sched._needs_reload
+        # Other-instance entry still pending — that instance hasn't
+        # been reloaded yet.
+        assert ("llama3:latest", "http://other:11434") in sched._needs_reload
+
+    async def test_ensure_model_loaded_bypasses_cooldown_for_evicted(self):
+        """CRITICAL preemption path also reacts to evictions.
+
+        Pre-fix, only ``_bin_pack_models`` consulted ``_needs_reload``,
+        so a CRITICAL request for a just-evicted model with a stale
+        cooldown sat blocked until the cooldown expired.
+        ``_ensure_model_loaded`` (used by ``_handle_critical_preemption``
+        and ``_handle_unskippable_requests``) now mirrors the bypass.
+        """
+        from ollama_marshal.scheduler import _PreloadFailureState
+
+        sched = _make_scheduler()
+        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched.lifecycle.unload = AsyncMock(return_value=True)
+        sched._preload_failures["llama3:latest"] = _PreloadFailureState(
+            consecutive_failures=2,
+            cooldown_until=time.monotonic() + 60.0,
+        )
+        sched._needs_reload.add(("llama3:latest", _PRIMARY_INSTANCE_URL))
+        sched.memory.is_loaded_on.return_value = False
+
+        result = await sched._ensure_model_loaded("llama3:latest", num_ctx=None)
+
+        assert result is True
+        sched.lifecycle.preload.assert_called_once()
+        assert ("llama3:latest", _PRIMARY_INSTANCE_URL) not in sched._needs_reload
