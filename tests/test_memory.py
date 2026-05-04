@@ -933,6 +933,93 @@ class TestUnexpectedUnloadDetection:
         assert manager.unexpected_unloads_observed == 1
 
 
+class TestRecentUnexpectedUnloadsLedger:
+    """Per-(model, instance) eviction ledger added in v0.6.5 (Bug 4).
+
+    Two surfaces:
+    - ``take_recent_unexpected_unloads`` — drained by the scheduler each
+      tick to feed ``_needs_reload`` (drives next-tick reactivity).
+    - ``peek_recent_unexpected_unloads`` — non-draining ledger of every
+      eviction observed in this process; used by tests + diagnostics
+      so observers don't race the scheduler-tick drain.
+    """
+
+    def test_unexpected_unload_populates_recent_set(self):
+        manager = _make_manager()
+        _set_loaded(
+            manager,
+            {"mistral:latest": LoadedModel(name="mistral:latest", size_vram=1)},
+        )
+        _apply_ps(manager, {"models": []})
+
+        recent = manager.take_recent_unexpected_unloads()
+        assert recent == {("mistral:latest", _PRIMARY_URL)}
+
+    def test_take_recent_drains_set_but_peek_does_not(self):
+        manager = _make_manager()
+        _set_loaded(
+            manager,
+            {"a:1": LoadedModel(name="a:1", size_vram=1)},
+        )
+        _apply_ps(manager, {"models": []})
+
+        # peek is non-draining — repeated calls return the same record
+        assert manager.peek_recent_unexpected_unloads() == {("a:1", _PRIMARY_URL)}
+        assert manager.peek_recent_unexpected_unloads() == {("a:1", _PRIMARY_URL)}
+
+        # take drains the dispatch-set; subsequent take returns empty
+        assert manager.take_recent_unexpected_unloads() == {("a:1", _PRIMARY_URL)}
+        assert manager.take_recent_unexpected_unloads() == set()
+
+        # peek still shows the historical record — tests can observe
+        # without racing the scheduler tick that does the drain.
+        assert manager.peek_recent_unexpected_unloads() == {("a:1", _PRIMARY_URL)}
+
+    def test_intended_unload_does_not_populate_recent_set(self):
+        manager = _make_manager()
+        _set_loaded(
+            manager,
+            {"x:1": LoadedModel(name="x:1", size_vram=1)},
+        )
+        manager.mark_intended_unload("x:1")
+        _apply_ps(manager, {"models": []})
+
+        assert manager.take_recent_unexpected_unloads() == set()
+        assert manager.peek_recent_unexpected_unloads() == set()
+
+    def test_unexpected_unload_records_per_instance(self):
+        """Same model evicted on two instances yields two distinct records.
+
+        Bug 4's per-(model, instance) keying gives marshal the
+        granularity to issue one reload per evicted instance instead
+        of conflating all instances under one model name. Without
+        per-instance keys, a multi-instance setup couldn't tell which
+        instance lost the model.
+        """
+        manager = _make_multi_manager()
+        url_a = manager.instances[0].url
+        url_b = manager.instances[1].url
+        _set_loaded(
+            manager,
+            {"shared:1": LoadedModel(name="shared:1", size_vram=1)},
+            instance_url=url_a,
+        )
+        manager._loaded_models[url_b] = {
+            "shared:1": LoadedModel(name="shared:1", size_vram=1)
+        }
+        # Each instance independently observes /api/ps go empty.
+        manager._update_from_ps(url_a, {"models": []})
+        manager._update_from_ps(url_b, {"models": []})
+
+        peeked = manager.peek_recent_unexpected_unloads()
+        assert ("shared:1", url_a) in peeked
+        assert ("shared:1", url_b) in peeked
+        assert manager.take_recent_unexpected_unloads() == {
+            ("shared:1", url_a),
+            ("shared:1", url_b),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Multi-instance state (v0.5.0+)
 # ---------------------------------------------------------------------------

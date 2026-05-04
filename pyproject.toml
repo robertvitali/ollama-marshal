@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ollama-marshal"
-version = "0.6.4"
+version = "0.6.5"
 description = "Model-aware scheduling proxy for Ollama — eliminates model thrashing with intelligent FIFO + bin-packing scheduling"
 readme = "README.md"
 license = "Apache-2.0"
@@ -166,6 +166,7 @@ markers = [
     "integration: requires a running Ollama instance",
     "marshal_subprocess: integration test that spawns its own marshal subprocess",
     "marshal_prod: integration test that hits the live prod marshal at :11435",
+    "load: long-running load test (excluded from default suite; run with `make load-test`)",
 ]
 addopts = [
     "--strict-markers",

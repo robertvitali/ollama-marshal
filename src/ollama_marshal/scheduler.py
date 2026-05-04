@@ -530,6 +530,14 @@ class Scheduler:
         # ``PreloadFailedError`` so clients get clear feedback rather
         # than waiting forever.
         self._preload_failures: dict[str, _PreloadFailureState] = {}
+        # Per-(model, instance_url) reload requests fed by the memory
+        # poller's ``_recent_unexpected_unloads`` set. Drained at the
+        # top of every ``_tick`` and consumed by bin-packing — entries
+        # bypass the preload cooldown (the model was a known-good
+        # load that Ollama evicted, not a marshal preload failure)
+        # so requests for an evicted model don't sit waiting behind
+        # an unrelated cooldown window.
+        self._needs_reload: set[tuple[str, str]] = set()
 
     def is_paused(self) -> bool:
         """Return True if dispatch is currently paused.
@@ -728,6 +736,24 @@ class Scheduler:
             await self._tick_bypass_only()
             return
 
+        # Step 0: Pull any Ollama-side evictions surfaced by the memory
+        # poller into ``_needs_reload``. Bin-packing later in this tick
+        # (Step 4) skips the per-model cooldown for these so the just-
+        # evicted model gets a fresh preload immediately, instead of
+        # potentially waiting behind a preload-backoff window from an
+        # unrelated earlier failure. Pre-v0.6.5 the scheduler reacted
+        # to these evictions only on the next dispatch cycle that
+        # naturally tried to load the model — adding up to one full
+        # tick of latency between detection and reload.
+        evicted = self.memory.take_recent_unexpected_unloads()
+        for model, instance_url in evicted:
+            self._needs_reload.add((model, instance_url))
+            logger.info(
+                "scheduler.eviction_recorded_for_reload",
+                model=model,
+                instance=instance_url,
+            )
+
         # Step 1: Forward requests for models already loaded
         await self._forward_loaded_model_requests()
 
@@ -906,6 +932,8 @@ class Scheduler:
         model: str,
         num_ctx: int | None,
         instance_url: str,
+        *,
+        bypass_cooldown: bool = False,
     ) -> bool:
         """Wrap ``lifecycle.preload`` with cooldown + backoff + giveup.
 
@@ -918,8 +946,14 @@ class Scheduler:
         (``scheduler.ollama_forward_timeout_s``) through to
         ``lifecycle.preload`` so the load call shares the same
         wall-clock budget as forward calls.
+
+        ``bypass_cooldown`` (v0.6.5): when True, skip the per-model
+        cooldown check. Used by the bin-packer for models flagged in
+        ``_needs_reload`` (Ollama-side eviction, not a marshal preload
+        failure) so the eviction-triggered reload doesn't sit behind
+        a cooldown from an unrelated earlier failure.
         """
-        if self._is_in_preload_cooldown(model):
+        if not bypass_cooldown and self._is_in_preload_cooldown(model):
             return False
         success = await self.lifecycle.preload(
             model,
@@ -1124,12 +1158,21 @@ class Scheduler:
                 models_to_try.append(envelope.model)
 
         skipped_models: list[str] = []
+        # Models with any pending ``_needs_reload`` entry skip the
+        # cooldown gate — Ollama just evicted them, marshal didn't fail
+        # to load them, so the cooldown (which protects against marshal-
+        # preload-storm) doesn't apply.
+        reload_priority_models = {m for m, _ in self._needs_reload}
         for model in models_to_try:
             # Per-model preload backoff (v0.6.4+): if a recent preload
             # failed and the cooldown window hasn't passed, skip without
             # touching Ollama. Avoids the storm of ~10 preload calls/sec
-            # when Ollama is briefly unreachable.
-            if self._is_in_preload_cooldown(model):
+            # when Ollama is briefly unreachable. Bypass for any model
+            # the memory poller just flagged as evicted by Ollama (Bug 4,
+            # v0.6.5) — those weren't marshal-preload failures.
+            if model not in reload_priority_models and self._is_in_preload_cooldown(
+                model
+            ):
                 continue
             model_size = await self.registry.get_or_estimate_size(model)
             if self.memory.can_fit_model(model_size):
@@ -1149,10 +1192,23 @@ class Scheduler:
                     num_ctx=num_ctx,
                     instance=decision.instance.url,
                     routing_reason=decision.reason.value,
+                    needs_reload=model in reload_priority_models,
                 )
                 success = await self._attempt_preload(
-                    model, num_ctx=num_ctx, instance_url=decision.instance.url
+                    model,
+                    num_ctx=num_ctx,
+                    instance_url=decision.instance.url,
+                    bypass_cooldown=model in reload_priority_models,
                 )
+                # Drop the matching (model, instance) entry whether
+                # success or failure. Two reasons: (a) on failure, leaving
+                # the entry would re-bypass the cooldown next tick and
+                # convert v0.6.4's jittered backoff into per-tick
+                # hammering against a flapping Ollama; (b) on success,
+                # only the chosen instance is freshly loaded — entries
+                # for other instances must survive so each gets its own
+                # reload chance on a future tick.
+                self._needs_reload.discard((model, decision.instance.url))
                 if success:
                     self.metrics.model_swaps += 1
                     if num_ctx is not None:
@@ -1312,7 +1368,12 @@ class Scheduler:
         # within the cooldown window. Without the early return,
         # ``_evict_one`` would tear down loaded models to make room for
         # a preload that immediately gets skipped, leaving VRAM empty.
-        if self._is_in_preload_cooldown(model):
+        # Bug 4 (v0.6.5): bypass the cooldown when the memory poller
+        # flagged this model as Ollama-side evicted — that wasn't a
+        # marshal preload failure, so the cooldown shouldn't park
+        # CRITICAL/unskippable preemption either.
+        bypass_cooldown = any(m == model for m, _ in self._needs_reload)
+        if not bypass_cooldown and self._is_in_preload_cooldown(model):
             return False
 
         decision = await self._resolve_routing(model, num_ctx)
@@ -1379,8 +1440,15 @@ class Scheduler:
                 return False
 
         success = await self._attempt_preload(
-            model, num_ctx=num_ctx, instance_url=chosen_url
+            model,
+            num_ctx=num_ctx,
+            instance_url=chosen_url,
+            bypass_cooldown=bypass_cooldown,
         )
+        # Drop the matching (model, instance) eviction record either
+        # way — same rationale as bin-pack: leaving it on failure
+        # converts the v0.6.4 jittered backoff into per-tick hammering.
+        self._needs_reload.discard((model, chosen_url))
         if success:
             self.metrics.model_swaps += 1
             if is_reload:

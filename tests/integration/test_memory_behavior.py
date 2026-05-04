@@ -706,10 +706,14 @@ async def test_unexpected_unload_detection(tmp_marshal_paths, cleanup_models):
                 description="model loaded",
             )
             assert app.state._marshal_internals.memory.is_loaded(REQUIRED_MODEL)
-            baseline = app.state._marshal_internals.scheduler.metrics.unexpected_unloads
+            memory = app.state._marshal_internals.memory
+            instance_url = memory.find_instance_for(REQUIRED_MODEL)
+            assert instance_url is not None, (
+                "REQUIRED_MODEL should be loaded on a known instance"
+            )
 
             # Fake /api/ps to return empty. Next poll (≤1s) detects
-            # the disappearance and counts it as unexpected.
+            # the disappearance and records it in the per-model ledger.
             proxy.fake_response("/api/ps", body={"models": []}, times=3)
 
             # Wait for OUR model to disappear from _loaded_models —
@@ -721,11 +725,21 @@ async def test_unexpected_unload_detection(tmp_marshal_paths, cleanup_models):
                 timeout=10,
                 description="model disappeared from _loaded_models",
             )
-            delta = (
-                app.state._marshal_internals.scheduler.metrics.unexpected_unloads
-                - baseline
+            # v0.6.5 (Bug 4): assert per-model rather than the global
+            # counter delta. The previous `delta >= 1` assertion against
+            # `scheduler.metrics.unexpected_unloads` had two failure
+            # modes — cross-model collision (prod marshal's own evictions
+            # bumped the counter mid-test, capturing baseline at "+N
+            # already") and a drain-lag race (counter was the drained-
+            # into metric; `wait_for(not is_loaded)` returned before the
+            # next scheduler tick had drained). The non-draining
+            # ``_observed_unexpected_unloads`` ledger keyed by
+            # (model, instance) is immune to both.
+            observed = memory.peek_recent_unexpected_unloads()
+            assert (REQUIRED_MODEL, instance_url) in observed, (
+                f"expected ({REQUIRED_MODEL!r}, {instance_url!r}) recorded "
+                f"as unexpectedly unloaded; got {observed}"
             )
-            assert delta >= 1, f"expected ≥1 unexpected unload, got delta={delta}"
 
 
 # ---------------------------------------------------------------------

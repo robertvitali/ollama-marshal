@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import psutil
 import structlog
 from fastapi import FastAPI, Request, Response
@@ -30,7 +31,7 @@ from ollama_marshal.openai_compat import (
     parse_openai_completion_request,
     parse_openai_embedding_request,
 )
-from ollama_marshal.queue import ModelQueues, RequestEnvelope
+from ollama_marshal.queue import ModelQueues, PreloadFailedError, RequestEnvelope
 from ollama_marshal.registry import ModelRegistry
 from ollama_marshal.scheduler import Scheduler, SchedulerMetrics
 from ollama_marshal.stream import forward_passthrough
@@ -1029,6 +1030,76 @@ def _resolve_forward_timeout(request: Request) -> int:
     return 3600
 
 
+def _http_status_for_error(exc: BaseException) -> int:
+    """Map a forward-side exception class to an HTTP status code.
+
+    The granularity matters because operators triage by status: a 504
+    ("Ollama took too long") points at model size or num_ctx; a 503
+    ("can't reach Ollama" or "couldn't load model") points at process
+    or VRAM state; a 502 (default) points at protocol or unknown.
+    Pre-v0.6.5 every failure surfaced as 502.
+
+    The httpx parent classes ``TimeoutException`` and ``NetworkError``
+    are matched (not just ``ReadTimeout`` / ``ConnectError``) so the
+    less common siblings — ``ConnectTimeout``, ``WriteTimeout``,
+    ``PoolTimeout``, ``ReadError``, ``WriteError`` — get the right
+    code instead of silently falling through to 502.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return 504
+    if isinstance(exc, httpx.NetworkError | PreloadFailedError):
+        return 503
+    return 502
+
+
+def _build_error_response(
+    envelope: RequestEnvelope,
+    model: str,
+    *,
+    openai_compat: bool,
+) -> JSONResponse:
+    """Build the JSONResponse for a failed envelope with consistent shape.
+
+    Both Ollama-native and OpenAI-compat paths derive ``error_type``
+    from the exception class and ``status`` from
+    ``_http_status_for_error``. The body shape switches: Ollama-native
+    returns a flat ``{error, error_type, model}`` and OpenAI-compat
+    preserves the spec envelope ``{error: {message, type, code}}``
+    with ``type`` pinned to the slug ``"proxy_error"`` (matching
+    OpenAI's ``invalid_request_error`` / ``rate_limit_error``
+    convention) and the actual exception class name in
+    ``error.exception_type`` so clients matching on the slug stay
+    backwards-compatible.
+    """
+    err = envelope.error
+    err_type = type(err).__name__ if err is not None else "UnknownError"
+    err_msg = (str(err) if err is not None else "") or err_type
+    status = _http_status_for_error(err) if err is not None else 502
+    logger.error(
+        "server.request_error",
+        model=model,
+        error=err_msg,
+        error_type=err_type,
+        status=status,
+    )
+    if openai_compat:
+        return JSONResponse(
+            {
+                "error": {
+                    "message": err_msg,
+                    "type": "proxy_error",
+                    "code": "proxy_error",
+                    "exception_type": err_type,
+                }
+            },
+            status_code=status,
+        )
+    return JSONResponse(
+        {"error": err_msg, "error_type": err_type, "model": model},
+        status_code=status,
+    )
+
+
 async def _enqueue_inference(
     request: Request,
     body: dict[str, Any],
@@ -1114,15 +1185,7 @@ async def _enqueue_inference(
     await envelope.done_event.wait()
 
     if envelope.error:
-        logger.error(
-            "server.request_error",
-            model=model,
-            error=str(envelope.error),
-        )
-        return JSONResponse(
-            {"error": "Internal proxy error"},
-            status_code=502,
-        )
+        return _build_error_response(envelope, model, openai_compat=False)
 
     response = envelope.response
     if stream and hasattr(response, "__aiter__"):
@@ -1220,10 +1283,7 @@ async def _enqueue_and_wait(
     await envelope.done_event.wait()
 
     if envelope.error:
-        return JSONResponse(
-            {"error": {"message": "Internal proxy error", "type": "proxy_error"}},
-            status_code=502,
-        )
+        return _build_error_response(envelope, model, openai_compat=True)
 
     response = envelope.response
     if stream and hasattr(response, "__aiter__"):
