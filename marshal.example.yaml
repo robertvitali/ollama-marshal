@@ -201,6 +201,13 @@ context:
 # even during pause. Resume drops the flag and the scheduler drains
 # the accumulated queue at full speed. Default OFF — operators opt
 # in by setting both pause_endpoints_enabled AND admin_token.
+#
+# Integration test contributors: enable both pause_endpoints_enabled
+# and admin_token, then write the values to ~/.ollama-marshal/admin-
+# tokens.env (chmod 600). The v0.6.3+ autouse pytest fixture
+# `pause_local_prod_marshal` reads from that file (no need to source
+# it) and pauses local prod marshal at :11435 for the duration of
+# the integration suite, preventing cross-suite VRAM contention.
 admin:
   pause_endpoints_enabled: false   # MARSHAL_ADMIN_PAUSE_ENDPOINTS_ENABLED
                                    # — expose POST /api/marshal/admin/{pause,resume}.
