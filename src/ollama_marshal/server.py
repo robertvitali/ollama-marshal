@@ -127,6 +127,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Start background tasks
         await _memory.start_polling()
         await _registry.initialize()
+        # Begin periodic /api/tags polling so an `ollama rm <model>`
+        # while marshal is running shows up in `_known_models` within
+        # one interval — request entry then fail-fasts with 404
+        # instead of preload-looping into 502.
+        await _registry.start_polling(_config.scheduler.model_detect_interval)
         # Benchmark task is gated by config so integration tests can opt
         # out — running the full per-model load/unload sweep through a
         # fault-injection proxy saturates the upstream and turns
@@ -200,6 +205,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         await _scheduler.stop()
         await _memory.stop_polling()
+        await _registry.stop_polling()
 
         if _config.shutdown.unload_models:
             loaded = list(_memory.get_loaded_models().keys())

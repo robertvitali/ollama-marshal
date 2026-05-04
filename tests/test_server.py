@@ -1568,6 +1568,8 @@ def _make_mock_components():
     registry = MagicMock()
     registry.initialize = AsyncMock()
     registry.benchmark_unknown = AsyncMock()
+    registry.start_polling = AsyncMock()
+    registry.stop_polling = AsyncMock()
 
     lifecycle = MagicMock()
     lifecycle.unload_all = AsyncMock()
@@ -1602,10 +1604,16 @@ class TestLifespan:
             async with server_mod.lifespan(app):
                 memory.start_polling.assert_called_once()
                 registry.initialize.assert_called_once()
+                # v0.6.6: registry polls /api/tags so external model
+                # adds/removals propagate without process restart.
+                registry.start_polling.assert_called_once_with(
+                    config.scheduler.model_detect_interval
+                )
                 scheduler.start.assert_called_once()
 
             scheduler.stop.assert_called_once()
             memory.stop_polling.assert_called_once()
+            registry.stop_polling.assert_called_once()
 
     async def test_lifespan_drain_mode(self):
         config = MarshalConfig(

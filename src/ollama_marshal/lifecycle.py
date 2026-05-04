@@ -12,6 +12,7 @@ working without modification. The scheduler always passes an explicit
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -55,6 +56,7 @@ class ModelLifecycle:
         num_ctx: int | None = None,
         instance_url: str | None = None,
         load_timeout_s: int | None = None,
+        is_known_model_check: Callable[[str], Awaitable[bool]] | None = None,
     ) -> bool:
         """Preload a model into Ollama's VRAM.
 
@@ -78,12 +80,52 @@ class ModelLifecycle:
                 call in seconds. None falls back to the
                 ``_LOAD_TIMEOUT`` default. Production call sites pass
                 ``scheduler.ollama_forward_timeout_s`` through.
+            is_known_model_check: Optional async predicate that returns
+                True if `model` is currently installed in Ollama.
+                When provided and returning False, the preload skips
+                the /api/generate call and returns False immediately
+                — defense in depth against `ollama rm <model>` between
+                request entry and preload time, which would otherwise
+                drive lifecycle into a /api/generate loop that retries
+                until the model gives up. Production call sites in
+                the scheduler pass `registry.is_known_model`.
 
         Returns:
             True if the model was successfully loaded.
         """
         host = self._resolve_host(instance_url)
         timeout = _LOAD_TIMEOUT if load_timeout_s is None else load_timeout_s
+
+        if is_known_model_check is not None:
+            # Defense in depth must itself be defensive. A malformed
+            # /api/tags response (e.g. a proxy mid-flight returning a
+            # text/plain error page) makes the underlying httpx
+            # `.json()` raise `json.JSONDecodeError` (a `ValueError`)
+            # — outside the existing `httpx.HTTPError` catch in
+            # registry.is_known_model. Without this wrap, that
+            # exception would propagate into the scheduler tick and
+            # poison the dispatcher. Fail-open on any predicate error:
+            # better to attempt the preload (and let Ollama answer the
+            # truth) than to hard-fail the request on a transient
+            # registry hiccup.
+            try:
+                known = await is_known_model_check(model)
+            except Exception:
+                logger.warning(
+                    "lifecycle.is_known_model_check_failed",
+                    model=model,
+                    instance=host,
+                    exc_info=True,
+                )
+                known = True
+            if not known:
+                logger.warning(
+                    "lifecycle.preload_skipped_unknown_model",
+                    model=model,
+                    instance=host,
+                )
+                return False
+
         logger.info(
             "lifecycle.preloading",
             model=model,

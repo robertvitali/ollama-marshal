@@ -48,6 +48,8 @@ def _make_mock_components():
     registry = MagicMock()
     registry.initialize = AsyncMock()
     registry.benchmark_unknown = AsyncMock()
+    registry.start_polling = AsyncMock()
+    registry.stop_polling = AsyncMock()
 
     lifecycle = MagicMock()
     lifecycle.unload_all = AsyncMock()

@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -501,6 +501,7 @@ class TestBinPackModels:
             num_ctx=None,
             instance_url=_PRIMARY_INSTANCE_URL,
             load_timeout_s=3600,
+            is_known_model_check=ANY,
         )
         assert sched.metrics.model_swaps == 1
         memory.refresh.assert_called_once()
@@ -780,6 +781,7 @@ class TestEnsureModelLoaded:
             num_ctx=None,
             instance_url=_PRIMARY_INSTANCE_URL,
             load_timeout_s=3600,
+            is_known_model_check=ANY,
         )
         assert sched.metrics.model_swaps == 1
 
@@ -1407,6 +1409,7 @@ class TestEnsureModelLoadedReloadOnNeed:
             num_ctx=32768,
             instance_url=_PRIMARY_INSTANCE_URL,
             load_timeout_s=3600,
+            is_known_model_check=ANY,
         )
         memory.record_allocated_num_ctx.assert_called_with(
             "llama3:latest", 32768, instance_url=_PRIMARY_INSTANCE_URL
@@ -2873,6 +2876,7 @@ class TestPreloadBackoffStateMachine:
             num_ctx=None,
             instance_url=_PRIMARY_INSTANCE_URL,
             load_timeout_s=1234,
+            is_known_model_check=ANY,
         )
 
     async def test_ensure_model_loaded_short_circuits_during_cooldown(self):

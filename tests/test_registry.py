@@ -288,6 +288,60 @@ class TestFetchModelList:
 
         assert result == []
 
+    async def test_returns_empty_on_non_json_body(self, registry):
+        # Defensive parsing (v0.6.6 Bug 6): a fault-injection proxy
+        # mid-flight or an upstream error page can return a non-JSON
+        # body. Without the defensive guard, resp.json() raises
+        # ValueError (json.JSONDecodeError) and would propagate out
+        # of every caller — including is_known_model's resync, where
+        # only httpx.HTTPError was previously caught.
+        mock_resp = MagicMock(spec=httpx.Response)
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.side_effect = ValueError("Expecting value")
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            result = await registry._fetch_model_list()
+
+        assert result == []
+
+    async def test_returns_empty_on_non_dict_body(self, registry):
+        # Same defense — Ollama returning a list (or string) at the
+        # top level instead of {"models": [...]}.
+        mock_resp = MagicMock(spec=httpx.Response)
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = ["unexpected", "list"]
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            result = await registry._fetch_model_list()
+
+        assert result == []
+
+    async def test_skips_malformed_model_entries(self, registry):
+        # Some entries malformed (missing name, wrong type) — keep
+        # well-formed ones, drop the rest, never crash.
+        mock_resp = MagicMock(spec=httpx.Response)
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "models": [
+                {"name": "llama3:latest"},
+                {"missing-name": "x"},
+                "not-a-dict",
+                {"name": 12345},  # name not a string
+                {"name": "mistral:latest"},
+            ]
+        }
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            result = await registry._fetch_model_list()
+
+        assert result == ["llama3:latest", "mistral:latest"]
+
 
 # ---------------------------------------------------------------------------
 # _sync_with_ollama
@@ -1150,3 +1204,220 @@ class TestGetTotalFootprint:
         size = await registry.get_total_footprint("x:1", 1024, KVCacheType.F16)
         # Equal to model size (KV slot contribution falls back to 0).
         assert size == 4 * 1024**3
+
+
+# ---------------------------------------------------------------------------
+# Periodic /api/tags polling (v0.6.6 — Bug 6)
+# ---------------------------------------------------------------------------
+
+
+class TestKnownModelsPolling:
+    """Background poll loop that keeps `_known_models` fresh against /api/tags."""
+
+    async def test_start_polling_creates_task(self, registry):
+        await registry.start_polling(poll_interval_s=60)
+        assert registry._poll_task is not None
+        assert not registry._poll_task.done()
+        await registry.stop_polling()
+
+    async def test_start_polling_is_idempotent(self, registry):
+        await registry.start_polling(poll_interval_s=60)
+        first_task = registry._poll_task
+        await registry.start_polling(poll_interval_s=60)
+        # Second call must not replace the running task.
+        assert registry._poll_task is first_task
+        await registry.stop_polling()
+
+    async def test_stop_polling_idempotent_when_never_started(self, registry):
+        await registry.stop_polling()
+        assert registry._poll_task is None
+
+    async def test_stop_polling_cancels_task(self, registry):
+        await registry.start_polling(poll_interval_s=3600)
+        task = registry._poll_task
+        await registry.stop_polling()
+        assert registry._poll_task is None
+        assert task is not None
+        assert task.done()
+
+    async def test_poll_loop_calls_sync(self, registry):
+        # Use an Event signalled from inside the patched sync to make
+        # this test deterministic — no reliance on asyncio scheduler
+        # cadence under loaded CI.
+        import asyncio as _asyncio
+
+        first_call = _asyncio.Event()
+
+        async def signal_first() -> None:
+            first_call.set()
+
+        with patch.object(registry, "_sync_with_ollama", side_effect=signal_first):
+            await registry.start_polling(poll_interval_s=0.01)
+            await _asyncio.wait_for(first_call.wait(), timeout=2.0)
+            await registry.stop_polling()
+
+        # If we reach here, the loop fired at least once. No tick-count
+        # assertion needed — the await-with-timeout IS the assertion.
+
+    async def test_poll_loop_swallows_unexpected_exception(self, registry):
+        # Errors must not kill the loop — observability via warning log
+        # only. Otherwise a single bad poll would freeze the known-models
+        # view until process restart.
+        import asyncio as _asyncio
+
+        second_call = _asyncio.Event()
+        call_count = 0
+
+        async def boom() -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("first poll explodes")
+            second_call.set()
+
+        with patch.object(registry, "_sync_with_ollama", side_effect=boom):
+            await registry.start_polling(poll_interval_s=0.01)
+            # Wait for the SECOND call to land — proves the loop kept
+            # ticking after the first call raised.
+            await _asyncio.wait_for(second_call.wait(), timeout=2.0)
+            await registry.stop_polling()
+
+        assert call_count >= 2
+
+
+class TestSyncWithOllamaPeriodic:
+    """Re-running `_sync_with_ollama` keeps `_known_models` aligned with /api/tags."""
+
+    async def test_first_sync_seeds_known_models(self, populated_registry):
+        # Before any sync the set is empty and last_sync is sentinel-zero.
+        assert populated_registry._known_models == set()
+        assert populated_registry._known_models_last_sync == 0.0
+
+        with patch.object(
+            populated_registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            return_value=["llama3:latest", "codellama:latest", "mistral:latest"],
+        ):
+            await populated_registry._sync_with_ollama()
+
+        assert populated_registry._known_models == {
+            "llama3:latest",
+            "codellama:latest",
+            "mistral:latest",
+        }
+        assert populated_registry._known_models_last_sync > 0.0
+
+    async def test_subsequent_sync_picks_up_added_model(self, populated_registry):
+        # First sync seeds.
+        with patch.object(
+            populated_registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            return_value=["llama3:latest", "codellama:latest"],
+        ):
+            await populated_registry._sync_with_ollama()
+        # Second sync sees a new model — should be added.
+        with patch.object(
+            populated_registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            return_value=["llama3:latest", "codellama:latest", "newly-pulled:latest"],
+        ):
+            await populated_registry._sync_with_ollama()
+
+        assert "newly-pulled:latest" in populated_registry._known_models
+
+    async def test_concurrent_syncs_serialized_by_lock(self, populated_registry):
+        # v0.6.6 Bug 6: when two _sync_with_ollama callers race (the
+        # periodic poll loop + is_known_model's opportunistic resync),
+        # their /api/tags responses can arrive out of order and the
+        # earlier snapshot can overwrite the later one — falsely
+        # pruning a freshly-pulled model. The _sync_lock prevents
+        # overlap; this test asserts that two concurrent calls end up
+        # serialized.
+        import asyncio as _asyncio
+
+        in_flight = 0
+        max_in_flight = 0
+        gate = _asyncio.Event()
+
+        async def slow_fetch() -> list[str]:
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            # Hold the critical section open long enough that a
+            # concurrent caller without serialization would also enter.
+            await gate.wait()
+            in_flight -= 1
+            return ["llama3:latest", "codellama:latest"]
+
+        with patch.object(
+            populated_registry,
+            "_fetch_model_list",
+            side_effect=slow_fetch,
+        ):
+            t1 = _asyncio.create_task(populated_registry._sync_with_ollama())
+            t2 = _asyncio.create_task(populated_registry._sync_with_ollama())
+            # Yield enough times for both tasks to attempt entry.
+            for _ in range(5):
+                await _asyncio.sleep(0)
+            gate.set()
+            await _asyncio.gather(t1, t2)
+
+        assert max_in_flight == 1, (
+            f"_sync_with_ollama must be serialized; observed "
+            f"{max_in_flight} concurrent fetches"
+        )
+
+    async def test_external_removal_prunes_known_models(self, populated_registry):
+        # First sync seeds.
+        with patch.object(
+            populated_registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            return_value=["llama3:latest", "codellama:latest"],
+        ):
+            await populated_registry._sync_with_ollama()
+        assert "codellama:latest" in populated_registry._known_models
+
+        # Simulate `ollama rm codellama:latest` — second sync sees only one.
+        with patch.object(
+            populated_registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            return_value=["llama3:latest"],
+        ):
+            await populated_registry._sync_with_ollama()
+
+        assert "codellama:latest" not in populated_registry._known_models
+        # Disk caches also pruned for the removed model.
+        assert "codellama:latest" not in populated_registry._sizes
+
+    async def test_no_changes_skips_disk_save(self, populated_registry):
+        # First sync establishes baseline.
+        with patch.object(
+            populated_registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            return_value=["llama3:latest", "codellama:latest"],
+        ):
+            await populated_registry._sync_with_ollama()
+
+        # Second sync with identical list must not rewrite either cache
+        # file — sizes nor metadata. Patching both ensures the
+        # invariant holds across both on-disk caches.
+        with (
+            patch.object(
+                populated_registry,
+                "_fetch_model_list",
+                new_callable=AsyncMock,
+                return_value=["llama3:latest", "codellama:latest"],
+            ),
+            patch.object(populated_registry, "_save_cache") as mock_save,
+            patch.object(populated_registry, "_save_metadata_cache") as mock_save_meta,
+        ):
+            await populated_registry._sync_with_ollama()
+
+        mock_save.assert_not_called()
+        mock_save_meta.assert_not_called()

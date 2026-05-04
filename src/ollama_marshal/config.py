@@ -181,7 +181,14 @@ class SchedulerConfig(BaseModel):
     )
     model_detect_interval: int = Field(
         default=30,
-        description="Seconds between /api/tags polls for new models",
+        ge=1,
+        description=(
+            "Seconds between /api/tags polls for model adds/removals. "
+            "Drives ModelRegistry's periodic refresh: a removed model "
+            "(`ollama rm`) starts fail-fasting with 404 within this window "
+            "instead of preload-looping into 502. Minimum 1s — values "
+            "below would tight-loop /api/tags."
+        ),
     )
     idle_eviction_minutes: int = Field(
         default=15,

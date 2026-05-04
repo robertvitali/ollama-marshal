@@ -139,6 +139,60 @@ class TestPreload:
 
         assert result is False
 
+    async def test_preload_short_circuits_when_model_unknown(self, lifecycle):
+        # Defense in depth (v0.6.6): when a known-model predicate is
+        # passed and returns False, preload must not hit /api/generate
+        # at all — the model has been removed from Ollama and the
+        # subsequent load loop would just retry until the giveup
+        # threshold.
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post = AsyncMock()
+        mock_client.get = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def predicate(model: str) -> bool:
+            return False
+
+        with patch(
+            "ollama_marshal.lifecycle.httpx.AsyncClient", return_value=mock_client
+        ):
+            result = await lifecycle.preload(
+                "uninstalled:model", is_known_model_check=predicate
+            )
+
+        assert result is False
+        mock_client.post.assert_not_awaited()
+        mock_client.get.assert_not_awaited()
+
+    async def test_preload_proceeds_when_model_known(self, lifecycle):
+        # Sanity check: a True predicate must NOT block the normal path.
+        mock_post_response = MagicMock(spec=httpx.Response)
+        mock_ps_response = MagicMock(spec=httpx.Response)
+        mock_ps_response.json.return_value = {
+            "models": [{"name": "llama3:latest", "model": "llama3:latest"}]
+        }
+        mock_ps_response.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post = AsyncMock(return_value=mock_post_response)
+        mock_client.get = AsyncMock(return_value=mock_ps_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def predicate(model: str) -> bool:
+            return True
+
+        with patch(
+            "ollama_marshal.lifecycle.httpx.AsyncClient", return_value=mock_client
+        ):
+            result = await lifecycle.preload(
+                "llama3:latest", is_known_model_check=predicate
+            )
+
+        assert result is True
+        mock_client.post.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # unload

@@ -955,11 +955,17 @@ class Scheduler:
         """
         if not bypass_cooldown and self._is_in_preload_cooldown(model):
             return False
+        # Defense in depth: server.py's _is_known_model fail-fast at
+        # request entry catches the common case, but a model removed
+        # from Ollama between enqueue and preload time would otherwise
+        # ride the full retry budget. Passing the registry predicate
+        # through makes lifecycle short-circuit before /api/generate.
         success = await self.lifecycle.preload(
             model,
             num_ctx=num_ctx,
             instance_url=instance_url,
             load_timeout_s=self.config.scheduler.ollama_forward_timeout_s,
+            is_known_model_check=self.registry.is_known_model,
         )
         if success:
             self._clear_preload_failure(model)

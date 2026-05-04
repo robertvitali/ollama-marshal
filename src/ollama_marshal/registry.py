@@ -18,6 +18,7 @@ Tracks three pieces of per-model state:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import asdict, dataclass, field
@@ -187,6 +188,28 @@ class ModelRegistry:
         # (which only contains benchmarked models) and `_metadata` (probed).
         self._known_models: set[str] = set()
         self._known_models_last_sync: float = 0.0
+        # Background polling task that periodically calls
+        # _sync_with_ollama. Started by start_polling() in the server
+        # lifespan; without it, _known_models would only refresh at
+        # startup and on opportunistic miss in is_known_model().
+        # Without periodic refresh, an `ollama rm <model>` while marshal
+        # is running leaves the registry stale until restart, causing
+        # subsequent requests for the removed model to preload-loop
+        # into 502 instead of fail-fast 404.
+        self._poll_task: asyncio.Task[None] | None = None
+        self._poll_interval_s: float = 0.0
+        # Serializes _sync_with_ollama against itself so concurrent
+        # callers (the periodic poll loop + is_known_model's
+        # opportunistic resync) can't race on out-of-order /api/tags
+        # responses. Without the lock, two in-flight fetches could
+        # commit snapshots in arbitrary order — the LATER fetch (with
+        # newer state) might be overwritten by the EARLIER fetch's
+        # response, falsely pruning a freshly-pulled model from
+        # _known_models AND _sizes/_metadata on disk. The race is
+        # cheap to trigger when poll_interval_s is short (integration
+        # tests) and reachable in production whenever an unknown-model
+        # request arrives during a periodic poll.
+        self._sync_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Load cached registry and sync with current Ollama models."""
@@ -264,38 +287,140 @@ class ModelRegistry:
     async def _sync_with_ollama(self) -> None:
         """Sync the registry against models currently downloaded in Ollama.
 
-        Removes entries for models no longer present. New models are
-        identified but not benchmarked here (call benchmark_unknown for that).
-        Also refreshes `_known_models` (the fail-fast lookup set used by
-        `is_known_model`).
+        Refreshes `_known_models` (the fail-fast lookup set used by
+        `is_known_model`) and prunes stale entries from the on-disk
+        caches. Called both at startup (from `initialize`) and on a
+        background poll loop (`start_polling`) so model adds/removals
+        in Ollama show up within one poll interval.
+
+        Serialized via `_sync_lock` so the periodic poll can't race
+        with `is_known_model`'s opportunistic resync — concurrent
+        in-flight /api/tags fetches whose responses arrive out of
+        order would otherwise commit older state on top of newer,
+        falsely pruning freshly-pulled models from `_known_models`
+        and the on-disk caches.
+
+        Logging is delta-aware: the first sync logs the full inventory
+        of un-benchmarked models (so startup output matches v0.6.5
+        behavior), and subsequent syncs log only models that were
+        added or removed since the previous sync. Without that, every
+        poll cycle would re-emit the full un-benchmarked list.
         """
-        try:
-            current_models = await self._fetch_model_list()
-        except httpx.HTTPError:
-            logger.warning("model_registry.sync_failed", reason="cannot reach Ollama")
+        async with self._sync_lock:
+            try:
+                current_models = await self._fetch_model_list()
+            except httpx.HTTPError:
+                logger.warning(
+                    "model_registry.sync_failed", reason="cannot reach Ollama"
+                )
+                return
+
+            new_set = set(current_models)
+            is_first_sync = self._known_models_last_sync == 0.0
+            added = new_set - self._known_models
+            removed = self._known_models - new_set
+
+            # Refresh the source-of-truth set used by is_known_model().
+            self._known_models = new_set
+            self._known_models_last_sync = time.monotonic()
+
+            # Remove entries for deleted models (from both on-disk caches).
+            stale = set(self._sizes.keys()) - new_set
+            meta_stale = set(self._metadata.keys()) - new_set
+            for model in stale:
+                del self._sizes[model]
+            for model in meta_stale:
+                del self._metadata[model]
+
+            if stale:
+                self._save_cache()
+            if meta_stale:
+                self._save_metadata_cache()
+
+            if is_first_sync:
+                unknown = new_set - set(self._sizes.keys())
+                if unknown:
+                    logger.info(
+                        "model_registry.new_models_found", models=sorted(unknown)
+                    )
+                # Pre-Bug-6, the per-model `removed_stale` log fired here.
+                # The delta-aware refactor accidentally muted it for the
+                # startup path — operators tuning a fresh marshal lose
+                # visibility into "we deleted these from disk because
+                # they're no longer in Ollama". Restore an aggregate
+                # version so the audit trail stays complete.
+                if stale or meta_stale:
+                    logger.info(
+                        "model_registry.removed_stale_at_startup",
+                        models=sorted(stale | meta_stale),
+                    )
+            else:
+                if added:
+                    logger.info("model_registry.models_added", models=sorted(added))
+                if removed:
+                    logger.info("model_registry.models_removed", models=sorted(removed))
+
+    async def start_polling(self, poll_interval_s: float) -> None:
+        """Begin periodic /api/tags polling so model adds/removals show up live.
+
+        Called from the server lifespan after `initialize`. The poll
+        loop fires `_sync_with_ollama` every `poll_interval_s` seconds.
+        Calling twice without `stop_polling` between is a no-op (the
+        existing task wins).
+
+        Args:
+            poll_interval_s: Seconds between /api/tags polls. Pulled
+                from `config.scheduler.model_detect_interval` in the
+                production wiring; tests pass smaller values to keep
+                wall-clock low.
+        """
+        if self._poll_task is not None and not self._poll_task.done():
             return
+        self._poll_interval_s = poll_interval_s
+        self._poll_task = asyncio.create_task(self._poll_loop())
+        logger.info("model_registry.polling_started", interval_s=poll_interval_s)
 
-        # Refresh the source-of-truth set used by is_known_model().
-        self._known_models = set(current_models)
-        self._known_models_last_sync = time.monotonic()
+    async def stop_polling(self) -> None:
+        """Stop the background polling task. Idempotent.
 
-        # Remove entries for deleted models (from both on-disk caches).
-        stale = set(self._sizes.keys()) - set(current_models)
-        meta_stale = set(self._metadata.keys()) - set(current_models)
-        for model in stale:
-            del self._sizes[model]
-            logger.info("model_registry.removed_stale", model=model)
-        for model in meta_stale:
-            del self._metadata[model]
+        Catches any exception from the awaited task (not just
+        `CancelledError`) so a poll task that died with an unforeseen
+        error class doesn't break the surrounding `lifespan` finally
+        block — which would otherwise skip subsequent shutdown steps
+        like `unload_models`.
+        """
+        if self._poll_task is None:
+            return
+        self._poll_task.cancel()
+        try:
+            await self._poll_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # Catch (don't swallow silently) so an unforeseen poll
+            # task failure doesn't break the surrounding lifespan
+            # finally and skip subsequent shutdown steps.
+            logger.warning("model_registry.poll_task_died", exc_info=True)
+        self._poll_task = None
+        logger.info("model_registry.polling_stopped")
 
-        if stale:
-            self._save_cache()
-        if meta_stale:
-            self._save_metadata_cache()
+    async def _poll_loop(self) -> None:
+        """Continuously call `_sync_with_ollama` at the configured interval.
 
-        unknown = set(current_models) - set(self._sizes.keys())
-        if unknown:
-            logger.info("model_registry.new_models_found", models=sorted(unknown))
+        `_sync_with_ollama` already swallows `httpx.HTTPError`. The
+        outer `except Exception` is a defense-in-depth net for
+        anything else (e.g. `OSError` from `_save_cache` on a full
+        disk) so one bad poll doesn't kill the loop and silently
+        freeze the known-models view until restart. `CancelledError`
+        is a `BaseException` and falls through naturally — that's how
+        `stop_polling` ends the task.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._poll_interval_s)
+                await self._sync_with_ollama()
+            except Exception:
+                logger.warning("model_registry.poll_error", exc_info=True)
 
     async def fetch_model_list(self) -> list[str]:
         """Fetch the list of downloaded model names from Ollama (public API).
@@ -305,14 +430,48 @@ class ModelRegistry:
         method — `_fetch_model_list` is preserved as a thin alias for
         backwards compatibility with existing tests.
 
+        Defensively parses the response: a malformed body (proxy
+        mid-flight returning a text/plain error page, missing
+        `"models"`, non-list `"models"`, model entries missing
+        `"name"`) returns an empty list with a warning rather than
+        propagating `JSONDecodeError`/`KeyError`/`TypeError` up
+        through callers that only catch `httpx.HTTPError`.
+
         Returns:
-            List of model name strings.
+            List of model name strings (empty on malformed response).
         """
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{self.ollama_host}/api/tags", timeout=10)
             resp.raise_for_status()
-            data = resp.json()
-            return [m["name"] for m in data.get("models", [])]
+            try:
+                data = resp.json()
+            except ValueError:
+                # JSONDecodeError is a subclass of ValueError. A
+                # non-JSON body shouldn't be possible from real Ollama,
+                # but a fault-injection proxy or upstream error page
+                # can produce one — surface the trust-boundary
+                # violation rather than crashing the caller.
+                logger.warning(
+                    "model_registry.tags_malformed_json",
+                    host=self.ollama_host,
+                )
+                return []
+        if not isinstance(data, dict):
+            logger.warning(
+                "model_registry.tags_malformed_shape", got=type(data).__name__
+            )
+            return []
+        models_raw = data.get("models", [])
+        if not isinstance(models_raw, list):
+            logger.warning("model_registry.tags_malformed_shape", got="models-not-list")
+            return []
+        out: list[str] = []
+        for m in models_raw:
+            if isinstance(m, dict):
+                name = m.get("name")
+                if isinstance(name, str) and name:
+                    out.append(name)
+        return out
 
     # Kept for backwards compatibility with existing tests that patch
     # `_fetch_model_list`. New callers should use the public name.
@@ -587,12 +746,15 @@ class ModelRegistry:
           immediately (zero HTTP).
         - If not in the cache AND it's been more than
           `_KNOWN_MODELS_RESYNC_MIN_INTERVAL_S` since the last sync,
-          re-fetch `/api/tags` opportunistically. Catches the case where
+          delegate to `_sync_with_ollama` (lock-serialized against the
+          periodic poll) to refresh state. Catches the case where
           a user just ran `ollama pull <model>` and immediately fired
           a request — without this re-sync, we'd false-fail until the
           next periodic sync.
-        - If still not in the set after the re-sync attempt (or the
-          re-sync was rate-limited), return False.
+        - If `_sync_with_ollama` failed to reach Ollama (detectable via
+          unchanged `_known_models_last_sync`), fail OPEN — better to
+          attempt the preload and let Ollama answer than to wrongly
+          404 on a transient hiccup.
         """
         if model in self._known_models:
             return True
@@ -600,19 +762,20 @@ class ModelRegistry:
         now = time.monotonic()
         if now - self._known_models_last_sync < _KNOWN_MODELS_RESYNC_MIN_INTERVAL_S:
             return False  # too soon to re-sync; trust the cached negative
-        try:
-            current_models = await self._fetch_model_list()
-        except httpx.HTTPError:
-            # Couldn't reach Ollama — fail open (let the request through;
-            # better to attempt and fail at preload than to wrongly 404
-            # if Ollama just briefly hiccupped).
+        # Delegate to the lock-serialized sync so we can't race the
+        # periodic poll loop. The lock also coalesces concurrent
+        # opportunistic resyncs from multiple in-flight requests for
+        # the same unknown model.
+        pre_sync_marker = self._known_models_last_sync
+        await self._sync_with_ollama()
+        if self._known_models_last_sync == pre_sync_marker:
+            # Sync didn't advance — Ollama unreachable (or another
+            # concurrent caller's sync also failed). Fail-open.
             logger.warning(
                 "model_registry.known_models_resync_failed",
                 model=model,
             )
             return True
-        self._known_models = set(current_models)
-        self._known_models_last_sync = now
         return model in self._known_models
 
     def get_metadata(self, model: str) -> ModelMetadata | None:

@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Periodic `/api/tags` polling on the model registry (Bug 6).**
+  `ModelRegistry` now runs a background poll task driven by
+  `scheduler.model_detect_interval` (default 30s, minimum 1s) so
+  `_known_models` reflects ground truth without process restart.
+  Previously, an `ollama rm <model>` while marshal was running left
+  the registry stale until restart — subsequent inference requests
+  for the removed model slipped past the server's fail-fast 404
+  check and rode the preload retry budget into a 502
+  `PreloadFailedError` after several seconds. Now a removed model
+  starts fail-fasting with 404 within one poll interval. Wired in
+  the server lifespan alongside `MemoryManager.start_polling`.
+- **Defense-in-depth pre-preload existence check.** `lifecycle.preload`
+  accepts an optional `is_known_model_check` async predicate that
+  short-circuits before `/api/generate` when the model has been
+  removed between request entry and preload time. The scheduler
+  threads `registry.is_known_model` through `_attempt_preload` so
+  every preload attempt picks up the latest registry state. The
+  predicate is fail-open under any exception class — better to
+  attempt the preload than to wrongly reject on a transient
+  registry hiccup.
+- **Defensive parsing of `/api/tags` responses.** `fetch_model_list`
+  no longer propagates `JSONDecodeError`, `KeyError`, or `TypeError`
+  on a malformed response (e.g. a fault-injection proxy mid-flight,
+  or an upstream error page). It returns an empty list with a
+  warning instead, so callers that only catch `httpx.HTTPError`
+  (such as `is_known_model`'s opportunistic resync) can no longer
+  poison the scheduler tick.
+- **`_sync_lock` serializes concurrent registry syncs.** The periodic
+  poll loop and `is_known_model`'s opportunistic resync now share an
+  `asyncio.Lock` around `_sync_with_ollama`. Without it, two in-flight
+  `/api/tags` fetches could commit snapshots in arbitrary order — the
+  earlier (stale) response could overwrite the later (fresh) one,
+  falsely pruning a freshly-pulled model from `_known_models` AND
+  the on-disk size/metadata caches.
+- **Unit + integration coverage for the prune path.** New
+  `tests/integration/test_registry_validation.py` simulates
+  `ollama rm <model>` via the fault proxy and asserts subsequent
+  inference returns 404 fail-fast (not 502 preload-loop). New
+  `test_registry.py` cases cover the polling lifecycle, defensive
+  `_fetch_model_list` parsing, and the `_sync_lock` serialization
+  invariant.
 - **Integration test coverage for v0.6.5 error-body propagation.**
   New file `tests/integration/test_error_propagation.py` exercises the
   v0.6.5 Bug 3 fix end-to-end against real Ollama via the
@@ -22,6 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preload-giveup + v0.6.5 error-shape interaction), and
   `RemoteProtocolError` → 502 (default class for unmapped errors).
   Pure test addition — no production code change.
+
+### Changed
+
+- **`scheduler.model_detect_interval` now drives a real polling loop.**
+  Previously declared in config but unused. Default 30s, minimum 1s
+  (validated). Sub-1s values would tight-loop `/api/tags` and are
+  rejected at config load.
+- **Registry sync logging is delta-aware.** The first sync emits the
+  full inventory (preserving v0.6.5 startup output) and an aggregate
+  `model_registry.removed_stale_at_startup` event when on-disk
+  caches were pruned. Subsequent syncs emit `models_added` /
+  `models_removed` only when the set actually changed — without
+  this, every poll cycle would re-emit the full un-benchmarked list.
 
 ### Fixed
 
