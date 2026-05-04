@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Integration test coverage for v0.6.5 error-body propagation.**
+  New file `tests/integration/test_error_propagation.py` exercises the
+  v0.6.5 Bug 3 fix end-to-end against real Ollama via the
+  fault-injection proxy. Five tests assert the wire-level shape of
+  every classified failure path: `ReadTimeout` → 504 with
+  `error_type: "ReadTimeout"`, `ConnectError` → 503 with
+  `error_type: "ConnectError"`, OpenAI-compat envelope on
+  `/v1/chat/completions` failure (`error.exception_type` field
+  populated alongside the spec-stable `error.type: "proxy_error"`
+  slug), `PreloadFailedError` → 503 (validates the v0.6.4
+  preload-giveup + v0.6.5 error-shape interaction), and
+  `RemoteProtocolError` → 502 (default class for unmapped errors).
+  Pure test addition — no production code change.
+
 ### Fixed
 
 - **Multi-instance integration test contamination.** Tests in
