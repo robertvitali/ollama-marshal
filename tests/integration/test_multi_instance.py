@@ -163,11 +163,12 @@ def _multi_instance_config(tmp_paths: dict[str, Path], audit_enabled: bool = Fal
                 tier_label=TIER_FALLBACK,
             ),
         ],
-        proxy=ProxyConfig(host="127.0.0.1", port=11437, request_timeout_s=90),
+        proxy=ProxyConfig(host="127.0.0.1", port=11437),
         memory=MemoryConfig(poll_interval=1),
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
+            ollama_forward_timeout_s=90,
         ),
         programs={
             "default": ProgramConfig(),
@@ -477,12 +478,13 @@ def _proxy_instances_config(
                 tier_label=TIER_FALLBACK,
             ),
         ],
-        proxy=ProxyConfig(host="127.0.0.1", port=11438, request_timeout_s=90),
+        proxy=ProxyConfig(host="127.0.0.1", port=11438),
         memory=MemoryConfig(poll_interval=1),
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
             benchmark_on_startup=False,
+            ollama_forward_timeout_s=90,
         ),
         programs={
             "default": ProgramConfig(),
@@ -754,11 +756,12 @@ async def test_fault_proxy_routing_decision_observes_q4_load(tmp_marshal_paths):
                     tier_label="last_resort",
                 ),
             ],
-            proxy=ProxyConfig(host="127.0.0.1", port=11439, request_timeout_s=90),
+            proxy=ProxyConfig(host="127.0.0.1", port=11439),
             memory=MemoryConfig(poll_interval=1),
             scheduler=SchedulerConfig(
                 metrics_path=str(tmp_marshal_paths["metrics_path"]),
                 metrics_persist_interval_s=3600,
+                ollama_forward_timeout_s=90,
             ),
             programs={
                 "default": ProgramConfig(),
@@ -885,11 +888,12 @@ async def test_legacy_single_instance_config_still_works(tmp_marshal_paths):
     cfg = MarshalConfig(
         ollama=OllamaConfig(host=DEFAULT_OLLAMA_HOST),  # legacy form
         # NOTE: no `instances` field — validator backfills.
-        proxy=ProxyConfig(host="127.0.0.1", port=11440, request_timeout_s=90),
+        proxy=ProxyConfig(host="127.0.0.1", port=11440),
         memory=MemoryConfig(poll_interval=1),
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
+            ollama_forward_timeout_s=90,
         ),
         programs={
             "default": ProgramConfig(),
@@ -1122,7 +1126,7 @@ async def test_a_rule_strict_q8_to_q4_fallback(tmp_marshal_paths):
                 tier_label="last_resort",
             ),
         ],
-        proxy=ProxyConfig(host="127.0.0.1", port=11441, request_timeout_s=120),
+        proxy=ProxyConfig(host="127.0.0.1", port=11441),
         # Tight budget: 1.5 GB, no overhead. REQUIRED_MODEL (~1.6 GB)
         # strictly cannot fit at f16. At q8 (0.5x KV multiplier on the
         # slot, but model weights are unchanged) it also strictly cannot
@@ -1136,6 +1140,7 @@ async def test_a_rule_strict_q8_to_q4_fallback(tmp_marshal_paths):
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
+            ollama_forward_timeout_s=120,
         ),
         programs={
             "default": ProgramConfig(),
@@ -1269,11 +1274,12 @@ async def test_q4_only_promotes_to_higher_tier_when_room(tmp_marshal_paths):
                 tier_label="last_resort",
             ),
         ],
-        proxy=ProxyConfig(host="127.0.0.1", port=11442, request_timeout_s=120),
+        proxy=ProxyConfig(host="127.0.0.1", port=11442),
         memory=MemoryConfig(poll_interval=1),
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
+            ollama_forward_timeout_s=120,
         ),
         programs={
             "default": ProgramConfig(),

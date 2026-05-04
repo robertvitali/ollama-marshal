@@ -148,54 +148,78 @@ class TestRouteRegistration:
 
 
 # ---------------------------------------------------------------------------
-# _resolve_timeout (per-request timeout override via X-Request-Timeout header)
+# _resolve_forward_timeout (Hop 2 timeout: X-Request-Timeout header + config)
 # ---------------------------------------------------------------------------
 
 
-class TestResolveTimeout:
-    """Cover the per-request X-Request-Timeout header + config fallback."""
+class TestResolveForwardTimeout:
+    """Cover the per-request X-Request-Timeout header + config fallback.
+
+    v0.6.4: the header was repurposed from "Hop 1 wait cap" to "Hop 2
+    forward budget" and the config source moved from
+    ``proxy.request_timeout_s`` (removed) to
+    ``scheduler.ollama_forward_timeout_s``.
+    """
 
     def _request(self, headers: dict, *, with_config: bool = True) -> MagicMock:
         req = MagicMock()
         req.headers = headers
         if with_config:
             cfg = MarshalConfig()
-            cfg.proxy.request_timeout_s = 1234
+            cfg.scheduler.ollama_forward_timeout_s = 1234
             req.app.state.config = cfg
         else:
             req.app.state = MagicMock(spec=[])
         return req
 
     def test_no_header_uses_config(self):
-        from ollama_marshal.server import _resolve_timeout
+        from ollama_marshal.server import _resolve_forward_timeout
 
-        assert _resolve_timeout(self._request({})) == 1234
+        assert _resolve_forward_timeout(self._request({})) == 1234
 
     def test_header_overrides_config(self):
-        from ollama_marshal.server import _resolve_timeout
+        from ollama_marshal.server import _resolve_forward_timeout
 
-        assert _resolve_timeout(self._request({"x-request-timeout": "60"})) == 60
+        req = self._request({"x-request-timeout": "60"})
+        assert _resolve_forward_timeout(req) == 60
 
     def test_header_zero_falls_back_to_config(self):
-        from ollama_marshal.server import _resolve_timeout
+        from ollama_marshal.server import _resolve_forward_timeout
 
         # 0 is invalid; we ignore it and use config.
-        assert _resolve_timeout(self._request({"x-request-timeout": "0"})) == 1234
+        req = self._request({"x-request-timeout": "0"})
+        assert _resolve_forward_timeout(req) == 1234
 
     def test_header_negative_falls_back_to_config(self):
-        from ollama_marshal.server import _resolve_timeout
+        from ollama_marshal.server import _resolve_forward_timeout
 
-        assert _resolve_timeout(self._request({"x-request-timeout": "-5"})) == 1234
+        req = self._request({"x-request-timeout": "-5"})
+        assert _resolve_forward_timeout(req) == 1234
 
     def test_header_non_int_falls_back_to_config(self):
-        from ollama_marshal.server import _resolve_timeout
+        from ollama_marshal.server import _resolve_forward_timeout
 
-        assert _resolve_timeout(self._request({"x-request-timeout": "abc"})) == 1234
+        req = self._request({"x-request-timeout": "abc"})
+        assert _resolve_forward_timeout(req) == 1234
 
     def test_no_config_uses_3600s_default(self):
-        from ollama_marshal.server import _resolve_timeout
+        from ollama_marshal.server import _resolve_forward_timeout
 
-        assert _resolve_timeout(self._request({}, with_config=False)) == 3600
+        assert _resolve_forward_timeout(self._request({}, with_config=False)) == 3600
+
+    def test_envelope_inherits_resolved_timeout(self):
+        """X-Request-Timeout value flows into RequestEnvelope.ollama_forward_timeout_s.
+
+        Sanity check that ``_resolve_forward_timeout`` is the source of
+        truth for the envelope field — the integration path matters
+        because ``Scheduler._forward_single_inner`` reads
+        ``envelope.ollama_forward_timeout_s`` and passes it to
+        ``forward_request``.
+        """
+        from ollama_marshal.server import _resolve_forward_timeout
+
+        req = self._request({"x-request-timeout": "42"})
+        assert _resolve_forward_timeout(req) == 42
 
 
 # ---------------------------------------------------------------------------
@@ -604,9 +628,11 @@ class TestParseRetryMaxHeader:
 class TestFailFastUnknownModel:
     """Marshal must 404 in milliseconds for models not installed in Ollama.
 
-    Without this, the request would sit in the queue for proxy.request_timeout_s
-    (default 1h) while lifecycle.preload retries trying to load a model
-    Ollama doesn't have.
+    Without this, the request would sit in the queue indefinitely (Hop
+    1 became unbounded in v0.6.4) while ``lifecycle.preload`` retries
+    trying to load a model Ollama doesn't have — eventually firing the
+    new ``preload_max_consecutive_failures`` giveup, but only after
+    serving the client a confused error instead of a clear 404.
     """
 
     def _registry_with_known(self, *, known: bool) -> MagicMock:

@@ -104,10 +104,12 @@ def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
 
     Test defaults that differ from production:
 
-    - ``proxy.request_timeout_s = 90`` — generous enough that cold
-      first-loads on a busy machine (Ollama under memory pressure
-      while another marshal is also using it) don't surface as
-      timeouts. Bounded so stuck requests still fail.
+    - ``scheduler.ollama_forward_timeout_s = 90`` — generous enough
+      that cold first-loads on a busy machine (Ollama under memory
+      pressure while another marshal is also using it) don't surface
+      as timeouts. Bounded so stuck Ollama forwards still fail. v0.6.4
+      replaced ``proxy.request_timeout_s`` (Hop 1 cap, removed) with
+      this Hop 2 budget.
     - ``memory.poll_interval = 1`` — speed up unexpected-unload tests.
       Real production uses 5s.
     - ``shutdown.mode = IMMEDIATE``, ``unload_models = True`` — when
@@ -126,12 +128,13 @@ def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
     """
     return MarshalConfig(
         ollama=OllamaConfig(host=DEFAULT_OLLAMA_HOST),
-        proxy=ProxyConfig(host="127.0.0.1", port=11436, request_timeout_s=90),
+        proxy=ProxyConfig(host="127.0.0.1", port=11436),
         memory=MemoryConfig(poll_interval=1),
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,  # don't write during tests
             benchmark_on_startup=False,
+            ollama_forward_timeout_s=90,
         ),
         programs={
             "default": ProgramConfig(),
@@ -378,12 +381,12 @@ def build_test_config_yaml(
         "proxy:",
         '  host: "127.0.0.1"',
         f"  port: {port}",
-        "  request_timeout_s: 90",
         "memory:",
         "  poll_interval: 1",
         "scheduler:",
         "  benchmark_on_startup: false",
         "  metrics_persist_interval_s: 3600",
+        "  ollama_forward_timeout_s: 90",
         f"  idle_eviction_minutes: {idle_eviction_minutes}",
         "shutdown:",
         '  mode: "immediate"',

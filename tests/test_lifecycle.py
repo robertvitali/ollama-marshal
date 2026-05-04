@@ -393,7 +393,10 @@ class TestEnsureLoaded:
 
         assert result is True
         mock_preload.assert_awaited_once_with(
-            "llama3:latest", num_ctx=None, instance_url=None
+            "llama3:latest",
+            num_ctx=None,
+            instance_url=None,
+            load_timeout_s=None,
         )
 
     async def test_not_loaded_preload_fails(self, lifecycle):
@@ -412,7 +415,10 @@ class TestEnsureLoaded:
 
         assert result is True
         mock_preload.assert_awaited_once_with(
-            "mistral:latest", num_ctx=None, instance_url=None
+            "mistral:latest",
+            num_ctx=None,
+            instance_url=None,
+            load_timeout_s=None,
         )
 
 

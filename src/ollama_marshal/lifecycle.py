@@ -19,8 +19,12 @@ import structlog
 
 logger = structlog.get_logger()
 
-# Timeout for loading a model (can be large for first-time quantization)
-_LOAD_TIMEOUT = 300  # 5 minutes
+# Default load timeout for legacy unit-test paths that don't pass one.
+# Production call sites thread the configured Hop 2 timeout
+# (``scheduler.ollama_forward_timeout_s``) through ``preload()`` —
+# v0.6.4 raised the default from 300 (5 min) to 3600 (1 hour) so big
+# first-time quantizations + slow disks don't trip a spurious failure.
+_LOAD_TIMEOUT = 3600
 _UNLOAD_TIMEOUT = 60
 _PS_POLL_INTERVAL = 1  # seconds
 _PS_POLL_MAX_WAIT = 120  # seconds
@@ -50,6 +54,7 @@ class ModelLifecycle:
         model: str,
         num_ctx: int | None = None,
         instance_url: str | None = None,
+        load_timeout_s: int | None = None,
     ) -> bool:
         """Preload a model into Ollama's VRAM.
 
@@ -69,11 +74,16 @@ class ModelLifecycle:
             instance_url: Which Ollama instance to preload on. None
                 falls back to the constructor default — single-instance
                 behavior unchanged.
+            load_timeout_s: Wall-clock budget for the preload HTTP
+                call in seconds. None falls back to the
+                ``_LOAD_TIMEOUT`` default. Production call sites pass
+                ``scheduler.ollama_forward_timeout_s`` through.
 
         Returns:
             True if the model was successfully loaded.
         """
         host = self._resolve_host(instance_url)
+        timeout = _LOAD_TIMEOUT if load_timeout_s is None else load_timeout_s
         logger.info(
             "lifecycle.preloading",
             model=model,
@@ -96,7 +106,7 @@ class ModelLifecycle:
                 await client.post(
                     f"{host}/api/generate",
                     json=payload,
-                    timeout=_LOAD_TIMEOUT,
+                    timeout=timeout,
                 )
 
                 # Wait for model to appear in /api/ps on this instance.
@@ -223,6 +233,7 @@ class ModelLifecycle:
         loaded_models: set[str],
         num_ctx: int | None = None,
         instance_url: str | None = None,
+        load_timeout_s: int | None = None,
     ) -> bool:
         """Ensure a model is loaded, preloading if necessary.
 
@@ -231,13 +242,20 @@ class ModelLifecycle:
             loaded_models: Set of currently loaded model names.
             num_ctx: If preloading, allocate the KV slot at this size.
             instance_url: Which Ollama instance to load on.
+            load_timeout_s: Forwarded to ``preload`` when the model
+                isn't already loaded.
 
         Returns:
             True if the model is (now) loaded.
         """
         if model in loaded_models:
             return True
-        return await self.preload(model, num_ctx=num_ctx, instance_url=instance_url)
+        return await self.preload(
+            model,
+            num_ctx=num_ctx,
+            instance_url=instance_url,
+            load_timeout_s=load_timeout_s,
+        )
 
     @staticmethod
     def override_keep_alive(request_body: dict[str, Any]) -> dict[str, Any]:

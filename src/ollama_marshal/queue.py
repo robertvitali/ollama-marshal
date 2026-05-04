@@ -9,6 +9,19 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+class PreloadFailedError(Exception):
+    """Scheduler exhausted its per-model preload retry budget.
+
+    Set as ``RequestEnvelope.error`` by the scheduler when
+    ``lifecycle.preload`` has failed
+    ``scheduler.preload_max_consecutive_failures`` consecutive times for
+    the same model — at which point keeping the envelope queued forever
+    is worse than failing it. Surfaced to clients through the standard
+    error response path (a 502 today; v0.6.5 will propagate the class
+    name + reason in the response body).
+    """
+
+
 @dataclass
 class RequestEnvelope:
     """Wraps an incoming request with scheduling metadata.
@@ -61,6 +74,14 @@ class RequestEnvelope:
     # so they can fire requests against a paused prod marshal without
     # blocking on the queue freeze.
     bypass_pause: bool = False
+    # Hop 2 forward timeout (v0.6.4+). Wall-clock budget for the
+    # marshal→Ollama HTTP forward in seconds. Resolved by the request
+    # handler from the X-Request-Timeout header (if present) or
+    # ``scheduler.ollama_forward_timeout_s`` config default. The
+    # scheduler reads this when calling ``forward_request``. Default
+    # 3600 (1h) matches the config default for legacy tests / direct
+    # construction paths that don't set it explicitly.
+    ollama_forward_timeout_s: int = 3600
 
     def increment_skip(self) -> None:
         """Increment the skip counter for this request."""

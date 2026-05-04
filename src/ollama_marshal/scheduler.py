@@ -15,9 +15,9 @@ import structlog
 from ollama_marshal.config import MarshalConfig, Priority
 from ollama_marshal.lifecycle import ModelLifecycle
 from ollama_marshal.memory import MemoryManager
-from ollama_marshal.queue import ModelQueues, RequestEnvelope
+from ollama_marshal.queue import ModelQueues, PreloadFailedError, RequestEnvelope
 from ollama_marshal.registry import ModelRegistry
-from ollama_marshal.retry import call_with_retry
+from ollama_marshal.retry import backoff_delay, call_with_retry
 from ollama_marshal.routing import (
     FitProbe,
     RoutingDecision,
@@ -57,6 +57,24 @@ _MAX_LIVE_HINTS = 256
 # the per-pair cap to produce arbitrary aggregate boost on a target
 # model and starve every other program's eviction.
 _BURST_HINT_AGGREGATE_MULTIPLIER = 8
+
+
+@dataclass
+class _PreloadFailureState:
+    """Per-model preload-failure tracking for backoff + giveup.
+
+    Attributes:
+        consecutive_failures: Count of consecutive failed preload
+            attempts for this model. Cleared on a successful preload
+            and after the giveup path runs.
+        cooldown_until: Monotonic deadline before the next preload
+            attempt for this model is allowed. The scheduler tick
+            short-circuits any preload work for this model until the
+            deadline passes.
+    """
+
+    consecutive_failures: int
+    cooldown_until: float
 
 
 @dataclass
@@ -499,6 +517,19 @@ class Scheduler:
         # back after ``auto_resume_after_seconds`` regardless. Cancelled
         # by an explicit resume.
         self._auto_resume_task: asyncio.Task[None] | None = None
+        # Per-model preload-failure state (v0.6.4+). Without this, when
+        # Ollama crashes/restarts, the 0.1s scheduler tick keeps calling
+        # ``lifecycle.preload`` ~10 times/sec on every queued model
+        # while Ollama is unreachable — observed 313 ``lifecycle.preload_failed``
+        # entries in 30s during one Ollama crash recovery. Now: each
+        # failed preload bumps a per-model counter and parks future
+        # attempts behind an exponential-backoff cooldown
+        # (``preload_backoff_base_s`` → ``preload_backoff_max_s`` with
+        # full jitter). After ``preload_max_consecutive_failures``
+        # attempts, queued envelopes for the model fail with
+        # ``PreloadFailedError`` so clients get clear feedback rather
+        # than waiting forever.
+        self._preload_failures: dict[str, _PreloadFailureState] = {}
 
     def is_paused(self) -> bool:
         """Return True if dispatch is currently paused.
@@ -782,6 +813,128 @@ class Scheduler:
             if progs
         }
 
+    def _is_in_preload_cooldown(self, model: str, now: float | None = None) -> bool:
+        """Check whether ``model``'s preload is currently parked on cooldown.
+
+        Returns True when the model has prior failures and the cooldown
+        deadline hasn't yet passed. Pass ``now`` to override the clock
+        for tests.
+        """
+        state = self._preload_failures.get(model)
+        if state is None:
+            return False
+        ts = time.monotonic() if now is None else now
+        return ts < state.cooldown_until
+
+    def _record_preload_failure(self, model: str) -> int:
+        """Bump per-model failure count and recompute the backoff cooldown.
+
+        Reuses ``backoff_delay`` from ``retry.py`` for the same
+        full-jitter exponential as Hop 2 forward retries. Returns the
+        new consecutive-failure count so callers can decide whether to
+        give up.
+        """
+        cfg = self.config.scheduler
+        prior = self._preload_failures.get(model)
+        failures = (prior.consecutive_failures + 1) if prior else 1
+        delay = backoff_delay(
+            failures,
+            cfg.preload_backoff_base_s,
+            cfg.preload_backoff_max_s,
+        )
+        self._preload_failures[model] = _PreloadFailureState(
+            consecutive_failures=failures,
+            cooldown_until=time.monotonic() + delay,
+        )
+        logger.warning(
+            "scheduler.preload_failure_recorded",
+            model=model,
+            consecutive_failures=failures,
+            cooldown_s=round(delay, 2),
+        )
+        return failures
+
+    def _clear_preload_failure(self, model: str) -> None:
+        """Drop ``model``'s failure state after a successful preload or giveup."""
+        if self._preload_failures.pop(model, None) is not None:
+            logger.info("scheduler.preload_failure_cleared", model=model)
+
+    async def _give_up_on_preload(self, model: str) -> None:
+        """Drain ``model``'s queue and fail every envelope with PreloadFailedError.
+
+        Called after the per-model failure counter reaches
+        ``preload_max_consecutive_failures``. Clears the failure state
+        so the next request for the same model starts a fresh backoff
+        sequence — the cooldown is per-batch, not permanent.
+        """
+        cfg = self.config.scheduler
+        drained = await self.queues.dequeue_batch(model)
+        error = PreloadFailedError(
+            f"preload failed {cfg.preload_max_consecutive_failures} consecutive "
+            f"times for model {model!r}; giving up"
+        )
+        for env in drained:
+            env.fail(error)
+        logger.error(
+            "scheduler.preload_giving_up",
+            model=model,
+            consecutive_failures=cfg.preload_max_consecutive_failures,
+            failed_envelopes=len(drained),
+        )
+        try:
+            # Use ``error_type`` to align with the ``request.failed``
+            # convention. The numeric ``failed_envelopes`` is in the
+            # structured log above; ``AuditLogger.record`` doesn't accept
+            # arbitrary kwargs, so passing ``failed_envelopes=...`` here
+            # would TypeError and the audit entry would be silently
+            # dropped by the surrounding except.
+            await self.audit.record(
+                "scheduler.preload_giving_up",
+                model=model,
+                error_type="PreloadFailedError",
+            )
+        except Exception as exc:
+            logger.warning(
+                "scheduler.preload_giving_up_audit_failed",
+                model=model,
+                error=str(exc),
+            )
+        self._clear_preload_failure(model)
+
+    async def _attempt_preload(
+        self,
+        model: str,
+        num_ctx: int | None,
+        instance_url: str,
+    ) -> bool:
+        """Wrap ``lifecycle.preload`` with cooldown + backoff + giveup.
+
+        Production preload sites in the scheduler call this instead of
+        ``lifecycle.preload`` directly so the per-model failure state
+        machine applies uniformly. Returns True only on a successful
+        load; False on cooldown skip, transient failure, or giveup.
+
+        Threads the configured Hop 2 timeout
+        (``scheduler.ollama_forward_timeout_s``) through to
+        ``lifecycle.preload`` so the load call shares the same
+        wall-clock budget as forward calls.
+        """
+        if self._is_in_preload_cooldown(model):
+            return False
+        success = await self.lifecycle.preload(
+            model,
+            num_ctx=num_ctx,
+            instance_url=instance_url,
+            load_timeout_s=self.config.scheduler.ollama_forward_timeout_s,
+        )
+        if success:
+            self._clear_preload_failure(model)
+            return True
+        failures = self._record_preload_failure(model)
+        if failures >= self.config.scheduler.preload_max_consecutive_failures:
+            await self._give_up_on_preload(model)
+        return False
+
     async def _idle_evict_unused_models(self) -> None:
         """Evict loaded models that have been idle longer than the threshold.
 
@@ -972,6 +1125,12 @@ class Scheduler:
 
         skipped_models: list[str] = []
         for model in models_to_try:
+            # Per-model preload backoff (v0.6.4+): if a recent preload
+            # failed and the cooldown window hasn't passed, skip without
+            # touching Ollama. Avoids the storm of ~10 preload calls/sec
+            # when Ollama is briefly unreachable.
+            if self._is_in_preload_cooldown(model):
+                continue
             model_size = await self.registry.get_or_estimate_size(model)
             if self.memory.can_fit_model(model_size):
                 num_ctx = await self._max_num_ctx_for_pending(model)
@@ -991,7 +1150,7 @@ class Scheduler:
                     instance=decision.instance.url,
                     routing_reason=decision.reason.value,
                 )
-                success = await self.lifecycle.preload(
+                success = await self._attempt_preload(
                     model, num_ctx=num_ctx, instance_url=decision.instance.url
                 )
                 if success:
@@ -1148,6 +1307,14 @@ class Scheduler:
         Returns:
             True if the model is now loaded at the requested size.
         """
+        # Per-model preload backoff (v0.6.4+): bail before doing any
+        # eviction work when a recent preload failed and we're still
+        # within the cooldown window. Without the early return,
+        # ``_evict_one`` would tear down loaded models to make room for
+        # a preload that immediately gets skipped, leaving VRAM empty.
+        if self._is_in_preload_cooldown(model):
+            return False
+
         decision = await self._resolve_routing(model, num_ctx)
         chosen_url = decision.instance.url
 
@@ -1211,7 +1378,7 @@ class Scheduler:
                     )
                 return False
 
-        success = await self.lifecycle.preload(
+        success = await self._attempt_preload(
             model, num_ctx=num_ctx, instance_url=chosen_url
         )
         if success:
@@ -1453,6 +1620,7 @@ class Scheduler:
                     endpoint=envelope.endpoint,
                     request_body=envelope.request_body,
                     stream=envelope.stream,
+                    timeout_s=envelope.ollama_forward_timeout_s,
                 )
             else:
                 # request_id correlates retries in logs; envelope object
@@ -1464,6 +1632,7 @@ class Scheduler:
                     endpoint=envelope.endpoint,
                     request_body=envelope.request_body,
                     stream=envelope.stream,
+                    timeout_s=envelope.ollama_forward_timeout_s,
                     max_attempts=max_attempts,
                     base_delay_s=retry_cfg.base_delay_s,
                     max_delay_s=retry_cfg.max_delay_s,

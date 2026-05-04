@@ -492,7 +492,10 @@ class TestBinPackModels:
         await sched._bin_pack_models()
 
         lifecycle.preload.assert_called_once_with(
-            "small:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+            "small:latest",
+            num_ctx=None,
+            instance_url=_PRIMARY_INSTANCE_URL,
+            load_timeout_s=3600,
         )
         assert sched.metrics.model_swaps == 1
         memory.refresh.assert_called_once()
@@ -768,7 +771,10 @@ class TestEnsureModelLoaded:
         result = await sched._ensure_model_loaded("llama3:latest")
         assert result is True
         lifecycle.preload.assert_called_once_with(
-            "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+            "llama3:latest",
+            num_ctx=None,
+            instance_url=_PRIMARY_INSTANCE_URL,
+            load_timeout_s=3600,
         )
         assert sched.metrics.model_swaps == 1
 
@@ -1392,7 +1398,10 @@ class TestEnsureModelLoadedReloadOnNeed:
             "llama3:latest", instance_url=_PRIMARY_INSTANCE_URL
         )
         lifecycle.preload.assert_called_once_with(
-            "llama3:latest", num_ctx=32768, instance_url=_PRIMARY_INSTANCE_URL
+            "llama3:latest",
+            num_ctx=32768,
+            instance_url=_PRIMARY_INSTANCE_URL,
+            load_timeout_s=3600,
         )
         memory.record_allocated_num_ctx.assert_called_with(
             "llama3:latest", 32768, instance_url=_PRIMARY_INSTANCE_URL
@@ -2697,3 +2706,191 @@ class TestPauseDispatchIntegration:
         # the assertion below confirms the public API never reports
         # negative numbers regardless of internal state.
         assert sched.in_flight_count() >= 0
+
+
+# ---------------------------------------------------------------------------
+# v0.6.4 Bug 2 — per-model preload backoff with exponential delay + giveup
+# ---------------------------------------------------------------------------
+
+
+class TestPreloadBackoffStateMachine:
+    """Cover the cooldown + backoff + giveup helpers added in v0.6.4.
+
+    The state machine prevents the 313-failures-in-30s cascade observed
+    when Ollama crashes — without backoff, the 0.1s scheduler tick
+    keeps calling ``lifecycle.preload`` ~10 times/sec while Ollama is
+    unreachable. After ``preload_max_consecutive_failures`` consecutive
+    failures, queued envelopes for that model fail with
+    ``PreloadFailedError`` rather than waiting forever.
+    """
+
+    async def test_preload_failure_records_state_with_backoff(self):
+        """A failed preload bumps the failure counter and sets a cooldown deadline."""
+        cfg = _make_config(
+            **{
+                "scheduler.preload_backoff_base_s": 1.0,
+                "scheduler.preload_backoff_max_s": 30.0,
+            }
+        )
+        sched = _make_scheduler(config=cfg)
+
+        # First failure → consecutive_failures=1, cooldown set in future.
+        before = time.monotonic()
+        failures = sched._record_preload_failure("llama3:latest")
+        after = time.monotonic()
+
+        assert failures == 1
+        state = sched._preload_failures["llama3:latest"]
+        assert state.consecutive_failures == 1
+        # Cooldown is `now + delay` where delay ∈ [0, base_s] for the first
+        # failure (full jitter). Verify the deadline lies in that window.
+        assert state.cooldown_until >= before
+        assert state.cooldown_until <= after + 1.0
+
+    async def test_preload_in_cooldown_is_skipped(self):
+        """``_attempt_preload`` returns False without calling lifecycle.preload."""
+        sched = _make_scheduler()
+        sched.lifecycle.preload = AsyncMock(return_value=True)
+
+        # Plant a fresh cooldown 60s in the future.
+        from ollama_marshal.scheduler import _PreloadFailureState
+
+        sched._preload_failures["llama3:latest"] = _PreloadFailureState(
+            consecutive_failures=2,
+            cooldown_until=time.monotonic() + 60.0,
+        )
+
+        result = await sched._attempt_preload(
+            "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+        )
+
+        assert result is False
+        sched.lifecycle.preload.assert_not_called()
+
+    async def test_preload_success_clears_failure_state(self):
+        """A successful preload removes the model's failure entry."""
+        sched = _make_scheduler()
+        sched.lifecycle.preload = AsyncMock(return_value=True)
+
+        from ollama_marshal.scheduler import _PreloadFailureState
+
+        sched._preload_failures["llama3:latest"] = _PreloadFailureState(
+            consecutive_failures=2,
+            cooldown_until=time.monotonic() - 1.0,  # already expired
+        )
+
+        result = await sched._attempt_preload(
+            "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+        )
+
+        assert result is True
+        assert "llama3:latest" not in sched._preload_failures
+
+    async def test_max_consecutive_failures_fails_pending_envelopes(self):
+        """After N failures the queued envelopes fail with PreloadFailedError.
+
+        Drives ``_attempt_preload`` past
+        ``preload_max_consecutive_failures``, asserts that pending
+        envelopes get ``envelope.error = PreloadFailedError`` and
+        ``done_event`` set so blocked clients unblock immediately.
+        Failure state clears so a future request can try again from
+        scratch.
+        """
+        from ollama_marshal.queue import PreloadFailedError
+
+        cfg = _make_config(
+            **{
+                "scheduler.preload_max_consecutive_failures": 3,
+                "scheduler.preload_backoff_base_s": 0.001,
+                "scheduler.preload_backoff_max_s": 0.001,
+            }
+        )
+        queues = ModelQueues()
+        env1 = _make_envelope(model="llama3:latest", program_id="p1")
+        env2 = _make_envelope(model="llama3:latest", program_id="p2")
+        await queues.enqueue(env1)
+        await queues.enqueue(env2)
+
+        sched = _make_scheduler(queues=queues, config=cfg)
+        sched.lifecycle.preload = AsyncMock(return_value=False)
+
+        # 3 attempts → failures hit the max on the 3rd, giveup fires.
+        for _ in range(3):
+            # Sleep just enough that the tiny cooldown clears between
+            # attempts (base/max set to 0.001s above so the test stays
+            # snappy without flakes).
+            await asyncio.sleep(0.005)
+            await sched._attempt_preload(
+                "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+            )
+
+        # Both envelopes failed with PreloadFailedError.
+        assert env1.done_event.is_set()
+        assert env2.done_event.is_set()
+        assert isinstance(env1.error, PreloadFailedError)
+        assert isinstance(env2.error, PreloadFailedError)
+        # Failure state cleared after giveup so the next request retries
+        # from scratch (per-batch giveup, not permanent lockout).
+        assert "llama3:latest" not in sched._preload_failures
+        # All three preload attempts actually ran (cooldown didn't skip
+        # them because we slept past the tiny window between calls).
+        assert sched.lifecycle.preload.await_count == 3
+
+    async def test_clear_preload_failure_idempotent_on_unknown_model(self):
+        """``_clear_preload_failure`` on an absent key is a silent no-op."""
+        sched = _make_scheduler()
+        # No KeyError, no log spam.
+        sched._clear_preload_failure("never-tracked:latest")
+        assert "never-tracked:latest" not in sched._preload_failures
+
+    async def test_is_in_preload_cooldown_returns_false_for_untracked_model(self):
+        """Models without recorded failures aren't in cooldown."""
+        sched = _make_scheduler()
+        assert sched._is_in_preload_cooldown("fresh:latest") is False
+
+    async def test_attempt_preload_threads_forward_timeout_to_lifecycle(self):
+        """``_attempt_preload`` passes ``ollama_forward_timeout_s`` through.
+
+        Bug 1 + Bug 2 integration check — the scheduler reads the
+        configured Hop 2 timeout and forwards it as ``load_timeout_s``
+        so preloads get the same wall-clock budget as forward calls.
+        """
+        cfg = _make_config(**{"scheduler.ollama_forward_timeout_s": 1234})
+        sched = _make_scheduler(config=cfg)
+        sched.lifecycle.preload = AsyncMock(return_value=True)
+
+        await sched._attempt_preload(
+            "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+        )
+
+        sched.lifecycle.preload.assert_awaited_once_with(
+            "llama3:latest",
+            num_ctx=None,
+            instance_url=_PRIMARY_INSTANCE_URL,
+            load_timeout_s=1234,
+        )
+
+    async def test_ensure_model_loaded_short_circuits_during_cooldown(self):
+        """``_ensure_model_loaded`` bails before any eviction work during cooldown.
+
+        Without the early return, the eviction path could tear down
+        loaded models to make room for a preload that immediately gets
+        skipped — leaving VRAM empty.
+        """
+        from ollama_marshal.scheduler import _PreloadFailureState
+
+        sched = _make_scheduler()
+        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched.lifecycle.unload = AsyncMock(return_value=True)
+        sched._preload_failures["llama3:latest"] = _PreloadFailureState(
+            consecutive_failures=2,
+            cooldown_until=time.monotonic() + 60.0,
+        )
+
+        result = await sched._ensure_model_loaded("llama3:latest", num_ctx=None)
+
+        assert result is False
+        # Neither preload nor unload should have fired — the cooldown
+        # short-circuit happens before any eviction work.
+        sched.lifecycle.preload.assert_not_called()
+        sched.lifecycle.unload.assert_not_called()
