@@ -63,11 +63,18 @@ and re-commit.
 - **Unit tests**: 95% coverage minimum. Use mocked Ollama responses. Run on
   every commit via the pre-commit hook.
 - **Integration tests**: Marked with `@pytest.mark.integration`. Require a
-  running Ollama instance on `localhost:11434`. Run them manually before
-  pushing with `make pre-pr` or `make test-integration`. (A pre-push hook
-  for these is planned for v0.6.3 once the prod-pause fixture lands —
-  until then, sharing Ollama with a local prod marshal causes false
-  failures.)
+  running Ollama instance on `localhost:11434`. Run automatically on
+  every `git push` via the `pytest-integration` pre-push hook (v0.6.3+).
+  An autouse `pause_local_prod_marshal` fixture pauses any local prod
+  marshal at `:11435` for the duration of the suite so it doesn't
+  compete for Ollama VRAM. The fixture reads the prod admin token
+  from the `MARSHAL_TEST_ADMIN_TOKEN` env var or directly from
+  `~/.ollama-marshal/admin-tokens.env` (mode 600). When the token
+  isn't discoverable or prod isn't running, the fixture no-ops
+  cleanly. Set `MARSHAL_INTEGRATION_SKIP_PROD_PAUSE=1` to opt out
+  manually. Override the prod URL with `MARSHAL_TEST_PROD_URL`
+  (default `http://localhost:11435`); the auto-resume failsafe with
+  `MARSHAL_TEST_PAUSE_TIMEOUT_S` (default 3600s).
 - **Test naming**: `test_<feature>_<condition>_<expected_result>`
 
 ```bash

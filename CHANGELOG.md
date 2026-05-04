@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-05-03
+
+### Fixed
+
+- **Cross-suite contamination of integration tests resolved.** The
+  integration suite shares Ollama at `:11434` with any local prod
+  marshal at `:11435`. When prod had a model loaded (e.g.
+  `qwen3.5:2b-q8_0` for ai-email-triage), test marshals racing
+  against prod's load state caused 3 reproducible failures in
+  `test_multi_instance.py`, a documented flake on
+  `test_bin_packing_keeps_multiple_models_loaded`, and real prod
+  `server.request_error` events during the v0.6.2 integration test
+  run on 2026-05-03. New session-scoped autouse pytest fixture
+  `pause_local_prod_marshal` (in `tests/integration/conftest.py`)
+  pauses the local prod marshal via the v0.6.0 admin/pause endpoint
+  for the duration of the suite, then resumes.
+  - Pause is sent with `drain_timeout_s=0` (set the pause flag
+    immediately, don't wait for prod's in-flight inferences to
+    drain). In-flight inferences complete naturally while the
+    suite runs. Empirically: waiting on drain (e.g. `=60`) blocks
+    fixture setup AND introduced new flakes in multi-instance
+    routing tests when prod's in-flight finished mid-test. The
+    zero-drain path is the right semantic for "don't compete with
+    test scheduling" and shrinks suite wall-clock from ~6 min to
+    ~2:30 on the maintainer's M3 Ultra. Override with
+    `MARSHAL_TEST_PAUSE_DRAIN_S` for stricter semantics (e.g.
+    before destructive admin work).
+  - Pause endpoint returns 200 (drain complete) OR 409 (drain
+    timeout) — both leave the pause flag in effect server-side per
+    `Scheduler.pause()` contract. Fixture treats both as "paused"
+    and always calls `resume` on teardown.
+  - Auto-resume failsafe defaults to **1 hour**
+    (`MARSHAL_TEST_PAUSE_TIMEOUT_S=3600`) so a long integration run
+    can't trip the failsafe mid-suite and re-introduce the
+    contamination it exists to prevent. Up from the prior 10 min
+    `auto_resume_after_seconds` value the unused `prod_marshal_pause`
+    fixture used (raised here because the autouse path covers the
+    full suite, not a small subset).
+- **Token discovery without sourcing the env file.** New
+  `tests/integration/_admin_token.py` helper reads
+  `MARSHAL_TEST_ADMIN_TOKEN` / `MARSHAL_TEST_BYPASS_TOKEN` from the
+  environment first, then falls back to parsing
+  `~/.ollama-marshal/admin-tokens.env` directly (with mode-600
+  enforcement — refuses to read a world/group-readable token file).
+  Contributors no longer need to `source` the file before running
+  `make test-integration`.
+
+### Changed
+
+- **Pre-push integration test hook restored** in
+  `.pre-commit-config.yaml`. Was deferred from v0.6.2 because the
+  same contamination would have hit on every push. With the
+  autouse pause fixture in place, the hook is back as
+  `pytest-integration` at `stages: [pre-push]`, restoring "pre-PR
+  enforcement of integration tests" that was the original v0.6.2
+  intent.
+- **`prod_marshal_pause` fixture refactored** to depend on the new
+  autouse `pause_local_prod_marshal`. Tests that hit prod marshal
+  directly via `prod_marshal_client` now skip cleanly when the
+  autouse pause didn't take effect, rather than each path
+  re-implementing the discovery + skip logic.
+
+### Documentation
+
+- `CONTRIBUTING.md`: integration tests now run on `git push`
+  automatically; documented the
+  `MARSHAL_INTEGRATION_SKIP_PROD_PAUSE=1` escape hatch.
+- `marshal.example.yaml`: added a note in the `admin:` section
+  pointing integration test contributors at
+  `~/.ollama-marshal/admin-tokens.env` and the autouse pause
+  fixture.
+
 ## [0.6.2] - 2026-05-03
 
 ### Fixed
@@ -792,7 +864,8 @@ otherwise.
 - Structured logging via structlog (console + JSON modes)
 - 95%+ unit test coverage
 
-[Unreleased]: https://github.com/robertvitali/ollama-marshal/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/robertvitali/ollama-marshal/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/robertvitali/ollama-marshal/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/robertvitali/ollama-marshal/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/robertvitali/ollama-marshal/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/robertvitali/ollama-marshal/compare/v0.5.1...v0.6.0

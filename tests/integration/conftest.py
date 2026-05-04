@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
+import pytest_asyncio
+import structlog
 from asgi_lifespan import LifespanManager
 
 from ollama_marshal.config import (
@@ -45,6 +47,8 @@ from ollama_marshal.config import (
     ShutdownMode,
 )
 from ollama_marshal.server import create_app
+
+from ._admin_token import discover_admin_token, discover_bypass_token
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -269,10 +273,16 @@ async def wait_for(
 # touching the user's prod marshal at :11435.
 #
 # Tests marked ``@pytest.mark.marshal_prod`` hit the live prod marshal
-# at :11435 directly, after the session-scoped ``prod_marshal_pause``
-# fixture pauses it via ``POST /api/marshal/admin/pause``. Requires
-# environment vars ``MARSHAL_TEST_ADMIN_TOKEN`` and
-# ``MARSHAL_TEST_BYPASS_TOKEN`` to match prod marshal's config.
+# at :11435 directly via ``prod_marshal_client``. The session-scoped
+# ``pause_local_prod_marshal`` fixture (autouse, v0.6.3+) handles the
+# pause via ``POST /api/marshal/admin/pause`` so EVERY integration
+# test runs without competing for Ollama VRAM with prod marshal.
+# Requires admin/bypass tokens — discovered from the
+# ``MARSHAL_TEST_ADMIN_TOKEN`` / ``MARSHAL_TEST_BYPASS_TOKEN`` env
+# vars, or read directly from ``~/.ollama-marshal/admin-tokens.env``
+# if the operator hasn't sourced them. Set
+# ``MARSHAL_INTEGRATION_SKIP_PROD_PAUSE=1`` to opt out of the autouse
+# pause (e.g. when intentionally exercising contention).
 
 # Test bypass token used by both subprocess fixture and prod-pause
 # fixture. Subprocess marshals get this hardcoded into their per-test
@@ -489,28 +499,57 @@ async def marshal_subprocess_client(
 
 
 # ---------------------------------------------------------------------------
-# Prod-marshal pause fixture (Path A tests)
+# Prod-marshal pause fixtures
 # ---------------------------------------------------------------------------
+#
+# Two layers, both targeting the same v0.6.0 admin/pause endpoint:
+#
+# 1. ``pause_local_prod_marshal`` — session-scoped autouse, fires for
+#    EVERY integration test. Pauses local prod marshal at :11435 (if
+#    reachable, with a discoverable admin token) for the duration of
+#    the suite, then resumes. Prevents cross-suite contamination
+#    where prod marshal's loaded models compete with test marshals
+#    for Ollama VRAM, causing flaky integration test failures.
+#    Degrades to a no-op (does NOT skip tests) when prod isn't
+#    reachable, no token is discoverable, or the pause call fails.
+#    Honor the ``MARSHAL_INTEGRATION_SKIP_PROD_PAUSE=1`` env var to
+#    opt out (e.g. when intentionally exercising contention).
+#
+# 2. ``prod_marshal_pause`` — opt-in fixture for Path A tests that
+#    hit prod marshal directly via ``prod_marshal_client``. Skips
+#    the dependent tests when pause didn't take effect.
 
 
-# Default prod marshal URL — Path A tests target the user's running
+# Default prod marshal URL — both fixtures target the user's running
 # marshal directly. Override via env var if the operator runs marshal
 # on a non-default port.
 PROD_MARSHAL_URL = os.environ.get("MARSHAL_TEST_PROD_URL", "http://localhost:11435")
 
+# Manual escape hatch — set to ``1`` to skip the autouse pause (e.g.
+# when intentionally exercising contention with prod, or running on
+# a machine where the operator hasn't configured an admin token).
+SKIP_PAUSE_ENV = "MARSHAL_INTEGRATION_SKIP_PROD_PAUSE"
 
-def _prod_admin_token() -> str | None:
-    """Read prod marshal admin token from environment.
+# Auto-resume failsafe — set to one hour so a long integration run
+# (cold-start model loads + memory_behavior tests) doesn't trip the
+# failsafe mid-suite and re-introduce the v0.5.0 contamination bug
+# this fixture exists to prevent. Operators relying on a tighter
+# value can set MARSHAL_TEST_PAUSE_TIMEOUT_S explicitly.
+PAUSE_AUTO_RESUME_S = int(os.environ.get("MARSHAL_TEST_PAUSE_TIMEOUT_S", "3600"))
 
-    Returns None when not set so Path A tests can be skipped cleanly
-    rather than failing with a confusing 401.
-    """
-    return os.environ.get("MARSHAL_TEST_ADMIN_TOKEN") or None
+# Drain timeout — DEFAULT 0 (don't wait for in-flight to drain).
+# Pause flag is set server-side immediately; in-flight inferences
+# complete naturally while the suite runs. Empirically: a non-zero
+# drain timeout (e.g. 60s) blocks fixture setup waiting for prod's
+# in-flight inferences to finish, which on a busy machine adds 60s
+# of cold start AND introduced new flakes in multi-instance routing
+# tests. The zero-drain path is faster (suite went from 6:13 to
+# 2:34) AND eliminates 4 multi-instance test failures. Operators
+# who want a stricter drain (e.g. before destructive admin work)
+# can set MARSHAL_TEST_PAUSE_DRAIN_S explicitly.
+PAUSE_DRAIN_TIMEOUT_S = int(os.environ.get("MARSHAL_TEST_PAUSE_DRAIN_S", "0"))
 
-
-def _prod_bypass_token() -> str | None:
-    """Read prod marshal test-bypass token from environment."""
-    return os.environ.get("MARSHAL_TEST_BYPASS_TOKEN") or None
+_log = structlog.get_logger("integration.prod_pause")
 
 
 def _prod_marshal_reachable() -> bool:
@@ -523,59 +562,147 @@ def _prod_marshal_reachable() -> bool:
         return False
 
 
-@pytest.fixture(scope="session")
-async def prod_marshal_pause() -> AsyncIterator[None]:
-    """Pause the live prod marshal for the duration of Path A tests.
+async def _prod_pause(token: str) -> bool:
+    """Send pause request to prod marshal; True if pause flag is in effect.
 
-    Soft-pause: prod marshal stops dispatching from its queue but
-    continues accepting new requests (no client-visible 503s). Path A
-    tests fire requests with the test-bypass token so they dispatch
-    even during the pause. After all Path A tests complete, the
-    fixture calls resume so prod drains its accumulated queue.
-
-    Skips the entire Path A test phase if:
-    - Prod marshal isn't reachable at PROD_MARSHAL_URL
-    - MARSHAL_TEST_ADMIN_TOKEN env var is unset
-    - The pause endpoint returns 409 (drain timeout exceeded — likely
-      a long-running inference in flight)
-
-    The auto-resume failsafe (default 5min) ensures prod resumes
-    automatically if this fixture's teardown fails to fire (e.g.
-    test session crashed).
+    Server returns:
+    - 200: drain completed AND pause flag set
+    - 409: drain timed out BUT pause flag is still set (one or more
+      inferences are mid-stream, but no NEW dispatch happens). Per
+      ``Scheduler.pause()`` docstring: "The pause flag is set in
+      either case — a False return is informational, not a failure
+      to pause." So 409 is ALSO success from the fixture's
+      perspective — pause is in effect, resume is required on
+      teardown.
+    - any other: bypass disabled, auth fail, or other server error
+      — treat as no-pause and skip.
     """
-    admin_token = _prod_admin_token()
-    if not admin_token:
-        pytest.skip("MARSHAL_TEST_ADMIN_TOKEN not set — skipping prod-bound tests")
+    async with httpx.AsyncClient(timeout=120) as client:
+        try:
+            resp = await client.post(
+                f"{PROD_MARSHAL_URL}/api/marshal/admin/pause",
+                headers={"X-Marshal-Admin-Token": token},
+                json={
+                    "drain_timeout_s": PAUSE_DRAIN_TIMEOUT_S,
+                    "auto_resume_after_seconds": PAUSE_AUTO_RESUME_S,
+                },
+            )
+        except httpx.HTTPError as exc:
+            _log.warning("prod_pause.network_error", error=str(exc))
+            return False
+    if resp.status_code == 200:
+        return True
+    if resp.status_code == 409:
+        _log.warning(
+            "prod_pause.drain_timeout_but_paused",
+            in_flight=resp.json().get("in_flight"),
+            drain_timeout_s=PAUSE_DRAIN_TIMEOUT_S,
+        )
+        return True
+    _log.warning("prod_pause.unexpected_status", status=resp.status_code)
+    return False
+
+
+async def _prod_resume(token: str) -> None:
+    """Send resume request to prod marshal; log + best-effort, never raise."""
+    async with httpx.AsyncClient(timeout=120) as client:
+        try:
+            resp = await client.post(
+                f"{PROD_MARSHAL_URL}/api/marshal/admin/resume",
+                headers={"X-Marshal-Admin-Token": token},
+            )
+        except httpx.HTTPError as exc:
+            _log.warning(
+                "prod_pause.resume_failed",
+                error=str(exc),
+                will_auto_resume_in_s=PAUSE_AUTO_RESUME_S,
+            )
+            return
+        if resp.status_code != 200:
+            _log.warning(
+                "prod_pause.resume_non_200",
+                status=resp.status_code,
+                will_auto_resume_in_s=PAUSE_AUTO_RESUME_S,
+            )
+
+
+@pytest_asyncio.fixture(loop_scope="session", scope="session", autouse=True)
+async def pause_local_prod_marshal() -> AsyncIterator[bool]:
+    """Pause local prod marshal at :11435 for the integration session.
+
+    Yields ``True`` if prod was paused, ``False`` if the fixture
+    no-op'd. The autouse flag means EVERY test in the integration
+    suite picks this up — preventing the cross-suite VRAM contention
+    that has been blocking the suite since v0.5.0.
+
+    No-op (yields False, does NOT skip tests) when:
+
+    - ``MARSHAL_INTEGRATION_SKIP_PROD_PAUSE=1`` is set
+    - Prod marshal isn't reachable at ``PROD_MARSHAL_URL``
+    - No admin token is discoverable (env var or
+      ``~/.ollama-marshal/admin-tokens.env``)
+    - The pause endpoint returns non-200 (drain timeout, 401, 404
+      because admin endpoints are disabled, etc.)
+    - The pause request raises ``httpx.HTTPError`` (network blip)
+
+    Pause/resume use separate short-lived httpx clients so the
+    request lifetime is decoupled from the session-long event loop.
+    Auto-resume failsafe at ``PAUSE_AUTO_RESUME_S`` (default 1h)
+    protects against pytest crashes leaving prod paused indefinitely.
+    Operators don't need to remember to source the tokens file —
+    ``discover_admin_token`` reads it directly when env is unset.
+    """
+    if os.environ.get(SKIP_PAUSE_ENV) == "1":
+        yield False
+        return
+    if not _prod_marshal_reachable():
+        yield False
+        return
+    token = discover_admin_token()
+    if not token:
+        yield False
+        return
+
+    if not await _prod_pause(token):
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        await _prod_resume(token)
+
+
+@pytest_asyncio.fixture(loop_scope="session", scope="session")
+async def prod_marshal_pause(
+    pause_local_prod_marshal: bool,
+) -> None:
+    """Adapter for Path A tests — skips when autouse pause didn't take.
+
+    Path A tests fire requests against the live prod marshal via
+    ``prod_marshal_client``. They require pause to be in effect AND
+    a bypass token to be discoverable. The autouse fixture above
+    handles the actual pause/resume; this adapter just decides
+    whether the dependent tests should run.
+    """
+    if pause_local_prod_marshal:
+        return
+    if os.environ.get(SKIP_PAUSE_ENV) == "1":
+        pytest.skip(f"{SKIP_PAUSE_ENV}=1 — skipping prod-bound tests")
+    if not discover_admin_token():
+        pytest.skip(
+            "MARSHAL_TEST_ADMIN_TOKEN not set and no readable "
+            "~/.ollama-marshal/admin-tokens.env — skipping prod-bound tests"
+        )
     if not _prod_marshal_reachable():
         pytest.skip(
             f"prod marshal not reachable at {PROD_MARSHAL_URL} — "
             "skipping prod-bound tests"
         )
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            f"{PROD_MARSHAL_URL}/api/marshal/admin/pause",
-            headers={"X-Marshal-Admin-Token": admin_token},
-            json={"drain_timeout_s": 60, "auto_resume_after_seconds": 600},
-        )
-        if resp.status_code == 409:
-            pytest.skip(
-                "prod marshal drain timed out (long inference in flight) — "
-                "skipping prod-bound tests"
-            )
-        if resp.status_code != 200:
-            pytest.skip(
-                f"prod marshal pause returned {resp.status_code}: "
-                f"{resp.text} — skipping prod-bound tests"
-            )
-
-        try:
-            yield
-        finally:
-            await client.post(
-                f"{PROD_MARSHAL_URL}/api/marshal/admin/resume",
-                headers={"X-Marshal-Admin-Token": admin_token},
-            )
+    pytest.skip(
+        "prod marshal pause failed (admin endpoints disabled, drain "
+        "timeout, or transient error) — skipping prod-bound tests"
+    )
 
 
 @pytest.fixture
@@ -589,9 +716,12 @@ async def prod_marshal_client(
     test-bypass token so the request flows during pause AND the
     integration-test program ID for CRITICAL priority routing.
     """
-    bypass_token = _prod_bypass_token()
+    bypass_token = discover_bypass_token()
     if not bypass_token:
-        pytest.skip("MARSHAL_TEST_BYPASS_TOKEN not set — skipping prod-bound tests")
+        pytest.skip(
+            "MARSHAL_TEST_BYPASS_TOKEN not set and no readable "
+            "~/.ollama-marshal/admin-tokens.env — skipping prod-bound tests"
+        )
 
     async with httpx.AsyncClient(
         base_url=PROD_MARSHAL_URL,

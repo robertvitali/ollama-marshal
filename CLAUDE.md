@@ -164,6 +164,14 @@ GET /api/marshal/debug
   HTTP/1.1 proxy in front of Ollama. Hooks: `fail_next`,
   `disconnect_next`, `delay_next`, `fake_response`. Used for retry
   tests and the unexpected-unload test
+- `tests/integration/_admin_token.py` — token discovery for the
+  prod-pause fixtures. Reads `MARSHAL_TEST_ADMIN_TOKEN` /
+  `MARSHAL_TEST_BYPASS_TOKEN` from env, then falls back to parsing
+  `~/.ollama-marshal/admin-tokens.env` (mode 600 enforced). Used
+  by the autouse `pause_local_prod_marshal` fixture (v0.6.3+) so
+  the integration suite doesn't compete for Ollama VRAM with a
+  local prod marshal at `:11435`. Set
+  `MARSHAL_INTEGRATION_SKIP_PROD_PAUSE=1` to opt out.
 - Per-area test files: `test_smoke.py`, `test_memory_behavior.py`
   (the main thrust — model loading/unloading correctness),
   `test_fail_fast.py`, `test_num_ctx.py`, `test_retry.py`,

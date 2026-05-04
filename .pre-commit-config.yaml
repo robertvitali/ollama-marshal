@@ -46,12 +46,20 @@ repos:
         types: [python]
         pass_filenames: false
 
-      # NOTE: A pre-push integration test hook is INTENTIONALLY NOT
-      # configured. Integration tests share Ollama at :11434 with any
-      # local prod marshal at :11435, and the cross-suite contamination
-      # causes false-failures (and sometimes prod errors) on every push.
-      # The fix lives in v0.6.3: a pytest session-scoped fixture that
-      # pauses prod marshal via the v0.6.0 admin/pause endpoint, runs
-      # the suite, then resumes. Once that lands, the pre-push hook
-      # comes back. Until then, run `make pre-pr` manually before
-      # opening a PR.
+      # Run the integration test suite on every PUSH (~3min when prod
+      # marshal isn't running, longer when it is). The autouse
+      # `pause_local_prod_marshal` fixture (v0.6.3+) pauses any local
+      # prod marshal at :11435 for the duration of the suite so it
+      # doesn't compete for Ollama VRAM. Requires Ollama running on
+      # localhost:11434.
+      #
+      # Operators can skip this hook with `git push --no-verify` for
+      # WIP branches; the assumption is that PRs are pushed to ready
+      # branches that should pass the suite cleanly.
+      - id: pytest-integration
+        name: pytest (integration tests, on push)
+        entry: uv run --extra dev pytest tests/integration/ -m integration -q --no-cov
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]
