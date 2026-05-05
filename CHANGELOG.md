@@ -92,6 +92,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`pytest-timeout` hard escape valve.** Integration suite now runs
+  with `--timeout=1000` as a default (above the 900s Hop 2 budget per
+  request) so a single hung test or runaway VRAM lock can't stall
+  pre-push for hours. Tests with known long worst-case wallclock
+  (`test_marshal_eviction_drains_then_unloads` queues 4 sequential
+  900s chats) override via `@pytest.mark.timeout(3600)`. Added
+  `pytest-timeout>=2.3.0` to `[project.optional-dependencies].dev`.
+- **15-minute integration test forward-timeout budget.**
+  `INTEGRATION_FORWARD_TIMEOUT_S` raised from 120s to 900s. The new
+  budget absorbs the VRAM-contention window opened by
+  `PAUSE_DRAIN_TIMEOUT_S=0` (the v0.6.3 settled trade-off — see
+  `tests/integration/conftest.py` for the rationale block). With the
+  old 120s budget, even a tiny qwen3.5:0.8b chat with
+  `num_predict=4` would sporadically ReadTimeout on a contended
+  developer rig; 900s is generous enough that any genuine progress
+  completes within budget, while still surfacing real bugs that
+  would block beyond that. Test-side `httpx.AsyncClient(timeout=...)`
+  calls were also raised to 900s so the test client doesn't expire
+  before the marshal does. CLAUDE.md gained an "Integration test
+  infrastructure design decisions" section recording this and
+  related trade-offs (drain_timeout, priority semantics, pause
+  visibility) so future investigators don't re-litigate them.
 - **`paused` field in `/api/marshal/status` payload.** Surfaces the
   scheduler's dispatch-pause flag on the canonical (token-free) status
   endpoint, alongside `loaded_models`/`memory`/`queue`/`metrics`. The

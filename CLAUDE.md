@@ -193,6 +193,49 @@ GET /api/marshal/debug
   coverage — the unit suite mocks at the httpx boundary, missing
   exactly the bug class /review caught on PR #6 (v0.4.0)
 
+### Integration test infrastructure design decisions
+
+Settled trade-offs that should NOT be re-litigated without new
+evidence. Recorded here so future investigators don't redo the
+analysis from scratch.
+
+1. **`PAUSE_DRAIN_TIMEOUT_S = 0`** (v0.6.3, reaffirmed v0.6.6).
+   The autouse `pause_local_prod_marshal` fixture sets the pause
+   flag immediately and does NOT wait for prod's in-flight
+   inferences to drain. Reasons: a 60s drain on a busy machine
+   added 60s of cold start AND introduced new flakes in
+   multi-instance routing tests (suite went 6:13 → 2:34 with
+   `=0`, fixing 4 multi-instance failures). The cost — in-flight
+   prod inferences keep using Ollama VRAM until they naturally
+   finish — is absorbed by item 2 below.
+
+2. **`INTEGRATION_FORWARD_TIMEOUT_S = 900`** (15 min, v0.6.6 raised
+   from 120s). The Hop 2 budget (test marshal → Ollama) is large
+   enough to absorb VRAM-contention waits opened by the
+   `drain_timeout=0` choice above. A tiny qwen3.5:0.8b chat with
+   `num_predict=4` should complete in <5s; if it takes >900s
+   something is genuinely wrong and worth surfacing as a real bug.
+   Test-side `httpx.AsyncClient(timeout=...)` calls match this so
+   the test client doesn't ReadTimeout before the marshal does.
+
+3. **Test program priority is CRITICAL but doesn't help VRAM**
+   (informational, v0.6.6). Every test request carries
+   `X-Program-ID: integration-test` which `marshal_config` maps to
+   `Priority.CRITICAL`. CRITICAL preempts other programs in the
+   marshal queue, but the TEST marshal has no other traffic — so
+   priority is moot at that layer. Contention between test marshal
+   and prod marshal happens at OLLAMA's VRAM, where Ollama doesn't
+   have a priority concept (FIFO). Don't try to "fix" the
+   integration suite by tuning priority.
+
+4. **Pause state is visible on `/api/marshal/status`** (v0.6.6).
+   The `paused: bool` field on the canonical (token-free) status
+   payload lets the autouse fixture verify the dispatch flag
+   actually took effect after `admin/pause` returns success, and
+   lets operators see pause state without holding the admin token.
+   The fixture's `_verify_paused` step polls this for up to 5s and
+   warns loudly if the flag never propagates.
+
 ## Documentation Rules
 
 Every PR keeps these docs in sync with code changes (no drift allowed):

@@ -34,6 +34,7 @@ from ollama_marshal.config import (
 from tests.integration._fault_proxy import fault_proxy
 from tests.integration.conftest import (
     DEFAULT_OLLAMA_HOST,
+    INTEGRATION_FORWARD_TIMEOUT_S,
     PROGRAM_CRITICAL,
     REQUIRED_MODEL,
     _ollama_reachable,
@@ -78,7 +79,7 @@ def _build_config(*, tmp_paths: dict, ollama_host: str) -> MarshalConfig:
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
-            ollama_forward_timeout_s=60,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
         ),
         programs={
             "default": ProgramConfig(),
@@ -114,7 +115,7 @@ async def test_request_served_events_recorded(marshal_subprocess_client):
         "options": {"num_predict": 4},
     }
     for _ in range(5):
-        resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=60)
+        resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=900)
         assert resp.status_code == 200
     # AuditLogger flushes on a 100ms timer + final flush on shutdown.
     # Give it a beat AND let subprocess finalize before reading the
@@ -151,7 +152,7 @@ async def test_no_prompt_content_in_audit_records(marshal_subprocess_client):
         "stream": False,
         "options": {"num_predict": 4},
     }
-    resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=60)
+    resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=900)
     assert resp.status_code == 200
     await asyncio.sleep(0.5)
 

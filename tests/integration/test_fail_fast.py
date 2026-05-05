@@ -92,7 +92,7 @@ async def test_freshly_pulled_model_recognized(marshal_subprocess_client):
         "stream": False,
         "options": {"num_predict": 4},
     }
-    r1 = await client.post("/api/chat", json=body, headers=_HDR, timeout=60)
+    r1 = await client.post("/api/chat", json=body, headers=_HDR, timeout=900)
     assert r1.status_code == 200, r1.text
-    r2 = await client.post("/api/chat", json=body, headers=_HDR, timeout=60)
+    r2 = await client.post("/api/chat", json=body, headers=_HDR, timeout=900)
     assert r2.status_code == 200, r2.text

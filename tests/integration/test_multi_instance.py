@@ -327,7 +327,7 @@ async def test_cold_start_routes_to_f16_when_room(tmp_marshal_paths):
                 "stream": False,
             },
             headers={"X-Program-ID": PROGRAM_CRITICAL},
-            timeout=60,
+            timeout=900,
         )
         assert resp.status_code == 200, resp.text
 
@@ -389,7 +389,7 @@ async def test_already_loaded_q8_wins_over_empty_f16(tmp_marshal_paths):
                 "stream": False,
             },
             headers={"X-Program-ID": PROGRAM_CRITICAL},
-            timeout=60,
+            timeout=900,
         )
         assert resp.status_code == 200, resp.text
 
@@ -434,7 +434,7 @@ async def test_audit_log_records_tier_and_reason(tmp_marshal_paths):
                 "stream": False,
             },
             headers={"X-Program-ID": PROGRAM_CRITICAL},
-            timeout=60,
+            timeout=900,
         )
         assert resp.status_code == 200
 
@@ -614,7 +614,7 @@ async def test_fault_proxy_envelope_tagged_with_chosen_instance(tmp_marshal_path
                     "stream": False,
                 },
                 headers={"X-Program-ID": PROGRAM_CRITICAL},
-                timeout=60,
+                timeout=900,
             )
             assert resp.status_code == 200, resp.text
 
@@ -698,7 +698,7 @@ async def test_fault_proxy_forward_request_targets_chosen_instance(tmp_marshal_p
                     "stream": False,
                 },
                 headers={"X-Program-ID": PROGRAM_CRITICAL},
-                timeout=60,
+                timeout=900,
             )
             assert resp.status_code == 200
 
@@ -928,7 +928,7 @@ async def test_fault_proxy_one_instance_failure_does_not_break_others(
                     "stream": False,
                 },
                 headers={"X-Program-ID": PROGRAM_CRITICAL},
-                timeout=60,
+                timeout=900,
             )
             assert resp.status_code == 200, resp.text
 
@@ -1000,7 +1000,7 @@ async def test_legacy_single_instance_config_still_works(tmp_marshal_paths):
                 "stream": False,
             },
             headers={"X-Program-ID": PROGRAM_CRITICAL},
-            timeout=60,
+            timeout=900,
         )
         assert resp.status_code == 200
 

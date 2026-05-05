@@ -132,7 +132,7 @@ async def test_real_chat_round_trip(marshal_subprocess_client):
         "/api/chat",
         json=body,
         headers={"X-Program-ID": PROGRAM_CRITICAL},
-        timeout=60,
+        timeout=900,
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()
@@ -183,7 +183,7 @@ async def test_real_generate_streaming_round_trip(marshal_subprocess_client):
         "/api/generate",
         json=body,
         headers={"X-Program-ID": PROGRAM_CRITICAL},
-        timeout=60,
+        timeout=900,
     ) as resp:
         assert resp.status_code == 200, await resp.aread()
         async for line in resp.aiter_lines():

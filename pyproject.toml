@@ -46,6 +46,16 @@ dev = [
     "pytest>=8.0.0",
     "pytest-cov>=5.0.0",
     "pytest-asyncio>=0.23.0",
+    # Hard escape valve for hung tests. The integration suite's
+    # ``INTEGRATION_FORWARD_TIMEOUT_S = 900`` lets a single chat wait
+    # 15 min for VRAM contention to clear; without a pytest-level
+    # timeout, a runaway VRAM lock or infinite loop in production
+    # marshal can stall pre-push for hours. Default deadline is set
+    # in ``[tool.pytest.ini_options].addopts`` below; tests with
+    # known long worst-case wallclock (e.g.
+    # ``test_marshal_eviction_drains_then_unloads`` at 4 × 900s)
+    # override via ``@pytest.mark.timeout``.
+    "pytest-timeout>=2.3.0",
     "mypy>=1.10.0",
     "ruff>=0.5.0",
     "pre-commit>=3.7.0",
@@ -174,6 +184,16 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-report=html:htmlcov",
     "--cov-fail-under=95",
+    # Hard escape valve. Default per-test wallclock cap of 1000s — a
+    # comfortable margin above the integration suite's 900s Hop 2
+    # forward-timeout budget so a single in-flight request can complete
+    # but a runaway test (infinite loop, deadlock, hung Ollama) doesn't
+    # stall pre-push for hours. Tests that legitimately need longer
+    # (multi-request flows like ``test_marshal_eviction_drains_then_
+    # unloads`` whose worst-case is ~3600s) override via
+    # ``@pytest.mark.timeout(N)``. Unit tests finish in <1s each so
+    # this gate is effectively integration-suite-only.
+    "--timeout=1000",
 ]
 
 [tool.coverage.run]

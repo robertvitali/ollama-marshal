@@ -45,6 +45,7 @@ from ollama_marshal.config import (
 from tests.integration._fault_proxy import fault_proxy
 from tests.integration.conftest import (
     DEFAULT_OLLAMA_HOST,
+    INTEGRATION_FORWARD_TIMEOUT_S,
     PROGRAM_CRITICAL,
     PROGRAM_NORMAL,
     REQUIRED_MODEL,
@@ -116,7 +117,7 @@ async def _trigger_load(
         "/api/chat",
         json=body,
         headers=headers or _HDR_CRIT,
-        timeout=60,
+        timeout=900,
     )
     assert resp.status_code == 200, resp.text
 
@@ -267,6 +268,7 @@ async def test_bin_packing_keeps_multiple_models_loaded(marshal_app, cleanup_mod
 
 
 @_REQUIRES_MODELS
+@pytest.mark.timeout(3600)  # 4 sequential normal-priority chats x 900s budget
 async def test_marshal_eviction_drains_then_unloads(tmp_marshal_paths):
     """When eviction is needed, A's pending requests serve BEFORE A unloads.
 
@@ -331,7 +333,7 @@ async def test_marshal_eviction_drains_then_unloads(tmp_marshal_paths):
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
-            ollama_forward_timeout_s=120,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
         ),
         programs={
             "default": ProgramConfig(),
@@ -369,7 +371,11 @@ async def test_marshal_eviction_drains_then_unloads(tmp_marshal_paths):
         b_task = asyncio.create_task(
             _trigger_load(client, SECOND_MODEL, headers=_HDR_NORMAL)
         )
-        # All requests must complete (timeout 120s).
+        # All requests must complete. Each chat is bounded by
+        # ``ollama_forward_timeout_s`` = INTEGRATION_FORWARD_TIMEOUT_S
+        # (900s / 15 min) — worst-case wallclock for this test is
+        # ~3600s (4 sequentially-queued normal-priority chats x 900s)
+        # under heavy VRAM contention. Typical run completes in <30s.
         await asyncio.gather(*a_tasks, b_task)
         # Allow audit buffer to flush.
         await asyncio.sleep(0.3)
@@ -494,7 +500,7 @@ async def test_reload_does_not_drain_triggering_request(tmp_marshal_paths):
         scheduler=SchedulerConfig(
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
-            ollama_forward_timeout_s=120,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
         ),
         programs={
             "default": ProgramConfig(),
@@ -679,7 +685,7 @@ async def test_unexpected_unload_detection(tmp_marshal_paths, cleanup_models):
             scheduler=SchedulerConfig(
                 metrics_path=str(tmp_marshal_paths["metrics_path"]),
                 metrics_persist_interval_s=3600,
-                ollama_forward_timeout_s=60,
+                ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
             ),
             programs={
                 "default": ProgramConfig(),
@@ -765,7 +771,7 @@ async def test_idle_eviction_marks_intended_unload(tmp_marshal_paths, cleanup_mo
             idle_eviction_minutes=1,  # scheduler treats <1 as disabled, so 1 min
             metrics_path=str(tmp_marshal_paths["metrics_path"]),
             metrics_persist_interval_s=3600,
-            ollama_forward_timeout_s=60,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
         ),
         programs={
             "default": ProgramConfig(),

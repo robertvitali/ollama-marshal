@@ -43,6 +43,7 @@ from ollama_marshal.config import (
 )
 from tests.integration._fault_proxy import fault_proxy
 from tests.integration.conftest import (
+    INTEGRATION_FORWARD_TIMEOUT_S,
     PROGRAM_CRITICAL,
     REQUIRED_MODEL,
     _ollama_reachable,
@@ -80,7 +81,7 @@ def _build_config(
             metrics_persist_interval_s=3600,
             benchmark_on_startup=False,
             model_detect_interval=model_detect_interval,
-            ollama_forward_timeout_s=60,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
         ),
         programs={
             "default": ProgramConfig(),

@@ -61,12 +61,38 @@ REQUIRED_MODEL = "qwen3.5:0.8b-bf16"
 # Default Ollama host the suite expects to be reachable.
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 
-# Forward-timeout used by every integration test config. v0.6.6 bumped from
-# 90s to absorb cross-suite contention (autouse pause stops new dispatches but
-# in-flight Ollama work — large model loads, multi-second inferences — can
-# still queue test requests behind it on a contended box). Single source of
-# truth so future tuning lands in one place.
-INTEGRATION_FORWARD_TIMEOUT_S = 120
+# Forward-timeout used by every integration test config (Hop 2: marshal
+# → Ollama). v0.6.6 bumped from 120s to 900s (15 min) to absorb the
+# inherent VRAM-contention window opened by ``PAUSE_DRAIN_TIMEOUT_S=0``
+# below.
+#
+# Why 15 minutes:
+# - The autouse ``pause_local_prod_marshal`` fixture stops NEW prod
+#   dispatches but lets in-flight Ollama inferences finish naturally
+#   (the v0.6.3 trade-off — see ``PAUSE_DRAIN_TIMEOUT_S`` rationale).
+# - When prod has heavy models (gpt-oss:120b, qwen3:235b) actively
+#   serving, those inferences hold Ollama VRAM until they complete
+#   (~5-30s typically, longer for big context).
+# - Test marshal preloads land fine but the chat call to Ollama then
+#   sits behind that contention. With the old 120s budget, even a
+#   tiny qwen3.5:0.8b chat with num_predict=4 would ReadTimeout
+#   sporadically and fail multi_instance tests.
+# - 900s is generous enough that any genuine progress (Ollama eventually
+#   freeing VRAM and serving the request) completes within budget;
+#   anything longer signals a real bug worth surfacing.
+#
+# Why not a "progressive" no-progress timeout:
+# - HTTP doesn't expose mid-request progress for ``stream: False``
+#   chats — we send the prompt, then wait for the full response.
+# - For streaming, marshal already proxies chunks as they arrive.
+# - A true progress-aware timeout would require marshal to observe
+#   /api/ps for evidence of activity (size_vram, expires_at advancing).
+#   That's v0.7+ work; bumping the wall-clock budget gets us reliable
+#   pre-push hooks in the meantime.
+#
+# Single source of truth — every fixture and inline test client
+# reads from this constant.
+INTEGRATION_FORWARD_TIMEOUT_S = 900
 
 # Program ID conventions — tests use these via the X-Program-ID header.
 # integration-test (critical) is the default; integration-test-normal
@@ -112,8 +138,8 @@ def marshal_config(tmp_marshal_paths: dict[str, Path]) -> MarshalConfig:
     Test defaults that differ from production:
 
     - ``scheduler.ollama_forward_timeout_s = INTEGRATION_FORWARD_TIMEOUT_S``
-      (currently 120s) — see the constant's docstring at module top
-      for the rationale and tuning history.
+      (currently 900s / 15 min) — see the constant's docstring at
+      module top for the rationale and tuning history.
     - ``memory.poll_interval = 1`` — speed up unexpected-unload tests.
       Real production uses 5s.
     - ``shutdown.mode = IMMEDIATE``, ``unload_models = True`` — when
@@ -497,7 +523,7 @@ async def marshal_subprocess_client(
     base_url, audit_path = marshal_subprocess
     async with httpx.AsyncClient(
         base_url=base_url,
-        timeout=60,
+        timeout=900,
         headers={
             "X-Marshal-Test-Bypass": SUBPROCESS_BYPASS_TOKEN,
         },
@@ -545,15 +571,26 @@ SKIP_PAUSE_ENV = "MARSHAL_INTEGRATION_SKIP_PROD_PAUSE"
 PAUSE_AUTO_RESUME_S = int(os.environ.get("MARSHAL_TEST_PAUSE_TIMEOUT_S", "3600"))
 
 # Drain timeout — DEFAULT 0 (don't wait for in-flight to drain).
-# Pause flag is set server-side immediately; in-flight inferences
-# complete naturally while the suite runs. Empirically: a non-zero
-# drain timeout (e.g. 60s) blocks fixture setup waiting for prod's
-# in-flight inferences to finish, which on a busy machine adds 60s
-# of cold start AND introduced new flakes in multi-instance routing
-# tests. The zero-drain path is faster (suite went from 6:13 to
-# 2:34) AND eliminates 4 multi-instance test failures. Operators
-# who want a stricter drain (e.g. before destructive admin work)
-# can set MARSHAL_TEST_PAUSE_DRAIN_S explicitly.
+#
+# DESIGN DECISION (v0.6.3, reaffirmed v0.6.6 — do not re-litigate without
+# evidence). Pause flag is set server-side immediately; in-flight
+# inferences complete naturally while the suite runs. Empirically:
+# a non-zero drain timeout (e.g. 60s) blocks fixture setup waiting
+# for prod's in-flight inferences to finish, which on a busy machine
+# adds 60s of cold start AND introduced new flakes in multi-instance
+# routing tests. The zero-drain path is faster (suite went from 6:13
+# to 2:34) AND eliminated 4 multi-instance test failures.
+#
+# Trade-off this opens: in-flight prod inferences keep using Ollama
+# VRAM until they naturally finish (~5-30s, longer for big context),
+# competing with test marshal's preload + chat dispatches. We absorb
+# this in the integration tests by setting a 15-minute Hop 2 budget
+# (``INTEGRATION_FORWARD_TIMEOUT_S = 900`` at module top) so VRAM-
+# contended chats complete within budget instead of ReadTimeout-ing
+# at 120s.
+#
+# Operators who want a stricter drain (e.g. before destructive admin
+# work) can set MARSHAL_TEST_PAUSE_DRAIN_S explicitly.
 PAUSE_DRAIN_TIMEOUT_S = int(os.environ.get("MARSHAL_TEST_PAUSE_DRAIN_S", "0"))
 
 _log = structlog.get_logger("integration.prod_pause")
@@ -627,10 +664,19 @@ async def _verify_paused() -> bool:
 
     Returns True if pause was confirmed in effect; False otherwise.
     Loudly logs on failure so a silent no-op doesn't slip past.
+
+    Per-attempt timeout (2s) is intentionally below the overall deadline
+    (15s) so a single slow status response doesn't burn the whole budget.
+    The status payload calls into psutil + queue + memory polling and can
+    legitimately stall a few seconds on a contended box — hence the
+    generous 15s overall window with fast retries. The structured log on
+    failure distinguishes "field absent" (operator must upgrade prod
+    marshal to v0.6.6+) from "field present but False" (real flag-stuck
+    case worth investigating) so operators don't have to read prose.
     """
-    deadline = asyncio.get_event_loop().time() + 5.0
+    deadline = asyncio.get_event_loop().time() + 15.0
     last_payload: dict[str, Any] | None = None
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=2.0) as client:
         while asyncio.get_event_loop().time() < deadline:
             try:
                 resp = await client.get(f"{PROD_MARSHAL_URL}/api/marshal/status")
@@ -644,14 +690,16 @@ async def _verify_paused() -> bool:
             if paused_field is True:
                 return True
             await asyncio.sleep(0.2)
+    last = last_payload or {}
+    field_present = "paused" in last
     _log.warning(
         "prod_pause.verify_failed",
-        paused_field=(last_payload or {}).get("paused"),
+        field_present=field_present,
+        paused_field=last.get("paused"),
         reason=(
-            "admin/pause returned success but /api/marshal/status did "
-            "not show paused=True within 5s. Prod marshal may be on a "
-            "version <0.6.6 (no paused field) — upgrade prod to fix; "
-            "or the dispatch flag genuinely didn't toggle."
+            "prod marshal lacks the ``paused`` field — upgrade to v0.6.6+"
+            if not field_present
+            else "dispatch flag did not toggle within 15s — investigate"
         ),
     )
     return False
@@ -790,7 +838,7 @@ async def prod_marshal_client(
 
     async with httpx.AsyncClient(
         base_url=PROD_MARSHAL_URL,
-        timeout=60,
+        timeout=900,
         headers={
             "X-Marshal-Test-Bypass": bypass_token,
             "X-Program-ID": PROGRAM_CRITICAL,

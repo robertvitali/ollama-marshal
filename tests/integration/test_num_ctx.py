@@ -69,7 +69,7 @@ async def _fire_chat(
     if num_ctx is not None:
         options["num_ctx"] = num_ctx
     body["options"] = options
-    resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=60)
+    resp = await client.post("/api/chat", json=body, headers=_HDR, timeout=900)
     assert resp.status_code == 200, resp.text
 
 
