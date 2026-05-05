@@ -58,6 +58,11 @@ def _mock_scheduler():
     sched.active_programs_by_model = MagicMock(
         return_value={"llama3:latest": ["program-beta"]}
     )
+    # v0.6.6: status payload exposes ``paused`` so the integration
+    # suite's autouse pause fixture can verify the dispatch flag
+    # actually toggled. Default to False; tests that assert the
+    # paused branch override this.
+    sched.is_paused = MagicMock(return_value=False)
     return sched
 
 
@@ -931,6 +936,52 @@ class TestMarshalStatus:
         assert m["retries_succeeded"] == 4
         assert m["unexpected_unloads"] == 2
         assert m["reload_count"] == 1
+
+    async def test_status_exposes_paused_field(self):
+        # v0.6.6: ``paused`` surfaced on the canonical status endpoint
+        # so the integration suite's autouse pause-prod fixture can
+        # verify admin/pause actually took effect, and operators can
+        # see dispatch state without needing the admin token.
+        config = MarshalConfig()
+        app = create_app(config)
+
+        server_mod._queues = _mock_queues()
+        server_mod._memory = _mock_memory()
+        sched = _mock_scheduler()
+        sched.is_paused = MagicMock(return_value=True)
+        server_mod._scheduler = sched
+        server_mod._started_at = time.monotonic() - 60
+
+        status_handler = None
+        for route in app.routes:
+            if isinstance(route, Route) and route.path == "/api/marshal/status":
+                status_handler = route.endpoint
+                break
+        assert status_handler is not None
+        result = await status_handler()
+
+        assert result.get("paused") is True
+        sched.is_paused.assert_called()
+
+    async def test_status_paused_false_when_dispatching(self):
+        config = MarshalConfig()
+        app = create_app(config)
+
+        server_mod._queues = _mock_queues()
+        server_mod._memory = _mock_memory()
+        # _mock_scheduler defaults is_paused → False
+        server_mod._scheduler = _mock_scheduler()
+        server_mod._started_at = time.monotonic() - 60
+
+        status_handler = None
+        for route in app.routes:
+            if isinstance(route, Route) and route.path == "/api/marshal/status":
+                status_handler = route.endpoint
+                break
+        assert status_handler is not None
+        result = await status_handler()
+
+        assert result.get("paused") is False
 
 
 # ---------------------------------------------------------------------------

@@ -447,6 +447,14 @@ def _register_routes(app: FastAPI) -> None:
                 "total_pending": await _queues.total_pending(),
                 "by_model": pending_by_model,
             },
+            # v0.6.6+: dispatch state is surfaced here as well as on the
+            # gated /api/marshal/debug endpoint so operators (and the
+            # integration suite's autouse pause-prod fixture) can verify
+            # ``admin/pause`` actually took effect without needing the
+            # admin token. The field is True when the scheduler is
+            # holding non-bypass envelopes; bypass-flagged envelopes
+            # still dispatch via ``_tick_bypass_only``.
+            "paused": _scheduler.is_paused(),
             "metrics": {
                 "requests_served": _scheduler.metrics.requests_served,
                 "model_swaps": _scheduler.metrics.model_swaps,

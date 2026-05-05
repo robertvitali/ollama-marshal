@@ -583,6 +583,14 @@ async def _prod_pause(token: str) -> bool:
       teardown.
     - any other: bypass disabled, auth fail, or other server error
       — treat as no-pause and skip.
+
+    After the pause call returns "paused per server", v0.6.6+ does an
+    independent verification by polling ``/api/marshal/status`` for
+    ``paused: True``. Without this verify-step a partial pause (e.g.
+    test bypass routes new requests but the underlying flag never
+    actually toggled, or the admin endpoint returned success but
+    state didn't propagate) would silently let prod workloads keep
+    contending for Ollama VRAM during the test run.
     """
     async with httpx.AsyncClient(timeout=120) as client:
         try:
@@ -597,16 +605,55 @@ async def _prod_pause(token: str) -> bool:
         except httpx.HTTPError as exc:
             _log.warning("prod_pause.network_error", error=str(exc))
             return False
-    if resp.status_code == 200:
-        return True
     if resp.status_code == 409:
         _log.warning(
             "prod_pause.drain_timeout_but_paused",
             in_flight=resp.json().get("in_flight"),
             drain_timeout_s=PAUSE_DRAIN_TIMEOUT_S,
         )
-        return True
-    _log.warning("prod_pause.unexpected_status", status=resp.status_code)
+    elif resp.status_code != 200:
+        _log.warning("prod_pause.unexpected_status", status=resp.status_code)
+        return False
+
+    # Verify the flag actually took effect by reading the canonical
+    # status payload. ``paused`` was added to /api/marshal/status in
+    # v0.6.6 specifically so this check can run without holding the
+    # admin token.
+    return await _verify_paused()
+
+
+async def _verify_paused() -> bool:
+    """Poll /api/marshal/status until ``paused: True`` or short timeout.
+
+    Returns True if pause was confirmed in effect; False otherwise.
+    Loudly logs on failure so a silent no-op doesn't slip past.
+    """
+    deadline = asyncio.get_event_loop().time() + 5.0
+    last_payload: dict[str, Any] | None = None
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                resp = await client.get(f"{PROD_MARSHAL_URL}/api/marshal/status")
+                resp.raise_for_status()
+                last_payload = resp.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                _log.warning("prod_pause.verify_status_unreachable", error=str(exc))
+                await asyncio.sleep(0.2)
+                continue
+            paused_field = last_payload.get("paused") if last_payload else None
+            if paused_field is True:
+                return True
+            await asyncio.sleep(0.2)
+    _log.warning(
+        "prod_pause.verify_failed",
+        paused_field=(last_payload or {}).get("paused"),
+        reason=(
+            "admin/pause returned success but /api/marshal/status did "
+            "not show paused=True within 5s. Prod marshal may be on a "
+            "version <0.6.6 (no paused field) — upgrade prod to fix; "
+            "or the dispatch flag genuinely didn't toggle."
+        ),
+    )
     return False
 
 

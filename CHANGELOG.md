@@ -90,6 +90,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `models_removed` only when the set actually changed — without
   this, every poll cycle would re-emit the full un-benchmarked list.
 
+### Added
+
+- **`paused` field in `/api/marshal/status` payload.** Surfaces the
+  scheduler's dispatch-pause flag on the canonical (token-free) status
+  endpoint, alongside `loaded_models`/`memory`/`queue`/`metrics`. The
+  gated `/api/marshal/debug` endpoint still has the same field
+  (`is_paused`) but required the admin token; operators and the
+  integration suite's autouse `pause_local_prod_marshal` fixture can
+  now confirm pause actually took effect without needing it. The
+  fixture itself was also updated to verify the flag via this field
+  after `admin/pause` returns success — a partial-pause failure mode
+  (admin call accepted but state didn't propagate) would otherwise
+  silently let prod workloads keep contending for Ollama VRAM during
+  the test run.
+
 ### Fixed
 
 - **Shared-Ollama shutdown contamination (Bug 8).** When two
