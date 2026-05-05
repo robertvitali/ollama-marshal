@@ -20,7 +20,7 @@ import httpx
 import psutil
 import structlog
 
-from ollama_marshal.registry import ModelRegistry
+from ollama_marshal.registry import MalformedTagsResponseError, ModelRegistry
 
 logger = structlog.get_logger()
 
@@ -102,7 +102,7 @@ async def gather_report(
     registry = ModelRegistry(ollama_host=ollama_host)
     try:
         all_names = await registry.fetch_model_list()
-    except httpx.HTTPError:
+    except (httpx.HTTPError, MalformedTagsResponseError):
         logger.warning("doctor.tags_unreachable")
         return DoctorReport(total_ram_bytes=total_ram, loaded_models=[], all_models=[])
 

@@ -32,10 +32,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Defensive parsing of `/api/tags` responses.** `fetch_model_list`
   no longer propagates `JSONDecodeError`, `KeyError`, or `TypeError`
   on a malformed response (e.g. a fault-injection proxy mid-flight,
-  or an upstream error page). It returns an empty list with a
-  warning instead, so callers that only catch `httpx.HTTPError`
-  (such as `is_known_model`'s opportunistic resync) can no longer
-  poison the scheduler tick.
+  or an upstream error page). It raises a new
+  `MalformedTagsResponseError` instead, which `_sync_with_ollama`
+  treats exactly like `httpx.HTTPError` — skip state mutation,
+  leave `_known_models_last_sync` unchanged so `is_known_model`'s
+  fail-open detection still fires. Returning an empty list (the
+  v0.6.6 first-cut approach) was wrong: a single transient garbled
+  body would have been indistinguishable from "Ollama has zero
+  models installed" and would have wiped `_known_models` AND
+  deleted the on-disk size/metadata caches.
+- **`lifecycle.preload` calls `raise_for_status()` on `/api/generate`.**
+  Previously, a 404 from Ollama (model removed between request entry
+  and preload, or a multi-instance routing mismatch) was silently
+  consumed and `_wait_for_model` polled `/api/ps` for up to 120s
+  for a model that would never appear — stalling the scheduler.
+  The HTTP error now surfaces immediately and the existing
+  `except httpx.HTTPError` block returns `False`, letting the
+  scheduler's per-model failure counter take over.
 - **`_sync_lock` serializes concurrent registry syncs.** The periodic
   poll loop and `is_known_model`'s opportunistic resync now share an
   `asyncio.Lock` around `_sync_with_ollama`. Without it, two in-flight

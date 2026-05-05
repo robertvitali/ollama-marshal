@@ -145,11 +145,23 @@ class ModelLifecycle:
                     # size is fixed until a reload — that's why
                     # marshal's reload-on-need logic exists.
                     payload["options"] = {"num_ctx": num_ctx}
-                await client.post(
+                resp = await client.post(
                     f"{host}/api/generate",
                     json=payload,
                     timeout=timeout,
                 )
+                # If Ollama doesn't have the model (e.g. removed
+                # between request entry and preload, or the registry
+                # check is fooled by a multi-instance routing
+                # mismatch), /api/generate returns 404. Without
+                # raise_for_status, the response is silently consumed
+                # and `_wait_for_model` polls /api/ps for up to 120s
+                # waiting on a model that will never appear — stalling
+                # the scheduler. Surface the HTTP error here so the
+                # surrounding `except httpx.HTTPError` returns False
+                # immediately and the caller's failure-counter logic
+                # (scheduler._record_preload_failure) takes over.
+                resp.raise_for_status()
 
                 # Wait for model to appear in /api/ps on this instance.
                 loaded = await self._wait_for_model(client, model, host)

@@ -165,6 +165,41 @@ class TestPreload:
         mock_client.post.assert_not_awaited()
         mock_client.get.assert_not_awaited()
 
+    async def test_preload_returns_false_on_404_from_generate(self, lifecycle):
+        # v0.6.6 Bug 6 (Codex finding): if Ollama returns 404 from
+        # /api/generate (model removed between request entry and
+        # preload, multi-instance routing mismatch), the response
+        # must NOT fall through into _wait_for_model — that would
+        # poll /api/ps for up to 120s for a model that will never
+        # appear, stalling the scheduler. raise_for_status converts
+        # the 404 into httpx.HTTPStatusError, the existing
+        # except httpx.HTTPError block returns False immediately.
+        mock_response = MagicMock(spec=httpx.Response)
+        mock_response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                "404 Not Found",
+                request=MagicMock(spec=httpx.Request),
+                response=MagicMock(spec=httpx.Response, status_code=404),
+            )
+        )
+
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post = AsyncMock(return_value=mock_response)
+        # _wait_for_model uses .get on the same client — must not be
+        # reached. AsyncMock will track if it was called.
+        mock_client.get = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "ollama_marshal.lifecycle.httpx.AsyncClient", return_value=mock_client
+        ):
+            result = await lifecycle.preload("removed:model")
+
+        assert result is False
+        # _wait_for_model must not have been invoked — no /api/ps poll.
+        mock_client.get.assert_not_called()
+
     async def test_preload_proceeds_when_model_known(self, lifecycle):
         # Sanity check: a True predicate must NOT block the normal path.
         mock_post_response = MagicMock(spec=httpx.Response)

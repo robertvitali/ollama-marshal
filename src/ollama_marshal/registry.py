@@ -70,6 +70,20 @@ _FALLBACK_KV_DIM = 4096
 _KNOWN_MODELS_RESYNC_MIN_INTERVAL_S = 5.0
 
 
+class MalformedTagsResponseError(Exception):
+    """Raised when /api/tags returns a non-JSON or wrong-shape body.
+
+    Distinguished from `httpx.HTTPError` so the registry sync path
+    can treat a malformed response as a *failed* sync rather than as
+    an authoritative "Ollama has zero models" — committing the empty
+    set as truth would falsely prune `_known_models` AND delete the
+    on-disk size/metadata caches on a single transient bad response
+    (e.g. a proxy mid-flight returning a text/plain error page).
+    Callers should catch this alongside `httpx.HTTPError` and skip
+    state mutation.
+    """
+
+
 @dataclass
 class ModelMetadata:
     """Architecture-derived metadata used for context + parallelism math.
@@ -314,6 +328,20 @@ class ModelRegistry:
                     "model_registry.sync_failed", reason="cannot reach Ollama"
                 )
                 return
+            except MalformedTagsResponseError as exc:
+                # A 200 with garbage body must NOT be committed as an
+                # authoritative empty inventory — that would wipe
+                # _known_models and delete the on-disk size/metadata
+                # caches on a single transient bad response. Treat
+                # exactly like an httpx error: skip state mutation,
+                # leave _known_models_last_sync unchanged so
+                # is_known_model's fail-open detection still fires.
+                logger.warning(
+                    "model_registry.sync_failed",
+                    reason="malformed /api/tags response",
+                    detail=str(exc),
+                )
+                return
 
             new_set = set(current_models)
             is_first_sync = self._known_models_last_sync == 0.0
@@ -430,41 +458,49 @@ class ModelRegistry:
         method — `_fetch_model_list` is preserved as a thin alias for
         backwards compatibility with existing tests.
 
-        Defensively parses the response: a malformed body (proxy
-        mid-flight returning a text/plain error page, missing
-        `"models"`, non-list `"models"`, model entries missing
-        `"name"`) returns an empty list with a warning rather than
-        propagating `JSONDecodeError`/`KeyError`/`TypeError` up
-        through callers that only catch `httpx.HTTPError`.
+        Top-level shape errors (non-JSON body, response not a dict,
+        ``"models"`` not a list) raise `MalformedTagsResponseError`
+        rather than returning an empty list. Returning `[]` would be
+        indistinguishable from "Ollama has zero models installed" —
+        and the caller (`_sync_with_ollama`) would commit that empty
+        set as authoritative truth, wiping `_known_models` AND
+        deleting cached benchmarks/metadata on disk on a single
+        transient bad response (e.g. a proxy mid-flight returning a
+        text/plain error page). Per-entry malformations (missing
+        ``"name"``, wrong type) are still tolerated: that entry is
+        dropped and the rest are returned, since the document IS
+        valid Ollama-shaped data — just one bad row.
 
         Returns:
-            List of model name strings (empty on malformed response).
+            List of model name strings.
+
+        Raises:
+            httpx.HTTPError: Connection failed, timed out, or non-2xx.
+            MalformedTagsResponseError: 200 response with body that
+                doesn't match the expected ``{"models": [...]}`` shape.
         """
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{self.ollama_host}/api/tags", timeout=10)
             resp.raise_for_status()
             try:
                 data = resp.json()
-            except ValueError:
-                # JSONDecodeError is a subclass of ValueError. A
-                # non-JSON body shouldn't be possible from real Ollama,
-                # but a fault-injection proxy or upstream error page
-                # can produce one — surface the trust-boundary
-                # violation rather than crashing the caller.
-                logger.warning(
-                    "model_registry.tags_malformed_json",
-                    host=self.ollama_host,
-                )
-                return []
+            except ValueError as exc:
+                # JSONDecodeError is a subclass of ValueError. Surface
+                # as MalformedTagsResponseError so the sync path can
+                # fail-soft (don't update state) rather than treat the
+                # garbled body as an authoritative empty inventory.
+                raise MalformedTagsResponseError(
+                    f"/api/tags returned non-JSON body from {self.ollama_host}"
+                ) from exc
         if not isinstance(data, dict):
-            logger.warning(
-                "model_registry.tags_malformed_shape", got=type(data).__name__
+            raise MalformedTagsResponseError(
+                f"/api/tags returned {type(data).__name__}, expected dict"
             )
-            return []
         models_raw = data.get("models", [])
         if not isinstance(models_raw, list):
-            logger.warning("model_registry.tags_malformed_shape", got="models-not-list")
-            return []
+            raise MalformedTagsResponseError(
+                "/api/tags returned 'models' that is not a list"
+            )
         out: list[str] = []
         for m in models_raw:
             if isinstance(m, dict):
@@ -544,7 +580,7 @@ class ModelRegistry:
         """
         try:
             current_models = await self._fetch_model_list()
-        except httpx.HTTPError:
+        except (httpx.HTTPError, MalformedTagsResponseError):
             return
 
         # Metadata probe is cheap — fan out for any model missing metadata,

@@ -288,37 +288,59 @@ class TestFetchModelList:
 
         assert result == []
 
-    async def test_returns_empty_on_non_json_body(self, registry):
-        # Defensive parsing (v0.6.6 Bug 6): a fault-injection proxy
+    async def test_raises_on_non_json_body(self, registry):
+        # v0.6.6 Bug 6 (Codex P1 fix): a fault-injection proxy
         # mid-flight or an upstream error page can return a non-JSON
-        # body. Without the defensive guard, resp.json() raises
-        # ValueError (json.JSONDecodeError) and would propagate out
-        # of every caller — including is_known_model's resync, where
-        # only httpx.HTTPError was previously caught.
+        # 200 body. Returning [] here would be indistinguishable from
+        # "Ollama has zero models" — the sync path would commit it as
+        # authoritative and wipe _known_models + on-disk caches. Raise
+        # MalformedTagsResponseError instead so callers fail-soft.
+        from ollama_marshal.registry import MalformedTagsResponseError
+
         mock_resp = MagicMock(spec=httpx.Response)
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.side_effect = ValueError("Expecting value")
         mock_client = _mock_async_client(AsyncMock())
         mock_client.get = AsyncMock(return_value=mock_resp)
 
-        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
-            result = await registry._fetch_model_list()
+        with (
+            patch(PATCH_ASYNC_CLIENT, return_value=mock_client),
+            pytest.raises(MalformedTagsResponseError),
+        ):
+            await registry._fetch_model_list()
 
-        assert result == []
-
-    async def test_returns_empty_on_non_dict_body(self, registry):
+    async def test_raises_on_non_dict_body(self, registry):
         # Same defense — Ollama returning a list (or string) at the
         # top level instead of {"models": [...]}.
+        from ollama_marshal.registry import MalformedTagsResponseError
+
         mock_resp = MagicMock(spec=httpx.Response)
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = ["unexpected", "list"]
         mock_client = _mock_async_client(AsyncMock())
         mock_client.get = AsyncMock(return_value=mock_resp)
 
-        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
-            result = await registry._fetch_model_list()
+        with (
+            patch(PATCH_ASYNC_CLIENT, return_value=mock_client),
+            pytest.raises(MalformedTagsResponseError),
+        ):
+            await registry._fetch_model_list()
 
-        assert result == []
+    async def test_raises_on_models_not_list(self, registry):
+        # Top-level "models" key present but wrong shape.
+        from ollama_marshal.registry import MalformedTagsResponseError
+
+        mock_resp = MagicMock(spec=httpx.Response)
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"models": "should-be-a-list"}
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with (
+            patch(PATCH_ASYNC_CLIENT, return_value=mock_client),
+            pytest.raises(MalformedTagsResponseError),
+        ):
+            await registry._fetch_model_list()
 
     async def test_skips_malformed_model_entries(self, registry):
         # Some entries malformed (missing name, wrong type) — keep
@@ -1327,6 +1349,52 @@ class TestSyncWithOllamaPeriodic:
             await populated_registry._sync_with_ollama()
 
         assert "newly-pulled:latest" in populated_registry._known_models
+
+    async def test_malformed_response_does_not_wipe_known_models(
+        self, populated_registry
+    ):
+        # v0.6.6 Bug 6 (Codex P1 fix): a transient malformed
+        # /api/tags response must NOT be treated as an authoritative
+        # empty inventory. _sync_with_ollama should swallow the
+        # MalformedTagsResponseError, leave _known_models AND the
+        # on-disk size/metadata caches alone, and not advance
+        # _known_models_last_sync (so is_known_model fail-open detects
+        # the failure).
+        from ollama_marshal.registry import MalformedTagsResponseError
+
+        # First seed _known_models with a successful sync.
+        with patch.object(
+            populated_registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            return_value=["llama3:latest", "codellama:latest"],
+        ):
+            await populated_registry._sync_with_ollama()
+
+        baseline_known = set(populated_registry._known_models)
+        baseline_sizes = dict(populated_registry._sizes)
+        baseline_last_sync = populated_registry._known_models_last_sync
+
+        # Now simulate a transient malformed response — the next sync
+        # must NOT wipe the prior good state.
+        with patch.object(
+            populated_registry,
+            "_fetch_model_list",
+            new_callable=AsyncMock,
+            side_effect=MalformedTagsResponseError("garbage body"),
+        ):
+            await populated_registry._sync_with_ollama()
+
+        assert populated_registry._known_models == baseline_known, (
+            "malformed /api/tags must not commit empty inventory"
+        )
+        assert populated_registry._sizes == baseline_sizes, (
+            "malformed /api/tags must not prune on-disk size cache"
+        )
+        assert populated_registry._known_models_last_sync == baseline_last_sync, (
+            "malformed /api/tags must not advance last_sync "
+            "(or fail-open detection breaks)"
+        )
 
     async def test_concurrent_syncs_serialized_by_lock(self, populated_registry):
         # v0.6.6 Bug 6: when two _sync_with_ollama callers race (the
