@@ -1379,3 +1379,150 @@ class TestIsInstanceReachable:
             await manager.refresh()
 
         assert manager.is_instance_reachable("http://localhost:11444") is True
+
+
+class TestOwnershipTracking:
+    """Bug 8: shutdown.unload_models filters by what THIS marshal preloaded.
+
+    /api/ps is global (all clients of the Ollama instance see the same
+    list of loaded models). Without ownership tracking, a marshal that
+    shares an Ollama with another marshal — or with a human running
+    `ollama run` directly — would observe foreign models in /api/ps
+    and try to unload them at shutdown. For the concrete bug: the
+    integration suite's test marshal sees prod marshal's heavy models
+    (gpt-oss:120b, qwen3:235b) and the slow unload blows past
+    asgi-lifespan's 10s shutdown deadline.
+
+    Invariants asserted below:
+    1. ``mark_owned`` records ownership against an instance.
+    2. ``get_owned_loaded_models`` returns the intersection of
+       ``_loaded_models`` ∩ ``_owned_models``.
+    3. Foreign loaded models (in /api/ps but never claimed) are
+       excluded.
+    4. Ownership auto-releases when /api/ps stops reporting the model.
+    5. Multi-instance ownership is per-instance — claiming on f16
+       does not imply ownership on q8.
+    """
+
+    def test_mark_owned_then_get_includes(self):
+        manager = _make_manager()
+        _apply_ps(manager, _ps_response(("a:1", 1_000_000)))
+        manager.mark_owned("a:1", _PRIMARY_URL)
+        owned = manager.get_owned_loaded_models()
+        assert owned == {_PRIMARY_URL: {"a:1"}}
+
+    def test_foreign_loaded_model_excluded(self):
+        manager = _make_manager()
+        # Two models loaded on the instance, but marshal only owns one.
+        _apply_ps(
+            manager,
+            _ps_response(("ours:1", 1), ("theirs:1", 1)),
+        )
+        manager.mark_owned("ours:1", _PRIMARY_URL)
+        owned = manager.get_owned_loaded_models()
+        assert owned == {_PRIMARY_URL: {"ours:1"}}
+        # Sanity: get_loaded_models still sees both.
+        assert set(manager.get_loaded_models()) == {"ours:1", "theirs:1"}
+
+    def test_get_owned_empty_when_nothing_claimed(self):
+        manager = _make_manager()
+        _apply_ps(manager, _ps_response(("foreign:1", 1)))
+        # No mark_owned call — every loaded model is foreign.
+        assert manager.get_owned_loaded_models() == {}
+
+    def test_get_owned_omits_instances_with_empty_intersection(self):
+        # Empty sets are filtered out so callers can iterate items()
+        # without checking length.
+        manager = _make_multi_manager()
+        # Mark on f16 but never load there; no intersection.
+        manager.mark_owned("a:1", "http://localhost:11434")
+        # Foreign load on q8.
+        manager._update_from_ps(
+            "http://localhost:11444",
+            {"models": [{"name": "foreign:1", "size_vram": 1}]},
+        )
+        assert manager.get_owned_loaded_models() == {}
+
+    def test_ownership_auto_releases_on_unload(self):
+        # The next /api/ps poll after the unload settles must drop the
+        # model from BOTH _loaded_models and _owned_models. Otherwise
+        # a stale ownership claim could survive an external eviction
+        # and lead to a phantom unload attempt at shutdown.
+        manager = _make_manager()
+        _apply_ps(manager, _ps_response(("a:1", 1)))
+        manager.mark_owned("a:1", _PRIMARY_URL)
+        assert manager.get_owned_loaded_models() == {_PRIMARY_URL: {"a:1"}}
+        # Tell the poll loop this is intentional so we don't hit the
+        # unexpected_unload counter (orthogonal feature).
+        manager.mark_intended_unload("a:1", instance_url=_PRIMARY_URL)
+        _apply_ps(manager, _ps_response())  # empty
+        assert manager.get_owned_loaded_models() == {}
+
+    def test_ownership_auto_releases_on_external_eviction(self):
+        # Same invariant as above but the disappearance is unintended
+        # (Ollama-side memory-pressure eviction). Ownership must still
+        # release — we don't own a model that's not loaded.
+        manager = _make_manager()
+        _apply_ps(manager, _ps_response(("a:1", 1)))
+        manager.mark_owned("a:1", _PRIMARY_URL)
+        # No mark_intended_unload — this is the unexpected path.
+        _apply_ps(manager, _ps_response())
+        assert manager.get_owned_loaded_models() == {}
+        # And the unexpected_unload counter fired (sanity).
+        assert manager.unexpected_unloads_observed == 1
+
+    def test_multi_instance_ownership_is_per_instance(self):
+        manager = _make_multi_manager()
+        # Same model loaded on both tiers (mid-promotion). Claim only
+        # the f16 copy.
+        f16 = "http://localhost:11434"
+        q8 = "http://localhost:11444"
+        manager._update_from_ps(f16, {"models": [{"name": "x:1", "size_vram": 1}]})
+        manager._update_from_ps(q8, {"models": [{"name": "x:1", "size_vram": 1}]})
+        manager.mark_owned("x:1", f16)
+        owned = manager.get_owned_loaded_models()
+        assert owned == {f16: {"x:1"}}
+        # q8 copy is foreign to us — never tear it down.
+
+    def test_mark_owned_idempotent(self):
+        manager = _make_manager()
+        _apply_ps(manager, _ps_response(("a:1", 1)))
+        manager.mark_owned("a:1", _PRIMARY_URL)
+        manager.mark_owned("a:1", _PRIMARY_URL)
+        owned = manager.get_owned_loaded_models()
+        assert owned == {_PRIMARY_URL: {"a:1"}}
+
+    def test_ownership_converges_when_load_was_never_observed(self):
+        # Codex P2 regression: claim must NOT survive when a model is
+        # marked owned but never appears in /api/ps before disappearing
+        # (e.g., Ollama-side eviction during the gap between
+        # lifecycle.preload returning and the next /api/ps poll). If
+        # the claim persists, a later foreign-load of the same model
+        # name would be falsely owned and unloaded at shutdown — the
+        # exact contamination Bug 8 fixes.
+        manager = _make_manager()
+        # Marshal claims X but the poll never observes it (X was
+        # evicted before /api/ps caught up).
+        manager.mark_owned("ghost:1", _PRIMARY_URL)
+        assert manager._owned_models[_PRIMARY_URL] == {"ghost:1"}
+        # First /api/ps poll arrives with X NOT in the snapshot.
+        # Without convergence, X persists in _owned_models. With it,
+        # _owned_models is bounded by current /api/ps reality.
+        _apply_ps(manager, _ps_response())  # empty
+        assert manager._owned_models[_PRIMARY_URL] == set()
+        # Now another marshal loads X — it must NOT be treated as owned.
+        _apply_ps(manager, _ps_response(("ghost:1", 1)))
+        assert manager.get_owned_loaded_models() == {}
+
+    def test_mark_owned_unknown_instance_is_ignored(self):
+        # Defensive: scheduler is the only caller and always passes a
+        # configured instance. A misrouted call with an unknown URL
+        # gets logged + dropped on the floor — accumulating it would
+        # leak entries forever (auto-release in _update_from_ps fires
+        # only for configured instances since /api/ps polls only those).
+        manager = _make_manager()
+        manager.mark_owned("a:1", "http://localhost:99999")
+        assert manager.get_owned_loaded_models() == {}
+        # Internal state must NOT have grown — the unknown URL is
+        # rejected at the entry point, not silently absorbed.
+        assert "http://localhost:99999" not in manager._owned_models

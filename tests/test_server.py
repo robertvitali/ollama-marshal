@@ -1564,6 +1564,10 @@ def _make_mock_components():
     memory.start_polling = AsyncMock()
     memory.stop_polling = AsyncMock()
     memory.get_loaded_models.return_value = {}
+    # Bug 8 (v0.6.6): shutdown filters by ownership. Default to empty so
+    # tests that don't care about the unload path don't accidentally
+    # trigger lifecycle.unload_all.
+    memory.get_owned_loaded_models.return_value = {}
 
     registry = MagicMock()
     registry.initialize = AsyncMock()
@@ -1646,6 +1650,9 @@ class TestLifespan:
             assert queues.total_pending.call_count >= 1
 
     async def test_lifespan_unload_models_on_shutdown(self):
+        # Bug 8 (v0.6.6): shutdown teardown is gated by ``get_owned_
+        # loaded_models`` so a marshal sharing an Ollama with another
+        # marshal doesn't tear down foreign models.
         config = MarshalConfig(
             shutdown=ShutdownConfig(
                 mode=ShutdownMode.IMMEDIATE,
@@ -1653,10 +1660,11 @@ class TestLifespan:
             )
         )
         app = create_app(config)
+        primary_url = config.instances[0].url
 
         memory, registry, lifecycle, scheduler, queues = _make_mock_components()
-        memory.get_loaded_models.return_value = {
-            "llama3:latest": LoadedModel(name="llama3:latest", size_vram=4_000_000_000),
+        memory.get_owned_loaded_models.return_value = {
+            primary_url: {"llama3:latest"},
         }
 
         with (
@@ -1672,7 +1680,54 @@ class TestLifespan:
             async with server_mod.lifespan(app):
                 pass
 
-            lifecycle.unload_all.assert_called_once_with(["llama3:latest"])
+            lifecycle.unload_all.assert_called_once_with(
+                ["llama3:latest"], instance_url=primary_url
+            )
+
+    async def test_lifespan_skips_foreign_loaded_models_at_shutdown(self):
+        # Bug 8 regression test: a model present in /api/ps but not in
+        # ``get_owned_loaded_models`` (loaded by another marshal or by
+        # a human via ``ollama run``) MUST NOT be unloaded by this
+        # marshal's lifespan teardown. Without this guard, a test
+        # marshal sharing the host's Ollama with prod marshal would
+        # try to unload prod's heavy models and blow past asgi-
+        # lifespan's 10s shutdown deadline on the slow 120B/235B
+        # unloads.
+        config = MarshalConfig(
+            shutdown=ShutdownConfig(
+                mode=ShutdownMode.IMMEDIATE,
+                unload_models=True,
+            )
+        )
+        app = create_app(config)
+        primary_url = config.instances[0].url
+
+        memory, registry, lifecycle, scheduler, queues = _make_mock_components()
+        # /api/ps shows the foreign model but ownership map is empty —
+        # we never preloaded it.
+        memory.get_loaded_models.return_value = {
+            "gpt-oss:120b": LoadedModel(
+                name="gpt-oss:120b",
+                size_vram=120_000_000_000,
+                instance_url=primary_url,
+            ),
+        }
+        memory.get_owned_loaded_models.return_value = {}
+
+        with (
+            patch("ollama_marshal.server.MemoryManager", return_value=memory),
+            patch("ollama_marshal.server.ModelRegistry", return_value=registry),
+            patch(
+                "ollama_marshal.server.ModelLifecycle",
+                return_value=lifecycle,
+            ),
+            patch("ollama_marshal.server.Scheduler", return_value=scheduler),
+            patch("ollama_marshal.server.ModelQueues", return_value=queues),
+        ):
+            async with server_mod.lifespan(app):
+                pass
+
+            lifecycle.unload_all.assert_not_called()
 
     async def test_lifespan_no_unload_when_disabled(self):
         config = MarshalConfig(shutdown=ShutdownConfig(unload_models=False))

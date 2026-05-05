@@ -44,6 +44,7 @@ def _make_mock_components():
     memory.start_polling = AsyncMock()
     memory.stop_polling = AsyncMock()
     memory.get_loaded_models.return_value = {}
+    memory.get_owned_loaded_models.return_value = {}
 
     registry = MagicMock()
     registry.initialize = AsyncMock()

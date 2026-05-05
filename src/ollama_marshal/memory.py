@@ -122,6 +122,19 @@ class MemoryManager:
         self._intended_unloads: dict[str, set[str]] = {
             inst.url: set() for inst in self._instances
         }
+        # Per-instance ownership tracking — the set of models THIS
+        # marshal process preloaded onto each instance. /api/ps is a
+        # global view of Ollama; without this filter, a marshal sharing
+        # an Ollama with another marshal (or a human) would observe
+        # models it didn't preload and treat them as "loaded by us"
+        # (e.g. unloading them at shutdown). Populated by
+        # ``mark_owned`` from the scheduler after a successful preload;
+        # auto-drained inside ``_update_from_ps`` when the model
+        # disappears from the /api/ps view (so we never claim ownership
+        # of something that's been externally unloaded).
+        self._owned_models: dict[str, set[str]] = {
+            inst.url: set() for inst in self._instances
+        }
         # Counter incremented whenever the poll loop detects an
         # unexpected unload on ANY instance. The scheduler reads + zeros
         # this to roll the value into SchedulerMetrics.unexpected_unloads.
@@ -331,8 +344,36 @@ class MemoryManager:
             # Forget the allocated num_ctx for any model that's no
             # longer loaded — its KV slots are gone.
             self._allocated_num_ctx.get(instance_url, {}).pop(name, None)
+            # Drop ownership too — once the model is no longer in
+            # /api/ps on this instance, marshal doesn't own a copy
+            # there. Whether the disappearance was marshal-initiated
+            # (intended_unloads matched) or external (unexpected),
+            # the result is the same: nothing for shutdown to unload.
+            self._owned_models.get(instance_url, set()).discard(name)
 
         self._loaded_models[instance_url] = new_loaded
+
+        # Bug 8 hardening (Codex review P2): converge ownership to
+        # whatever /api/ps actually shows loaded RIGHT NOW. Without
+        # this, a missed-poll race leaves a stale ownership claim
+        # that a future foreign-load with the same model name would
+        # match — reintroducing the contamination this fix prevents.
+        # Scenario: marshal preloads X (mark_owned fires) → X is
+        # evicted before any /api/ps poll observes it (Ollama memory
+        # pressure, parallel client unload) → X never enters
+        # ``prev_loaded``, so the per-name discard above never runs
+        # → claim persists → another marshal loads X → marshal's
+        # shutdown silently unloads the foreign copy. Convergence
+        # here closes that window: ownership is bounded by what's
+        # actually in /api/ps. The cost is a narrow race in the
+        # opposite direction (mark_owned racing the immediate next
+        # poll could wipe a just-claimed model that hasn't appeared
+        # yet), but ``get_owned_loaded_models`` already filters by
+        # the intersection at read time, so that window already
+        # exists and is empirically benign.
+        owned_set = self._owned_models.get(instance_url)
+        if owned_set is not None:
+            owned_set &= set(new_loaded.keys())
 
     # ------------------------------------------------------------------
     # Loaded-models accessors (flat-view kept for callers that don't care
@@ -623,6 +664,68 @@ class MemoryManager:
             # Sentinel: prior reload failed mid-flight. Always reload.
             return True
         return requested_num_ctx > current
+
+    def mark_owned(self, model: str, instance_url: str) -> None:
+        """Record that THIS marshal preloaded ``model`` on ``instance_url``.
+
+        Called by the scheduler after a successful
+        ``lifecycle.preload``. Together with ``get_owned_loaded_models``
+        this scopes shutdown teardown to models marshal itself loaded
+        — never models loaded by another marshal or a human against
+        the same Ollama (Bug 8: shared-Ollama shutdown contamination).
+
+        Ownership is auto-released by ``_update_from_ps`` when the
+        model leaves the /api/ps view on this instance, so callers
+        never need to drop_owned manually after an unload — the next
+        poll after the unload settles will clear it.
+
+        Args:
+            model: Model name marshal preloaded.
+            instance_url: Which instance the preload landed on. Must
+                be one of the configured instances; calls with an
+                unknown URL are logged and ignored (defense in depth
+                against a misrouted preload — auto-release wouldn't
+                fire for an unknown URL since /api/ps polls only the
+                configured instances, so the entry would otherwise
+                accumulate forever).
+        """
+        if instance_url not in self._owned_models:
+            logger.warning(
+                "memory.mark_owned_unknown_instance",
+                model=model,
+                instance=instance_url,
+                reason=(
+                    "instance not in configured list; ignoring to "
+                    "avoid accumulating phantom ownership entries"
+                ),
+            )
+            return
+        self._owned_models[instance_url].add(model)
+
+    def get_owned_loaded_models(self) -> dict[str, set[str]]:
+        """Return per-instance models that are loaded AND owned.
+
+        Intersection of ``_loaded_models`` (observed in /api/ps) and
+        ``_owned_models`` (claimed via ``mark_owned``).
+
+        Used by ``shutdown.unload_models`` so a marshal sharing an
+        Ollama with another marshal (or a human) doesn't tear down
+        models it didn't preload — protecting prod marshal's heavy
+        models (gpt-oss:120b, qwen3:235b) from a test-marshal's
+        lifespan teardown.
+
+        Returns:
+            Mapping of ``instance_url`` -> set of model names. Empty
+            sets are omitted so callers can iterate ``.items()``
+            without checking length.
+        """
+        out: dict[str, set[str]] = {}
+        for inst_url, owned in self._owned_models.items():
+            loaded_here = set(self._loaded_models.get(inst_url, {}).keys())
+            intersection = owned & loaded_here
+            if intersection:
+                out[inst_url] = intersection
+        return out
 
     def mark_intended_unload(
         self,

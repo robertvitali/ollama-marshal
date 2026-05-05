@@ -92,6 +92,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Shared-Ollama shutdown contamination (Bug 8).** When two
+  marshals point at the same Ollama (e.g. integration suite running
+  alongside the user's prod marshal), the lifespan-shutdown unload
+  path used to read every model in `/api/ps` and call
+  `lifecycle.unload_all` against the union — including models
+  loaded by the OTHER marshal. On the user's M3 Ultra rig that
+  meant the test marshal trying to unload prod marshal's heavy
+  models (`gpt-oss:120b`, `qwen3:235b`) on every test teardown;
+  the slow unloads blew past asgi-lifespan's 10s shutdown deadline
+  and produced sporadic failures in
+  `test_fault_proxy_one_instance_failure_does_not_break_others`,
+  `test_cold_start_routes_to_f16_when_room`, and
+  `test_audit_log_records_tier_and_reason`. Added per-instance
+  ownership tracking (`MemoryManager._owned_models`): the scheduler
+  calls `mark_owned` after every successful preload, ownership
+  auto-releases when /api/ps stops reporting the model, and the
+  shutdown teardown reads `get_owned_loaded_models` instead of the
+  flat /api/ps view. Result: a marshal only unloads what it
+  preloaded itself.
+
+  **Behavior change worth calling out:** the old flat-view shutdown
+  also cleaned up loaded-from-prior-run orphans — if marshal A
+  crashed leaving model X loaded and marshal A' started fresh,
+  A' would unload X at its own shutdown. The new ownership-filtered
+  shutdown does NOT reclaim those orphans (A' never preloaded X via
+  `_attempt_preload`, so it never claims ownership; the model is
+  served via `_forward_loaded_model_requests` as a "lucky cache hit"
+  but not owned). This is the conscious trade-off — reclaim-orphans
+  vs. don't-stomp-foreign — and we picked don't-stomp-foreign because
+  the failure mode there (test marshal killing prod's 120B model) is
+  catastrophic, while the failure mode here (a prior-run model stays
+  loaded across a marshal restart until Ollama itself unloads it on
+  TTL or memory pressure) is benign. Future work could add explicit
+  reclaim on first-forward if it turns out to matter in practice.
 - **Multi-instance integration test contamination.** Tests in
   `tests/integration/test_multi_instance.py` exercise routing that
   observes `/api/ps` state on real Ollama daemons (the fault-proxy

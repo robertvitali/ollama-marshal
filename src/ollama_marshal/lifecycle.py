@@ -291,6 +291,15 @@ class ModelLifecycle:
     ) -> bool:
         """Ensure a model is loaded, preloading if necessary.
 
+        WARNING (Bug 8): this method bypasses ownership tracking. It
+        calls ``self.preload`` directly, NOT through the scheduler's
+        ``_attempt_preload`` wrapper that calls ``memory.mark_owned``
+        on success. Production scheduler code should always use
+        ``_attempt_preload``; ``ensure_loaded`` is kept for legacy
+        single-instance callers and tests. New code that goes through
+        ``ensure_loaded`` will produce loaded-but-unowned models that
+        survive shutdown teardown — usually unintended.
+
         Args:
             model: The model name.
             loaded_models: Set of currently loaded model names.

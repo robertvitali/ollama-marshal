@@ -117,6 +117,7 @@ def _make_scheduler(
         # accidentally inject phantom evictions.
         memory.take_recent_unexpected_unloads.return_value = set()
         memory.mark_intended_unload = MagicMock()
+        memory.mark_owned = MagicMock()
         memory.record_allocated_num_ctx = MagicMock()
     if registry is None:
         registry = MagicMock()
@@ -1335,6 +1336,7 @@ class TestEnsureModelLoadedReloadOnNeed:
         memory.refresh = AsyncMock()
         memory.take_unexpected_unload_count.return_value = 0
         memory.mark_intended_unload = MagicMock()
+        memory.mark_owned = MagicMock()
         memory.record_allocated_num_ctx = MagicMock()
 
         lifecycle = MagicMock()
@@ -1367,6 +1369,7 @@ class TestEnsureModelLoadedReloadOnNeed:
         memory.refresh = AsyncMock()
         memory.take_unexpected_unload_count.return_value = 0
         memory.mark_intended_unload = MagicMock()
+        memory.mark_owned = MagicMock()
         memory.record_allocated_num_ctx = MagicMock()
 
         registry = MagicMock()
@@ -1431,6 +1434,7 @@ class TestEnsureModelLoadedReloadOnNeed:
         memory.refresh = AsyncMock()
         memory.take_unexpected_unload_count.return_value = 0
         memory.mark_intended_unload = MagicMock()
+        memory.mark_owned = MagicMock()
         memory.record_allocated_num_ctx = MagicMock()
 
         registry = MagicMock()
@@ -1465,6 +1469,7 @@ class TestUnexpectedUnloadsRollup:
         memory.refresh = AsyncMock()
         memory.take_unexpected_unload_count.return_value = 3
         memory.mark_intended_unload = MagicMock()
+        memory.mark_owned = MagicMock()
         memory.record_allocated_num_ctx = MagicMock()
 
         sched = _make_scheduler(memory=memory)
@@ -3051,3 +3056,57 @@ class TestUnexpectedUnloadReactivity:
         assert result is True
         sched.lifecycle.preload.assert_called_once()
         assert ("llama3:latest", _PRIMARY_INSTANCE_URL) not in sched._needs_reload
+
+
+class TestPreloadOwnershipClaim:
+    """Bug 8: a successful ``_attempt_preload`` claims memory ownership.
+
+    Without this, ``shutdown.unload_models`` would tear down every
+    model in ``/api/ps`` — including models loaded by another marshal
+    or human against the same Ollama. The integration suite hit this
+    when its test marshal saw prod marshal's gpt-oss:120b in /api/ps.
+    """
+
+    async def test_successful_preload_marks_owned(self):
+        sched = _make_scheduler()
+        sched.lifecycle.preload = AsyncMock(return_value=True)
+
+        result = await sched._attempt_preload(
+            "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+        )
+
+        assert result is True
+        sched.memory.mark_owned.assert_called_once_with(
+            "llama3:latest", _PRIMARY_INSTANCE_URL
+        )
+
+    async def test_failed_preload_does_not_mark_owned(self):
+        sched = _make_scheduler()
+        sched.lifecycle.preload = AsyncMock(return_value=False)
+
+        result = await sched._attempt_preload(
+            "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+        )
+
+        assert result is False
+        sched.memory.mark_owned.assert_not_called()
+
+    async def test_cooldown_skip_does_not_mark_owned(self):
+        # Skipped preloads short-circuit before lifecycle.preload — the
+        # model isn't loaded, so claiming ownership would be a lie.
+        from ollama_marshal.scheduler import _PreloadFailureState
+
+        sched = _make_scheduler()
+        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched._preload_failures["llama3:latest"] = _PreloadFailureState(
+            consecutive_failures=2,
+            cooldown_until=time.monotonic() + 60.0,
+        )
+
+        result = await sched._attempt_preload(
+            "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+        )
+
+        assert result is False
+        sched.memory.mark_owned.assert_not_called()
+        sched.lifecycle.preload.assert_not_called()

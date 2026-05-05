@@ -969,6 +969,12 @@ class Scheduler:
         )
         if success:
             self._clear_preload_failure(model)
+            # Claim ownership so shutdown.unload_models only tears down
+            # models THIS marshal loaded — not models loaded by another
+            # marshal or a human against the same Ollama. Auto-released
+            # by MemoryManager when the next /api/ps poll observes the
+            # model gone (whether marshal-initiated or external).
+            self.memory.mark_owned(model, instance_url)
             return True
         failures = self._record_preload_failure(model)
         if failures >= self.config.scheduler.preload_max_consecutive_failures:

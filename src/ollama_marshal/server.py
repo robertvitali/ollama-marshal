@@ -208,10 +208,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await _registry.stop_polling()
 
         if _config.shutdown.unload_models:
-            loaded = list(_memory.get_loaded_models().keys())
-            if loaded:
-                logger.info("server.unloading_models", models=loaded)
-                await _lifecycle.unload_all(loaded)
+            # Bug 8: only unload models THIS marshal preloaded. With the
+            # previous flat-view loop a test-mode marshal sharing the
+            # Ollama with a prod marshal would attempt to unload prod's
+            # heavy models (gpt-oss:120b, qwen3:235b) on shutdown,
+            # blowing past asgi-lifespan's 10s shutdown deadline.
+            owned_by_instance = _memory.get_owned_loaded_models()
+            for instance_url, models in owned_by_instance.items():
+                model_list = sorted(models)
+                logger.info(
+                    "server.unloading_models",
+                    instance=instance_url,
+                    models=model_list,
+                )
+                await _lifecycle.unload_all(model_list, instance_url=instance_url)
 
     # Final metrics snapshot — captures any counter changes from drain
     # phase plus any work that happened after the last periodic write.
