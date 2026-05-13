@@ -354,7 +354,7 @@ async def test_pause_resume_recovery_under_load(tmp_marshal_paths):
             )
             paused_at = time.monotonic()
             await asyncio.sleep(_PAUSE_DURATION_S)
-            await sched.resume()
+            sched.resume()
             resumed_at = time.monotonic()
             print(
                 f"\n[load.pause_resume] paused_for={resumed_at - paused_at:.1f}s "

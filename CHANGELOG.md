@@ -178,6 +178,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before each test in this module. Unreachable instances are
   silently skipped. Affects integration test infrastructure only —
   no production code change.
+- **`test_load.py` awaited the sync `Scheduler.resume()` (Bug 11).**
+  `test_pause_resume_recovery_under_load` called `await sched.resume()`
+  but `Scheduler.resume()` is sync (only `pause()` is async). The
+  TypeError crashed the test before the pause/resume-under-load
+  assertion at line 375 could run, so the marshal's pause/resume
+  behavior under sustained load had never actually been verified.
+  Dropped the `await`. Surfaced by the v0.6.6 first-ever run of
+  `make load-test` (the file shipped in v0.6.5 PR #20 gated behind
+  `@pytest.mark.load`, never executed). Test-infrastructure fix
+  only — no production code change.
 
 ### Documentation
 
