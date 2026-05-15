@@ -9,7 +9,10 @@ test:
 	uv run --extra dev pytest tests/ --ignore=tests/integration
 
 test-integration:
-	uv run --extra dev pytest tests/integration/ -m integration -v
+	# --no-cov: integration suite hits narrow live-Ollama paths;
+	# 95% gate (from pyproject) doesn't apply to partial slice.
+	# Matches the --no-cov already used in .pre-commit-config.yaml.
+	uv run --extra dev pytest tests/integration/ -m integration -v --no-cov
 
 # Long-running load tests — opt-in only. Excluded from `pre-pr` and
 # default `make test-integration` because each scenario runs for
@@ -18,7 +21,8 @@ test-integration:
 # cap → uvicorn worker pool must not be exhausted by patient
 # clients).
 load-test:
-	uv run --extra dev pytest tests/integration/ -m load -v
+	# --no-cov: same partial-slice exemption as test-integration.
+	uv run --extra dev pytest tests/integration/ -m load -v --no-cov
 
 lint:
 	uv run --extra dev ruff check src/ tests/

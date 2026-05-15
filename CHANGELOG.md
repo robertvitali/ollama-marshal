@@ -243,6 +243,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `make load-test` (the file shipped in v0.6.5 PR #20 gated behind
   `@pytest.mark.load`, never executed). Test-infrastructure fix
   only — no production code change.
+- **Makefile `test-integration` + `load-test` targets fired the
+  global 95% coverage gate (Bug 12).** `pyproject.toml`'s
+  `addopts` declares `--cov-fail-under=95` for every pytest run.
+  The two integration-suite Makefile targets did not override
+  it, so even when 100% of executed tests passed, pytest exited
+  1 (partial-slice coverage well below 95%) → `make` exited 2.
+  The false signal masked real failure modes (e.g. Bug 11
+  surfaced alongside the coverage-gate noise in the v0.6.6 load
+  test verify run). Added `--no-cov` to both Makefile targets,
+  matching the existing `.pre-commit-config.yaml` opt-out for
+  the same integration paths. `make test` (unit suite) keeps the
+  95% gate — its coverage legitimately clears the bar.
 
 ### Documentation
 
