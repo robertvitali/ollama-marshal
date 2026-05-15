@@ -178,6 +178,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before each test in this module. Unreachable instances are
   silently skipped. Affects integration test infrastructure only —
   no production code change.
+- **Model size estimator overshot non-Q4 quants by 2-4x (Bug 9).**
+  `ModelRegistry.get_or_estimate_size` fell back to `param_count * 4`
+  when the on-disk `_sizes` cache had no measured value for a model.
+  The `* 4` hardcoded an F32-equivalent bytes/param assumption, so the
+  estimate overshot BF16/F16 by 2x and Q8 by ~4x — a 873M-param Q8_0
+  model whose actual VRAM is ~1 GB got estimated at 3.49 GB. In tight
+  bin-packing scenarios (the v0.6.6 `test_marshal_eviction_drains_
+  then_unloads` integration test under a 2.5 GB constrained budget),
+  the overshoot pushed `can_fit_model` to return False indefinitely,
+  hung 4 sequential 900 s normal-priority chats on
+  `asyncio.gather`, and produced a ~60 min wall-clock "hang" that
+  masqueraded as a different infrastructure issue across multiple
+  v0.6.X verify cycles. Two-prong fix in `registry.py`:
+  1. **`_sync_with_ollama` now seeds `_tag_size_estimates` (a new
+     dict, separate from `_sizes`) from the per-model `size` field
+     returned by `/api/tags`** (scaled by the new
+     `_TAGS_SIZE_MARGIN = 1.10` to absorb KV/compute overhead).
+     Disk size from /api/tags is accurate within ~5 % of real
+     loaded VRAM at zero/small context. The dict is intentionally
+     separate from `_sizes` (which holds measured VRAM from
+     `benchmark_model`) so the startup benchmark loop
+     (`benchmark_unknown`) still sees un-benchmarked models as
+     candidates — writing the seed to `_sizes` would have shadowed
+     every model from the benchmark loop and left routing on disk-
+     approximations indefinitely (P2 caught in codex review of the
+     initial Bug 9 fix). Seed is opportunistic: failure does NOT
+     break the surrounding `_known_models` update.
+  2. **The `/api/show` fallback estimator now reads
+     `details.quantization_level`** and looks up bytes/param in a
+     new `_QUANT_BYTES_PER_PARAM` table (F32, F16/BF16, Q8_0,
+     Q6_K, Q5_*, Q4_*, Q3_*, Q2_K). Unknown quants fall back to
+     `_QUANT_BYTES_PER_PARAM_FALLBACK = 0.6` (≈ Q5). A new
+     `_ESTIMATE_KV_MARGIN = 1.10` covers KV cache at small context.
+  Estimator-fallback now fires only for the narrow window between
+  an `ollama pull` and the next `/api/tags` sync tick — not on every
+  cold-cache startup. New `_fetch_models_with_size` private method
+  returns `(name, file_size_bytes)` tuples while `fetch_model_list`
+  keeps its `list[str]` public contract for callers like the
+  `marshal doctor` CLI. Coverage: `TestFetchModelsWithSize` (2 cases),
+  `TestSyncWithOllamaSizeSeeding` (7 cases — including a regression
+  guard that `_sizes` never receives tag-derived seeds, locking in
+  the codex-caught P2),  `TestGetOrEstimateSize` gains Q8/BF16/
+  unknown-quant cases. Integration: post-fix the
+  eviction test passes in ~5 s instead of timing out at 3600 s.
+
+  **Operator-visible behavior change worth calling out:** because the
+  pre-fix estimator overshot non-Q4 quants by 2-4x, operators who
+  tuned `memory.total_ram` (or per-instance budgets in multi-instance
+  setups) against the old behavior may see different routing decisions
+  post-upgrade — specifically, more models loading concurrently before
+  eviction kicks in. If your prior budget was deliberately loose to
+  absorb the overshoot, re-validate it against the measured `_sizes`
+  values in `~/.ollama-marshal/model_sizes.json` (populated after the
+  first benchmark cycle for each model) before upgrading busy
+  production marshals.
 - **`test_load.py` awaited the sync `Scheduler.resume()` (Bug 11).**
   `test_pause_resume_recovery_under_load` called `await sched.resume()`
   but `Scheduler.resume()` is sync (only `pause()` is async). The

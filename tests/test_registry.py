@@ -370,13 +370,22 @@ class TestFetchModelList:
 # ---------------------------------------------------------------------------
 
 
+def _as_with_size(names):
+    """Helper: convert a list of model names to (name, 0) tuples for
+    mocking `_fetch_models_with_size`. Size=0 means the Bug 9 seed
+    loop skips the entry, so tests that only care about `_known_models`
+    / `_sizes` semantics don't accidentally populate
+    `_tag_size_estimates`."""
+    return [(n, 0) for n in names]
+
+
 class TestSyncWithOllama:
     async def test_removes_stale_models(self, populated_registry):
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=["llama3:latest"],
+            return_value=_as_with_size(["llama3:latest"]),
         ):
             await populated_registry._sync_with_ollama()
 
@@ -386,13 +395,11 @@ class TestSyncWithOllama:
     async def test_identifies_new_models(self, populated_registry):
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=[
-                "llama3:latest",
-                "codellama:latest",
-                "mistral:latest",
-            ],
+            return_value=_as_with_size(
+                ["llama3:latest", "codellama:latest", "mistral:latest"]
+            ),
         ):
             await populated_registry._sync_with_ollama()
 
@@ -405,9 +412,9 @@ class TestSyncWithOllama:
         with (
             patch.object(
                 populated_registry,
-                "_fetch_model_list",
+                "_fetch_models_with_size",
                 new_callable=AsyncMock,
-                return_value=["llama3:latest", "codellama:latest"],
+                return_value=_as_with_size(["llama3:latest", "codellama:latest"]),
             ),
             patch.object(populated_registry, "_save_cache") as mock_save,
         ):
@@ -419,9 +426,9 @@ class TestSyncWithOllama:
         with (
             patch.object(
                 populated_registry,
-                "_fetch_model_list",
+                "_fetch_models_with_size",
                 new_callable=AsyncMock,
-                return_value=["llama3:latest"],
+                return_value=_as_with_size(["llama3:latest"]),
             ),
             patch.object(
                 populated_registry,
@@ -435,13 +442,208 @@ class TestSyncWithOllama:
     async def test_http_error_handled_gracefully(self, populated_registry):
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
             side_effect=httpx.HTTPError("connection failed"),
         ):
             await populated_registry._sync_with_ollama()
 
         assert len(populated_registry._sizes) == 2
+
+
+# ---------------------------------------------------------------------------
+# _fetch_models_with_size + size seeding from /api/tags (Bug 9)
+# ---------------------------------------------------------------------------
+
+
+def _mock_tags_response_with_sizes(entries):
+    """Build a mocked /api/tags response with explicit (name, size) entries."""
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": n, "size": s} for n, s in entries]}
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+class TestFetchModelsWithSize:
+    async def test_returns_name_size_tuples(self, registry):
+        mock_resp = _mock_tags_response_with_sizes(
+            [
+                ("llama3:latest", 4_000_000_000),
+                ("qwen3.5:0.8b-q8_0", 1_036_046_583),
+            ]
+        )
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            result = await registry._fetch_models_with_size()
+
+        assert result == [
+            ("llama3:latest", 4_000_000_000),
+            ("qwen3.5:0.8b-q8_0", 1_036_046_583),
+        ]
+
+    async def test_missing_size_yields_zero(self, registry):
+        """Entries with no `size` field still surface (size=0) so the
+        seed path can skip them without losing the name."""
+        resp = MagicMock()
+        resp.json.return_value = {
+            "models": [
+                {"name": "llama3:latest"},  # no size key
+                {"name": "mistral:latest", "size": "not-an-int"},
+            ]
+        }
+        resp.raise_for_status = MagicMock()
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(return_value=resp)
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            result = await registry._fetch_models_with_size()
+
+        assert result == [
+            ("llama3:latest", 0),
+            ("mistral:latest", 0),
+        ]
+
+
+class TestSyncWithOllamaSizeSeeding:
+    """Bug 9: _sync_with_ollama populates `_tag_size_estimates` from
+    /api/tags disk size for previously-unmeasured models. The estimate
+    lives in a separate dict from `_sizes` so the startup benchmark
+    loop still sees un-benchmarked models as candidates — writing to
+    `_sizes` would have shadowed every model from `benchmark_unknown`
+    (P2 caught in initial codex review of Bug 9 fix)."""
+
+    async def test_seeds_tag_size_estimates_for_known_models(self, registry):
+        """Fresh registry + /api/tags returning size → `_tag_size_estimates`
+        gets populated with `disk_size * _TAGS_SIZE_MARGIN`."""
+        from ollama_marshal.registry import _TAGS_SIZE_MARGIN
+
+        with patch.object(
+            registry,
+            "_fetch_models_with_size",
+            new_callable=AsyncMock,
+            return_value=[("qwen3.5:0.8b-bf16", 1_760_116_918)],
+        ):
+            await registry._sync_with_ollama()
+
+        expected = int(1_760_116_918 * _TAGS_SIZE_MARGIN)
+        assert registry._tag_size_estimates["qwen3.5:0.8b-bf16"] == expected
+        # Critically: NOT in _sizes — that stays reserved for measured
+        # VRAM from benchmark_model so benchmark_unknown still fires.
+        assert "qwen3.5:0.8b-bf16" not in registry._sizes
+
+    async def test_seed_does_not_touch_measured_sizes(self, populated_registry):
+        """Existing measured `_sizes` entries are preserved alongside
+        the tag-size estimates — measured VRAM remains authoritative."""
+        # llama3:latest already in populated_registry._sizes (measured).
+        measured_before = populated_registry._sizes["llama3:latest"]
+        assert measured_before == 4_661_224_676
+
+        with patch.object(
+            populated_registry,
+            "_fetch_models_with_size",
+            new_callable=AsyncMock,
+            return_value=[
+                ("llama3:latest", 8_000_000_000),
+                ("codellama:latest", 7_000_000_000),
+            ],
+        ):
+            await populated_registry._sync_with_ollama()
+
+        # Measured value untouched.
+        assert populated_registry._sizes["llama3:latest"] == measured_before
+        # Tag estimate stored separately — `get_or_estimate_size` would
+        # still return the measured value because `_sizes` takes
+        # precedence (covered by TestGetOrEstimateSize.test_returns_cached_value).
+        from ollama_marshal.registry import _TAGS_SIZE_MARGIN
+
+        assert populated_registry._tag_size_estimates["llama3:latest"] == int(
+            8_000_000_000 * _TAGS_SIZE_MARGIN
+        )
+
+    async def test_seed_skipped_when_disk_size_zero(self, registry):
+        """Entries with size=0 (e.g. /api/tags shape variant) don't seed."""
+        with patch.object(
+            registry,
+            "_fetch_models_with_size",
+            new_callable=AsyncMock,
+            return_value=[("mystery:latest", 0)],
+        ):
+            await registry._sync_with_ollama()
+
+        assert "mystery:latest" not in registry._tag_size_estimates
+        assert "mystery:latest" not in registry._sizes
+
+    async def test_fetch_failure_preserves_prior_known_models(self, populated_registry):
+        """When `_fetch_models_with_size` fails, the sync returns early
+        and leaves `_known_models` untouched — never wiped to empty on
+        a single transient /api/tags failure."""
+        # Seed _known_models so we can verify it's preserved.
+        populated_registry._known_models = {"llama3:latest", "codellama:latest"}
+        populated_registry._known_models_last_sync = 100.0
+
+        with patch.object(
+            populated_registry,
+            "_fetch_models_with_size",
+            new_callable=AsyncMock,
+            side_effect=httpx.HTTPError("transient"),
+        ):
+            await populated_registry._sync_with_ollama()
+
+        # _known_models intact, last-sync timestamp untouched (so
+        # is_known_model's fail-open detection still fires).
+        assert populated_registry._known_models == {
+            "llama3:latest",
+            "codellama:latest",
+        }
+        assert populated_registry._known_models_last_sync == 100.0
+
+    async def test_stale_models_pruned_from_tag_estimates(self, registry):
+        """When a model is removed from /api/tags, its tag-size estimate
+        is also pruned so a re-pull triggers a fresh seed."""
+        registry._tag_size_estimates["old-model:latest"] = 5_000_000_000
+
+        with patch.object(
+            registry,
+            "_fetch_models_with_size",
+            new_callable=AsyncMock,
+            return_value=[("llama3:latest", 4_000_000_000)],  # old-model removed
+        ):
+            await registry._sync_with_ollama()
+
+        assert "old-model:latest" not in registry._tag_size_estimates
+        assert "llama3:latest" in registry._tag_size_estimates
+
+    async def test_tag_estimate_does_not_shadow_benchmark_unknown(self, registry):
+        """P2 regression guard: tag-size seed must NOT pollute `_sizes`,
+        because `benchmark_unknown` filters candidates via
+        `m not in self._sizes`. If the seed wrote to `_sizes`, every
+        known model would be filtered out and the startup benchmark
+        loop would never measure real VRAM."""
+        with patch.object(
+            registry,
+            "_fetch_models_with_size",
+            new_callable=AsyncMock,
+            return_value=[
+                ("a:latest", 1_000_000_000),
+                ("b:latest", 2_000_000_000),
+            ],
+        ):
+            await registry._sync_with_ollama()
+
+        # benchmark_unknown's candidate-filter logic mirrored here:
+        size_unknown = [m for m in registry._known_models if m not in registry._sizes]
+        assert set(size_unknown) == {"a:latest", "b:latest"}
+
+    async def test_get_or_estimate_size_returns_tag_estimate(self, registry):
+        """`get_or_estimate_size` falls through to `_tag_size_estimates`
+        when `_sizes` is empty — no /api/show round trip needed."""
+        registry._tag_size_estimates["seeded:latest"] = 1_500_000_000
+
+        result = await registry.get_or_estimate_size("seeded:latest")
+
+        assert result == 1_500_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +845,16 @@ class TestGetOrEstimateSize:
         )
         assert result == 4_661_224_676
 
-    async def test_estimates_from_api_show(self, registry):
+    async def test_estimates_from_api_show_unknown_quant_uses_median_fallback(
+        self, registry
+    ):
+        """When /api/show omits `details.quantization_level`, the estimator
+        falls back to the median 0.6 bytes/param + 1.10 KV margin.
+
+        Pre-Bug-9 this path multiplied param_count * 4 (F32-equivalent),
+        overshooting Q8 by 4x and BF16 by 2x. Locking in the new math
+        prevents drift back to the hardcoded-Q4-style behavior.
+        """
         mock_client = _mock_show_client(
             {
                 "model_info": {
@@ -657,8 +868,49 @@ class TestGetOrEstimateSize:
                 "llama3:latest",
             )
 
-        expected = 8_030_261_248 * 4
+        # 8.03B params * 0.6 bytes/param * 1.10 margin = ~5.30 GB
+        expected = int(8_030_261_248 * 0.6 * 1.10)
         assert result == expected
+
+    async def test_estimates_quantization_aware_q8(self, registry):
+        """`details.quantization_level == "Q8_0"` → 1.0625 bytes/param * 1.10."""
+        mock_client = _mock_show_client(
+            {
+                "model_info": {
+                    "general.parameter_count": 873_438_784,
+                },
+                "details": {"quantization_level": "Q8_0"},
+            }
+        )
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            result = await registry.get_or_estimate_size("qwen3.5:0.8b-q8_0")
+
+        # 873M * 1.0625 * 1.10 ≈ 1.02 GB — close to disk size 1.04 GB.
+        # Pre-Bug-9 this returned 873M * 4 = 3.49 GB (3.4x overshoot).
+        expected = int(873_438_784 * 1.0625 * 1.10)
+        assert result == expected
+        assert result < 1_500_000_000  # << 1.5 GB
+
+    async def test_estimates_quantization_aware_bf16(self, registry):
+        """`details.quantization_level == "BF16"` → 2.0 bytes/param * 1.10."""
+        mock_client = _mock_show_client(
+            {
+                "model_info": {
+                    "general.parameter_count": 873_438_784,
+                },
+                "details": {"quantization_level": "BF16"},
+            }
+        )
+
+        with patch(PATCH_ASYNC_CLIENT, return_value=mock_client):
+            result = await registry.get_or_estimate_size("qwen3.5:0.8b-bf16")
+
+        # 873M * 2.0 * 1.10 ≈ 1.92 GB — close to disk size 1.76 GB.
+        # Pre-Bug-9: 873M * 4 = 3.49 GB (2x overshoot).
+        expected = int(873_438_784 * 2.0 * 1.10)
+        assert result == expected
+        assert result < 2_100_000_000  # << 2.1 GB
 
     async def test_falls_back_to_4gb_on_no_params(self, registry):
         mock_client = _mock_show_client({"model_info": {}})
@@ -1087,9 +1339,9 @@ class TestIsKnownModel:
 
         with patch.object(
             registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=["just-pulled:latest"],
+            return_value=_as_with_size(["just-pulled:latest"]),
         ):
             result = await registry.is_known_model("just-pulled:latest")
 
@@ -1104,7 +1356,7 @@ class TestIsKnownModel:
 
         with patch.object(
             registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
             side_effect=httpx.HTTPError("ollama down"),
         ):
@@ -1117,18 +1369,18 @@ class TestIsKnownModel:
 
         with patch.object(
             registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=["old:latest"],
+            return_value=_as_with_size(["old:latest"]),
         ):
             assert await registry.is_known_model("never-pulled:latest") is False
 
     async def test_sync_with_ollama_populates_known_models(self, populated_registry):
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=["llama3:latest", "mistral:latest"],
+            return_value=_as_with_size(["llama3:latest", "mistral:latest"]),
         ):
             await populated_registry._sync_with_ollama()
 
@@ -1317,9 +1569,11 @@ class TestSyncWithOllamaPeriodic:
 
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=["llama3:latest", "codellama:latest", "mistral:latest"],
+            return_value=_as_with_size(
+                ["llama3:latest", "codellama:latest", "mistral:latest"]
+            ),
         ):
             await populated_registry._sync_with_ollama()
 
@@ -1334,17 +1588,19 @@ class TestSyncWithOllamaPeriodic:
         # First sync seeds.
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=["llama3:latest", "codellama:latest"],
+            return_value=_as_with_size(["llama3:latest", "codellama:latest"]),
         ):
             await populated_registry._sync_with_ollama()
         # Second sync sees a new model — should be added.
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=["llama3:latest", "codellama:latest", "newly-pulled:latest"],
+            return_value=_as_with_size(
+                ["llama3:latest", "codellama:latest", "newly-pulled:latest"]
+            ),
         ):
             await populated_registry._sync_with_ollama()
 
@@ -1365,9 +1621,9 @@ class TestSyncWithOllamaPeriodic:
         # First seed _known_models with a successful sync.
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=["llama3:latest", "codellama:latest"],
+            return_value=_as_with_size(["llama3:latest", "codellama:latest"]),
         ):
             await populated_registry._sync_with_ollama()
 
@@ -1379,7 +1635,7 @@ class TestSyncWithOllamaPeriodic:
         # must NOT wipe the prior good state.
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
             side_effect=MalformedTagsResponseError("garbage body"),
         ):
@@ -1410,7 +1666,7 @@ class TestSyncWithOllamaPeriodic:
         max_in_flight = 0
         gate = _asyncio.Event()
 
-        async def slow_fetch() -> list[str]:
+        async def slow_fetch() -> list[tuple[str, int]]:
             nonlocal in_flight, max_in_flight
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
@@ -1418,11 +1674,11 @@ class TestSyncWithOllamaPeriodic:
             # concurrent caller without serialization would also enter.
             await gate.wait()
             in_flight -= 1
-            return ["llama3:latest", "codellama:latest"]
+            return [("llama3:latest", 0), ("codellama:latest", 0)]
 
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             side_effect=slow_fetch,
         ):
             t1 = _asyncio.create_task(populated_registry._sync_with_ollama())
@@ -1442,9 +1698,9 @@ class TestSyncWithOllamaPeriodic:
         # First sync seeds.
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=["llama3:latest", "codellama:latest"],
+            return_value=_as_with_size(["llama3:latest", "codellama:latest"]),
         ):
             await populated_registry._sync_with_ollama()
         assert "codellama:latest" in populated_registry._known_models
@@ -1452,9 +1708,9 @@ class TestSyncWithOllamaPeriodic:
         # Simulate `ollama rm codellama:latest` — second sync sees only one.
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=["llama3:latest"],
+            return_value=_as_with_size(["llama3:latest"]),
         ):
             await populated_registry._sync_with_ollama()
 
@@ -1466,9 +1722,9 @@ class TestSyncWithOllamaPeriodic:
         # First sync establishes baseline.
         with patch.object(
             populated_registry,
-            "_fetch_model_list",
+            "_fetch_models_with_size",
             new_callable=AsyncMock,
-            return_value=["llama3:latest", "codellama:latest"],
+            return_value=_as_with_size(["llama3:latest", "codellama:latest"]),
         ):
             await populated_registry._sync_with_ollama()
 
@@ -1478,9 +1734,9 @@ class TestSyncWithOllamaPeriodic:
         with (
             patch.object(
                 populated_registry,
-                "_fetch_model_list",
+                "_fetch_models_with_size",
                 new_callable=AsyncMock,
-                return_value=["llama3:latest", "codellama:latest"],
+                return_value=_as_with_size(["llama3:latest", "codellama:latest"]),
             ),
             patch.object(populated_registry, "_save_cache") as mock_save,
             patch.object(populated_registry, "_save_metadata_cache") as mock_save_meta,

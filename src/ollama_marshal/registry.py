@@ -46,6 +46,54 @@ _KV_PRECISION_MULTIPLIER: dict[KVCacheType, float] = {
 _DEFAULT_REGISTRY_PATH = Path.home() / ".ollama-marshal" / "model_sizes.json"
 _DEFAULT_METADATA_PATH = Path.home() / ".ollama-marshal" / "model_metadata.json"
 
+# Quantization → bytes-per-parameter map for the size estimator fallback
+# (registry.py:get_or_estimate_size). The on-disk model_sizes.json cache
+# stores actual VRAM measured after a successful load, and /api/tags
+# seeds the cache with file-size-derived guesses; the estimator below
+# is the LAST-resort path when neither the cache nor /api/tags is
+# available (e.g. model pulled mid-session, polled before next
+# /api/tags refresh). Sourced from llama.cpp's actual weight bytes per
+# parameter at each quantization. Pre-Bug-9 the estimator hardcoded
+# `param_count * 4`, which assumed F32 weights and overshot Q8_0 by
+# 3.4x and BF16 by 2x — large enough to push small models past tight
+# budgets in the eviction test (3.49 GB estimate vs. 2.5 GB budget for
+# a 0.8b Q8 model that actually loads at ~1 GB).
+_QUANT_BYTES_PER_PARAM: dict[str, float] = {
+    "F32": 4.0,
+    "F16": 2.0,
+    "BF16": 2.0,
+    "Q8_0": 1.0625,
+    "Q6_K": 0.825,
+    "Q5_K_M": 0.6875,
+    "Q5_K_S": 0.6125,
+    "Q5_0": 0.6875,
+    "Q4_K_M": 0.55,
+    "Q4_K_S": 0.5,
+    "Q4_0": 0.5625,
+    "Q3_K_M": 0.4375,
+    "Q3_K_S": 0.4,
+    "Q2_K": 0.3125,
+}
+
+# Median bytes/param fallback when /api/show reports an unknown quant
+# string (new Ollama formats, custom quants). 0.6 ≈ Q5 — close to the
+# centre of the typical quant range and conservative-but-not-absurd.
+_QUANT_BYTES_PER_PARAM_FALLBACK = 0.6
+
+# Margin applied on top of raw weight bytes to absorb KV cache, compute
+# buffers, and minor framework overhead at zero/small context. The
+# estimator only fires when a model has NEVER been loaded successfully
+# (so we have no measured VRAM); first successful load overwrites the
+# estimate with the exact /api/ps `size_vram`. 1.10 covers small-model
+# zero-context VRAM within ~10% on observed test models; tight-budget
+# bin-packing still has the eviction loop as a safety net.
+_ESTIMATE_KV_MARGIN = 1.10
+
+# Margin applied to /api/tags disk-size when seeding `_sizes` for an
+# unmeasured model. Same rationale as _ESTIMATE_KV_MARGIN — disk size
+# is the model's weight bytes; runtime VRAM adds KV/compute overhead.
+_TAGS_SIZE_MARGIN = 1.10
+
 # KV cache dtype defaults to fp16 = 2 bytes per element. Newer Ollama
 # supports KV cache quantization (q8_0 = 1 byte) but we conservatively
 # assume the heaviest case so we don't over-allocate parallel slots.
@@ -194,6 +242,17 @@ class ModelRegistry:
         self.registry_path = registry_path or _DEFAULT_REGISTRY_PATH
         self.metadata_path = metadata_path or _DEFAULT_METADATA_PATH
         self._sizes: dict[str, int] = {}
+        # Bug 9: per-model disk-size estimate sourced from /api/tags during
+        # `_sync_with_ollama`. Used as a fallback by `get_or_estimate_size`
+        # when `_sizes` (measured VRAM from benchmark_model) has no entry.
+        # Kept separate from `_sizes` so `benchmark_unknown` still sees
+        # un-benchmarked models as candidates — if these tag-derived
+        # estimates lived in `_sizes`, the startup benchmark loop would
+        # see `size_unknown = []` and never measure anything, leaving
+        # routing/bin-packing on approximations indefinitely (P2 caught
+        # in Bug 9 codex review). Not persisted to disk — cheap to
+        # re-seed from /api/tags on each marshal start.
+        self._tag_size_estimates: dict[str, int] = {}
         self._metadata: dict[str, ModelMetadata] = {}
         self._benchmarking: set[str] = set()
         # Source-of-truth set for "is this model installed in Ollama right
@@ -321,8 +380,14 @@ class ModelRegistry:
         poll cycle would re-emit the full un-benchmarked list.
         """
         async with self._sync_lock:
+            # Single /api/tags fetch per sync. Bug 9 review caught the
+            # earlier two-call pattern (call _fetch_model_list for names,
+            # then _fetch_models_with_size for sizes) — both went through
+            # the same endpoint and the name-only call discarded data we
+            # already had. One fetch keeps the prune + seed against the
+            # same snapshot (no inter-call race window).
             try:
-                current_models = await self._fetch_model_list()
+                with_sizes = await self._fetch_models_with_size()
             except httpx.HTTPError:
                 logger.warning(
                     "model_registry.sync_failed", reason="cannot reach Ollama"
@@ -343,6 +408,7 @@ class ModelRegistry:
                 )
                 return
 
+            current_models = [name for name, _ in with_sizes]
             new_set = set(current_models)
             is_first_sync = self._known_models_last_sync == 0.0
             added = new_set - self._known_models
@@ -360,8 +426,42 @@ class ModelRegistry:
             for model in meta_stale:
                 del self._metadata[model]
 
+            # Drop tag-size estimates for models no longer in /api/tags.
+            # Not persisted, so no save_cache call.
+            tag_stale = set(self._tag_size_estimates.keys()) - new_set
+            for model in tag_stale:
+                del self._tag_size_estimates[model]
+
+            # Bug 9 seed: populate `_tag_size_estimates` (NOT `_sizes`) for
+            # known models, using the disk size from /api/tags scaled by
+            # `_TAGS_SIZE_MARGIN` to absorb KV/compute overhead. Kept
+            # separate from `_sizes` so the startup benchmark loop in
+            # `benchmark_unknown` still sees un-benchmarked models as
+            # candidates (P2 caught in codex review of the initial seed
+            # implementation: writing to `_sizes` would shadow every
+            # model from the benchmark loop, leaving routing/bin-packing
+            # on disk-size approximations indefinitely). Used by
+            # `get_or_estimate_size` as a fallback between measured
+            # `_sizes` and the /api/show param-count estimator. Always
+            # refreshes — disk size may have changed (re-pulled model).
+            seeded: list[str] = []
+            for name, disk_size in with_sizes:
+                if disk_size <= 0:
+                    continue
+                estimated = int(disk_size * _TAGS_SIZE_MARGIN)
+                if self._tag_size_estimates.get(name) == estimated:
+                    continue
+                self._tag_size_estimates[name] = estimated
+                seeded.append(name)
+
             if stale:
                 self._save_cache()
+            if seeded:
+                logger.info(
+                    "model_registry.tag_size_estimates_refreshed",
+                    models=sorted(seeded),
+                    margin=_TAGS_SIZE_MARGIN,
+                )
             if meta_stale:
                 self._save_metadata_cache()
 
@@ -458,6 +558,11 @@ class ModelRegistry:
         method — `_fetch_model_list` is preserved as a thin alias for
         backwards compatibility with existing tests.
 
+        Implementation note: delegates to ``_fetch_models_with_size``
+        and strips the size field. All wire/shape validation (HTTP
+        errors, ``MalformedTagsResponseError``, per-entry malformations)
+        lives in that method.
+
         Top-level shape errors (non-JSON body, response not a dict,
         ``"models"`` not a list) raise `MalformedTagsResponseError`
         rather than returning an empty list. Returning `[]` would be
@@ -479,16 +584,34 @@ class ModelRegistry:
             MalformedTagsResponseError: 200 response with body that
                 doesn't match the expected ``{"models": [...]}`` shape.
         """
+        with_sizes = await self._fetch_models_with_size()
+        return [name for name, _ in with_sizes]
+
+    async def _fetch_models_with_size(self) -> list[tuple[str, int]]:
+        """Fetch downloaded models from Ollama as ``(name, file_size_bytes)`` pairs.
+
+        Same wire call + shape validation as `fetch_model_list`. Adds
+        the per-model `size` field (model file size on disk) so the
+        sync path can seed `_sizes` for previously-unmeasured models
+        without paying the cost of the Q4-hardcode estimator fallback
+        (registry.py Bug 9 fix). Entries missing or carrying a
+        non-int `size` are returned with `size=0` so the caller can
+        skip seeding without losing the name.
+
+        Returns:
+            List of (name, size_bytes) tuples.
+
+        Raises:
+            httpx.HTTPError: Connection failed, timed out, or non-2xx.
+            MalformedTagsResponseError: 200 response with body that
+                doesn't match the expected ``{"models": [...]}`` shape.
+        """
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{self.ollama_host}/api/tags", timeout=10)
             resp.raise_for_status()
             try:
                 data = resp.json()
             except ValueError as exc:
-                # JSONDecodeError is a subclass of ValueError. Surface
-                # as MalformedTagsResponseError so the sync path can
-                # fail-soft (don't update state) rather than treat the
-                # garbled body as an authoritative empty inventory.
                 raise MalformedTagsResponseError(
                     f"/api/tags returned non-JSON body from {self.ollama_host}"
                 ) from exc
@@ -501,12 +624,19 @@ class ModelRegistry:
             raise MalformedTagsResponseError(
                 "/api/tags returned 'models' that is not a list"
             )
-        out: list[str] = []
+        out: list[tuple[str, int]] = []
         for m in models_raw:
-            if isinstance(m, dict):
-                name = m.get("name")
-                if isinstance(name, str) and name:
-                    out.append(name)
+            if not isinstance(m, dict):
+                continue
+            name = m.get("name")
+            if not (isinstance(name, str) and name):
+                continue
+            raw_size = m.get("size", 0)
+            try:
+                size = int(raw_size)
+            except (TypeError, ValueError):
+                size = 0
+            out.append((name, size if size > 0 else 0))
         return out
 
     # Kept for backwards compatibility with existing tests that patch
@@ -900,18 +1030,50 @@ class ModelRegistry:
     async def get_or_estimate_size(self, model: str) -> int:
         """Get model size from cache, or estimate from /api/show.
 
-        Falls back to the model's file size from /api/show as a rough
-        estimate when the model hasn't been benchmarked yet.
+        Precedence:
+
+        1. Measured VRAM from a prior load (`_sizes` cache, persisted
+           in `model_sizes.json`).
+        2. /api/tags-seeded value populated by `_sync_with_ollama` for
+           freshly-pulled models (disk size + ``_TAGS_SIZE_MARGIN``).
+        3. /api/show parameter-count * quant-aware bytes/param *
+           ``_ESTIMATE_KV_MARGIN`` — fires when the model is not in
+           ``_tag_size_estimates``: either ``/api/tags`` returned
+           ``size=0`` for it, the seed fetch failed transiently, or
+           the model was pulled between the last sync tick and this
+           call. Reads ``details.quantization_level`` for the
+           bytes/param multiplier (case-normalized to upper); unknown
+           quants get ``_QUANT_BYTES_PER_PARAM_FALLBACK`` (~Q5).
+        4. Conservative 4 GB default when /api/show is unreachable
+           or `general.parameter_count` is missing.
+
+        Pre-Bug-9 the estimator multiplied `param_count * 4` regardless
+        of quantization, overshooting Q8_0 by 3.4x and BF16 by 2x. That
+        was large enough to push small models past tight test budgets
+        — the eviction test would estimate 3.49 GB for an 873M Q8_0
+        model whose actual VRAM is ~1 GB, blocking every preload
+        because `can_fit_model` against the 2.5 GB test budget returned
+        False indefinitely.
 
         Args:
             model: The model name.
 
         Returns:
-            VRAM size in bytes (exact if benchmarked, estimated otherwise).
+            VRAM size in bytes (exact if measured, estimated otherwise).
         """
         cached = self._sizes.get(model)
         if cached is not None:
             return cached
+
+        # Bug 9: tag-size estimate populated by _sync_with_ollama. Lives
+        # in a separate dict from `_sizes` so the startup benchmark loop
+        # still sees un-benchmarked models as candidates. Used as the
+        # primary fallback when no measured value exists — accurate
+        # within ~5-10% of real VRAM at small contexts, much closer
+        # than the /api/show param-count estimator below.
+        tag_estimate = self._tag_size_estimates.get(model)
+        if tag_estimate is not None:
+            return tag_estimate
 
         # Estimate from /api/show
         try:
@@ -923,16 +1085,32 @@ class ModelRegistry:
                 )
                 resp.raise_for_status()
                 data: dict[str, Any] = resp.json()
-                # Use model_info parameter count as rough estimate
-                # Approximate: 4 bytes per parameter for Q4 quantization
                 model_info = data.get("model_info", {})
                 param_count = model_info.get("general.parameter_count", 0)
                 if param_count:
-                    estimated = int(param_count * 4)  # Q4 ~ 4 bytes/param
+                    details = data.get("details", {})
+                    quant_level = (
+                        details.get("quantization_level")
+                        if isinstance(details, dict)
+                        else None
+                    )
+                    # Normalize to upper case so future Ollama variants that
+                    # emit "q4_k_m" / "bf16" lowercase still hit the table
+                    # instead of silently falling back to the median.
+                    quant_key = (
+                        quant_level.upper() if isinstance(quant_level, str) else ""
+                    )
+                    bpp = _QUANT_BYTES_PER_PARAM.get(
+                        quant_key, _QUANT_BYTES_PER_PARAM_FALLBACK
+                    )
+                    estimated = int(param_count * bpp * _ESTIMATE_KV_MARGIN)
                     logger.debug(
                         "model_registry.estimated_size",
                         model=model,
                         estimated_bytes=estimated,
+                        quantization_level=quant_level,
+                        bytes_per_param=bpp,
+                        margin=_ESTIMATE_KV_MARGIN,
                     )
                     return estimated
         except httpx.HTTPError:
