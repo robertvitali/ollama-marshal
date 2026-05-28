@@ -255,6 +255,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching the existing `.pre-commit-config.yaml` opt-out for
   the same integration paths. `make test` (unit suite) keeps the
   95% gate — its coverage legitimately clears the bar.
+- **Missing `models` key in `/api/tags` response silently wiped
+  the registry (Bug 14).** Bug 6 hardened `_fetch_models_with_size`
+  against non-JSON bodies, non-dict top levels, and non-list
+  `models` values, but the `models_raw = data.get("models", [])`
+  default still substituted an empty list when the key was
+  absent — exactly what an upstream proxy error envelope like
+  `{"error": "rate limit"}` looks like (valid JSON dict, no
+  `models` key). The empty list propagated as authoritative
+  inventory: `_sync_with_ollama` cleared `_known_models` and
+  the periodic prune deleted size/metadata caches from disk
+  for every model not in the (empty) snapshot. Recovery
+  required re-benchmarking every model from cold cache,
+  serialized one at a time. Added an explicit `if "models"
+  not in data: raise MalformedTagsResponseError` check at
+  `registry.py:_fetch_models_with_size` matching the existing
+  three malformed-shape raises in the same function. Caller
+  `_sync_with_ollama` already catches the exception and skips
+  state mutation — the new raise inherits the fail-soft
+  posture unchanged. New unit test
+  `test_raises_on_missing_models_key` exercises the
+  `{"error": ...}` shape; the existing three `test_raises_on_*`
+  tests cover the other malformed-shape branches.
 
 ### Documentation
 

@@ -564,9 +564,10 @@ class ModelRegistry:
         lives in that method.
 
         Top-level shape errors (non-JSON body, response not a dict,
-        ``"models"`` not a list) raise `MalformedTagsResponseError`
-        rather than returning an empty list. Returning `[]` would be
-        indistinguishable from "Ollama has zero models installed" —
+        missing ``"models"`` key, ``"models"`` not a list) raise
+        `MalformedTagsResponseError` rather than returning an empty
+        list. Returning `[]` would be indistinguishable from "Ollama
+        has zero models installed" —
         and the caller (`_sync_with_ollama`) would commit that empty
         set as authoritative truth, wiping `_known_models` AND
         deleting cached benchmarks/metadata on disk on a single
@@ -604,7 +605,9 @@ class ModelRegistry:
         Raises:
             httpx.HTTPError: Connection failed, timed out, or non-2xx.
             MalformedTagsResponseError: 200 response with body that
-                doesn't match the expected ``{"models": [...]}`` shape.
+                doesn't match the expected ``{"models": [...]}`` shape
+                (non-JSON body, top-level non-dict, missing
+                ``"models"`` key, or ``"models"`` not a list).
         """
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{self.ollama_host}/api/tags", timeout=10)
@@ -619,7 +622,17 @@ class ModelRegistry:
             raise MalformedTagsResponseError(
                 f"/api/tags returned {type(data).__name__}, expected dict"
             )
-        models_raw = data.get("models", [])
+        if "models" not in data:
+            # Bug 14: an upstream error envelope like `{"error": "rate limit"}`
+            # is a valid dict but lacks the `models` key. `dict.get("models",
+            # [])` would silently substitute an empty list, which `_sync_with_
+            # ollama` then commits as authoritative inventory — wiping
+            # `_known_models` and deleting cached benchmarks/metadata on disk.
+            # Treat absence as malformed shape, same as a non-list value.
+            raise MalformedTagsResponseError(
+                f"/api/tags returned dict without 'models' key from {self.ollama_host}"
+            )
+        models_raw = data["models"]
         if not isinstance(models_raw, list):
             raise MalformedTagsResponseError(
                 "/api/tags returned 'models' that is not a list"

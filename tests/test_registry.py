@@ -342,6 +342,41 @@ class TestFetchModelList:
         ):
             await registry._fetch_model_list()
 
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"error": "rate limit"},
+            {},
+            {"version": "0.5.0"},
+        ],
+        ids=["error_envelope", "empty_dict", "version_probe"],
+    )
+    async def test_raises_on_missing_models_key(self, registry, body):
+        # v0.6.6 Bug 14 (Codex P2): a proxy/upstream error envelope
+        # like `{"error": "rate limit"}`, an empty `{}`, or a
+        # version-probe-style `{"version": "..."}` are all valid dicts
+        # that lack the `models` key. The pre-fix
+        # `data.get("models", [])` silently substituted an empty list,
+        # and `_sync_with_ollama` then committed that as authoritative
+        # inventory — wiping `_known_models` and deleting cached
+        # benchmarks/metadata on disk. Treat absence as malformed shape
+        # (same fail-soft posture as the other three
+        # MalformedTagsResponseError raises in
+        # `_fetch_models_with_size`).
+        from ollama_marshal.registry import MalformedTagsResponseError
+
+        mock_resp = MagicMock(spec=httpx.Response)
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = body
+        mock_client = _mock_async_client(AsyncMock())
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with (
+            patch(PATCH_ASYNC_CLIENT, return_value=mock_client),
+            pytest.raises(MalformedTagsResponseError),
+        ):
+            await registry._fetch_model_list()
+
     async def test_skips_malformed_model_entries(self, registry):
         # Some entries malformed (missing name, wrong type) — keep
         # well-formed ones, drop the rest, never crash.
