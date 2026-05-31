@@ -15,6 +15,20 @@ If Ollama isn't reachable on :11434, every test in this directory
 SKIPs cleanly via the module-level ``pytestmark`` set in each test
 file. See ``CLAUDE.md`` Testing Rules for the integration-suite
 conventions.
+
+Constrained-budget sizing (Bug B, v0.6.7): tests that tighten the
+memory budget to force eviction (e.g.
+``test_marshal_eviction_drains_then_unloads``) rely on the
+quantization-aware size estimator (Bug A) for accuracy on a cold
+registry cache, NOT on a pre-seeded size file. Each test gets a
+fresh ``registry_path`` (empty ``_sizes``), so first-touch sizing
+falls through to the estimator; Bug A made that fallback typically
+accurate within roughly 10-20%, enough for the constrained-budget
+tests to pass deterministically without per-test benchmarking. We
+deliberately did NOT pre-seed sizes from the prod cache (dev/CI
+coupling) or ship a known-sizes JSON (drift risk). If the eviction
+test ever flakes because the estimator margin matters at a tight
+budget, graduate to a shipped known-sizes fixture (Bug B Option 2).
 """
 
 from __future__ import annotations

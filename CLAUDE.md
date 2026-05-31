@@ -236,6 +236,23 @@ analysis from scratch.
    The fixture's `_verify_paused` step polls this for up to 5s and
    warns loudly if the flag never propagates.
 
+5. **Constrained-budget tests rely on the estimator, not a seeded
+   size cache** (Bug B, v0.6.7). Tests that tighten the memory
+   budget to force eviction
+   (`test_marshal_eviction_drains_then_unloads`) run against a cold
+   registry cache — each test gets a fresh `registry_path`, so
+   first-touch sizing falls through to the quantization-aware
+   estimator (Bug A, commit be65793). That estimator is typically
+   accurate within roughly 10-20%, enough for the constrained-budget
+   tests to pass
+   deterministically without per-test benchmarking. We deliberately
+   did NOT pre-seed sizes from the prod cache (dev/CI coupling) or
+   ship a known-sizes JSON (drift risk). If the eviction test ever
+   flakes because the estimator margin matters at a tight budget,
+   graduate to a shipped known-sizes fixture (Bug B Option 2). Full
+   trade-off in the `tests/integration/conftest.py` module
+   docstring.
+
 ## Documentation Rules
 
 Every PR keeps these docs in sync with code changes (no drift allowed):
