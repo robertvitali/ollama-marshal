@@ -78,22 +78,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preload-giveup + v0.6.5 error-shape interaction), and
   `RemoteProtocolError` → 502 (default class for unmapped errors).
   Pure test addition — no production code change.
-
-### Changed
-
-- **`scheduler.model_detect_interval` now drives a real polling loop.**
-  Previously declared in config but unused. Default 30s, minimum 1s
-  (validated). Sub-1s values would tight-loop `/api/tags` and are
-  rejected at config load.
-- **Registry sync logging is delta-aware.** The first sync emits the
-  full inventory (preserving v0.6.5 startup output) and an aggregate
-  `model_registry.removed_stale_at_startup` event when on-disk
-  caches were pruned. Subsequent syncs emit `models_added` /
-  `models_removed` only when the set actually changed — without
-  this, every poll cycle would re-emit the full un-benchmarked list.
-
-### Added
-
 - **`pytest-timeout` hard escape valve.** Integration suite now runs
   with `--timeout=1000` as a default (above the 900s Hop 2 budget per
   request) so a single hung test or runaway VRAM lock can't stall
@@ -128,6 +112,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (admin call accepted but state didn't propagate) would otherwise
   silently let prod workloads keep contending for Ollama VRAM during
   the test run.
+
+### Changed
+
+- **`scheduler.model_detect_interval` now drives a real polling loop.**
+  Previously declared in config but unused. Default 30s, minimum 1s
+  (validated). Sub-1s values would tight-loop `/api/tags` and are
+  rejected at config load.
+- **Registry sync logging is delta-aware.** The first sync emits the
+  full inventory (preserving v0.6.5 startup output) and an aggregate
+  `model_registry.removed_stale_at_startup` event when on-disk
+  caches were pruned. Subsequent syncs emit `models_added` /
+  `models_removed` only when the set actually changed — without
+  this, every poll cycle would re-emit the full un-benchmarked list.
 
 ### Fixed
 
