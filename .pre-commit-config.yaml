@@ -29,7 +29,11 @@ repos:
     hooks:
       - id: mypy
         name: mypy
-        entry: mypy
+        # Resolve mypy through the project's uv-managed dev env (matches the
+        # pytest hooks below and the Makefile's `uv run --extra dev mypy`).
+        # Bare `mypy` is not on PATH, which made every commit fail with
+        # "Executable mypy not found".
+        entry: uv run --extra dev mypy
         language: system
         types: [python]
         args: [--strict, src/]
