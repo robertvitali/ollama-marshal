@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-05-31
+
 ### Added
 
 - **Periodic `/api/tags` polling on the model registry (Bug 6).**

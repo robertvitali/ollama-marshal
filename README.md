@@ -378,6 +378,7 @@ FastAPI auto-generates Swagger UI and the OpenAPI spec:
     "total_pending": 5,
     "by_model": {"llama3:latest": 2, "codellama:latest": 3}
   },
+  "paused": false,
   "metrics": {
     "requests_served": 142,
     "model_swaps": 8,

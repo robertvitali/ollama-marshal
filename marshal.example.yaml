@@ -56,7 +56,7 @@ memory:
 # Scheduler
 scheduler:
   max_skips: 3                     # MARSHAL_SCHEDULER_MAX_SKIPS — per-request skip limit
-  model_detect_interval: 30        # MARSHAL_SCHEDULER_MODEL_DETECT_INTERVAL — seconds between /api/tags polls
+  model_detect_interval: 30        # MARSHAL_SCHEDULER_MODEL_DETECT_INTERVAL — /api/tags poll interval (s); drives live model add/removal detection, min 1s
   idle_eviction_minutes: 15        # MARSHAL_SCHEDULER_IDLE_EVICTION_MINUTES — unload a model
                                     # after this many minutes of no activity. 0 disables
                                     # time-based eviction (only memory-pressure eviction).
