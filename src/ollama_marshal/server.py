@@ -402,6 +402,12 @@ def _register_routes(app: FastAPI) -> None:
                 }
             )
         return {
+            # Marshal's own version (NOT Ollama's — /api/version is a
+            # pass-through to Ollama). Lets the integration suite's autouse
+            # pause-prod fixture detect when the running prod marshal is on
+            # stale code vs the test marshal (version-skew warning), and
+            # lets operators see which marshal build is serving.
+            "version": __version__,
             "uptime_seconds": round(time.monotonic() - _started_at, 1),
             "loaded_models": [
                 {

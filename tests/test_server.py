@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from starlette.routing import Route
 
 import ollama_marshal.server as server_mod
+from ollama_marshal import __version__
 from ollama_marshal.config import MarshalConfig, ShutdownConfig, ShutdownMode
 from ollama_marshal.memory import LoadedModel, MemoryBudget
 from ollama_marshal.queue import ModelQueues, PreloadFailedError
@@ -886,6 +887,9 @@ class TestMarshalStatus:
         assert "memory" in result
         assert "queue" in result
         assert "metrics" in result
+        # v0.6.7: marshal exposes its own version on the status payload so
+        # the integration pause-prod fixture can detect prod/test skew.
+        assert result["version"] == __version__
 
         # Verify nested structure
         assert len(result["loaded_models"]) == 1

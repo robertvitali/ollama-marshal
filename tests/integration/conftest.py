@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -48,6 +49,7 @@ import pytest_asyncio
 import structlog
 from asgi_lifespan import LifespanManager
 
+from ollama_marshal import __version__
 from ollama_marshal.config import (
     AuditConfig,
     MarshalConfig,
@@ -63,6 +65,7 @@ from ollama_marshal.config import (
 from ollama_marshal.server import create_app
 
 from ._admin_token import discover_admin_token, discover_bypass_token
+from ._version_skew import version_skew_reason
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -607,6 +610,29 @@ PAUSE_AUTO_RESUME_S = int(os.environ.get("MARSHAL_TEST_PAUSE_TIMEOUT_S", "3600")
 # work) can set MARSHAL_TEST_PAUSE_DRAIN_S explicitly.
 PAUSE_DRAIN_TIMEOUT_S = int(os.environ.get("MARSHAL_TEST_PAUSE_DRAIN_S", "0"))
 
+# Auto-restart prod marshal (v0.6.7) — see CLAUDE.md "Integration test
+# infrastructure design decisions". Two layers:
+#
+# - Option B (always-on floor): ``pause_local_prod_marshal`` reads prod
+#   marshal's ``version`` (now on /api/marshal/status) and WARNS when it
+#   differs from the test marshal's ``ollama_marshal.__version__``. Zero
+#   outage — catches the stale-prod-code skew that silently masked the
+#   ``paused``-field verification during Bug 12 (2026-05-15).
+# - Option A (opt-in via MARSHAL_TEST_RESTART_PROD=1): launchctl-restart
+#   prod marshal pre-suite so it runs freshly-installed code. Graceful
+#   fallback (no-op + warn) on non-launchd hosts or unregistered labels.
+#
+# Option C (fail-fast / skip pause on mismatch) was rejected — it would
+# surrender the VRAM-contention protection the autouse pause exists for.
+PROD_MARSHAL_RESTART_ENV = "MARSHAL_TEST_RESTART_PROD"
+# launchd label for the prod marshal service; restart target is
+# gui/<uid>/<label>. Override for non-default service names.
+PROD_MARSHAL_LAUNCHD_LABEL = os.environ.get(
+    "MARSHAL_TEST_LAUNCHD_LABEL", "com.ollama-marshal"
+)
+# Drain window (seconds) before the abrupt ``launchctl kickstart -k``.
+PROD_RESTART_DRAIN_S = int(os.environ.get("MARSHAL_TEST_RESTART_DRAIN_S", "10"))
+
 _log = structlog.get_logger("integration.prod_pause")
 
 
@@ -742,6 +768,159 @@ async def _prod_resume(token: str) -> None:
             )
 
 
+async def _read_prod_marshal_version() -> str | None:
+    """GET prod ``/api/marshal/status`` and return its ``version`` field.
+
+    Returns ``None`` when the status is unreachable, malformed, or lacks
+    the ``version`` field (prod marshal predates v0.6.7). Token-free —
+    ``version`` rides the canonical status payload.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(f"{PROD_MARSHAL_URL}/api/marshal/status")
+            resp.raise_for_status()
+            payload = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        _log.warning("prod_pause.version_read_failed", error=str(exc))
+        return None
+    # Tolerate a 200 with valid-but-non-object JSON (null, [], "error"):
+    # ``.get`` on a non-dict raises AttributeError, which would escape this
+    # helper into the autouse fixture and break the whole integration suite.
+    if not isinstance(payload, dict):
+        return None
+    version = payload.get("version")
+    return version if isinstance(version, str) else None
+
+
+async def _warn_on_version_skew() -> None:
+    """Log a warning when prod marshal's version differs from the test's.
+
+    Option B floor (always-on, zero outage): a status read + pure compare.
+    A skew means prod and test marshals are on different code (either side
+    may be the stale one), so prod's behavior may not match what the suite
+    expects.
+    """
+    reason = version_skew_reason(await _read_prod_marshal_version(), __version__)
+    if reason is not None:
+        _log.warning(
+            "prod_pause.version_skew",
+            reason=reason,
+            hint=(
+                "versions differ (either side may be stale); restart the "
+                f"stale marshal — {PROD_MARSHAL_RESTART_ENV}=1 restarts prod"
+            ),
+        )
+
+
+async def _wait_prod_healthy(timeout: float = 30.0) -> bool:
+    """Poll prod ``/api/marshal/status`` until 200 or ``timeout``.
+
+    Used after a ``launchctl`` restart to confirm prod came back up.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        try:
+            async with httpx.AsyncClient(timeout=1.0) as client:
+                resp = await client.get(f"{PROD_MARSHAL_URL}/api/marshal/status")
+                if resp.status_code == 200:
+                    return True
+        except (httpx.HTTPError, OSError):
+            pass
+        await asyncio.sleep(0.3)
+    return False
+
+
+def _kickstart_launchd(launchctl: str, target: str) -> subprocess.CompletedProcess[str]:
+    """Blocking ``launchctl kickstart -k <target>`` (call via ``asyncio.to_thread``).
+
+    Isolated so the synchronous ``subprocess.run`` (and its S603 suppression)
+    lives in one place and the caller can offload it off the event loop with
+    a bounded timeout. Raises ``subprocess.TimeoutExpired`` (a
+    ``SubprocessError``) on hang and ``OSError`` on spawn failure — both
+    handled by the caller as a graceful no-op.
+    """
+    return subprocess.run(  # noqa: S603 — resolved argv; label from env/default
+        [launchctl, "kickstart", "-k", target],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
+async def _maybe_restart_prod_marshal(token: str | None) -> None:
+    """Opt-in (``MARSHAL_TEST_RESTART_PROD=1``): launchctl-restart prod marshal.
+
+    Restarts the launchd-managed prod marshal so it runs freshly-installed
+    code before the suite, eliminating the stale-process version skew that
+    motivated this fixture. Best-effort and graceful: no-op + warn when
+    ``launchctl`` is unavailable (Linux dev box) or the launchd label is
+    not registered (manual marshal launch).
+
+    Sequence: best-effort drain via ``admin/pause`` (so in-flight Ollama
+    inferences aren't killed mid-stream) -> ``launchctl kickstart -k`` ->
+    wait for the restarted marshal to report healthy.
+    """
+    launchctl = shutil.which("launchctl")
+    if launchctl is None:
+        _log.warning(
+            "prod_restart.launchctl_unavailable",
+            reason="not a launchd platform (Linux?) — skipping opt-in restart",
+        )
+        return
+    # Best-effort drain before the abrupt ``kickstart -k`` so in-flight
+    # inferences stop accruing new work first. Non-fatal on error —
+    # kickstart restarts regardless.
+    if token:
+        try:
+            async with httpx.AsyncClient(
+                timeout=float(PROD_RESTART_DRAIN_S) + 5.0
+            ) as client:
+                await client.post(
+                    f"{PROD_MARSHAL_URL}/api/marshal/admin/pause",
+                    headers={"X-Marshal-Admin-Token": token},
+                    json={
+                        "drain_timeout_s": PROD_RESTART_DRAIN_S,
+                        # Arm the long (1h) failsafe so a kickstart failure
+                        # below can't leave prod frozen for only the server
+                        # default window; we also resume explicitly on failure.
+                        "auto_resume_after_seconds": PAUSE_AUTO_RESUME_S,
+                    },
+                )
+        except httpx.HTTPError as exc:
+            _log.warning("prod_restart.predrain_failed", error=str(exc))
+    target = f"gui/{os.getuid()}/{PROD_MARSHAL_LAUNCHD_LABEL}"
+    # Run the blocking kickstart off the event loop with a hard timeout, and
+    # treat spawn errors / timeouts as a graceful no-op. The session-scoped
+    # autouse fixture must never hang or raise.
+    try:
+        proc = await asyncio.to_thread(_kickstart_launchd, launchctl, target)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.warning("prod_restart.kickstart_error", target=target, error=str(exc))
+        if token:
+            # We may have paused prod above — don't leave it frozen.
+            await _prod_resume(token)
+        return
+    if proc.returncode != 0:
+        _log.warning(
+            "prod_restart.kickstart_failed",
+            target=target,
+            returncode=proc.returncode,
+            stderr=proc.stderr.strip(),
+            hint="launchd label not registered? set MARSHAL_TEST_LAUNCHD_LABEL",
+        )
+        # Restart did not happen: prod is still alive and (if we drained)
+        # paused. Resume so a failed opt-in restart never freezes prod.
+        if token:
+            await _prod_resume(token)
+        return
+    if await _wait_prod_healthy():
+        _log.info("prod_restart.done", target=target)
+    else:
+        _log.warning("prod_restart.unhealthy_after_restart", target=target)
+
+
 @pytest_asyncio.fixture(loop_scope="session", scope="session", autouse=True)
 async def pause_local_prod_marshal() -> AsyncIterator[bool]:
     """Pause local prod marshal at :11435 for the integration session.
@@ -776,7 +955,20 @@ async def pause_local_prod_marshal() -> AsyncIterator[bool]:
         _log.info("prod_pause.not_reachable", url=PROD_MARSHAL_URL)
         yield False
         return
+
     token = discover_admin_token()
+
+    # Option A (opt-in via MARSHAL_TEST_RESTART_PROD=1): restart prod marshal
+    # so it runs freshly-installed code before the suite. Best-effort +
+    # graceful (no-op + warn on non-launchd hosts / unregistered labels).
+    if os.environ.get(PROD_MARSHAL_RESTART_ENV) == "1":
+        await _maybe_restart_prod_marshal(token)
+
+    # Option B (always-on floor): warn if prod marshal reports a different
+    # version than the test marshal. Runs after any opt-in restart so it
+    # reflects the post-restart version. Zero outage.
+    await _warn_on_version_skew()
+
     if not token:
         _log.info("prod_pause.no_admin_token")
         yield False

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`version` field on `/api/marshal/status`.** The status payload now
+  reports the marshal's own version (`ollama_marshal.__version__`),
+  distinct from `/api/version` which passes through to Ollama. Lets
+  operators see which marshal build is serving, and lets the integration
+  suite detect when a running prod marshal is on stale code versus the
+  test marshal.
+
+### Changed
+
+- **Integration fixture warns on prod/test marshal version skew, with
+  opt-in prod restart.** The autouse `pause_local_prod_marshal` fixture
+  now logs a `prod_pause.version_skew` warning when the running prod
+  marshal's version differs from the test marshal's (always-on, zero
+  outage). Setting `MARSHAL_TEST_RESTART_PROD=1` additionally restarts
+  prod marshal via `launchctl kickstart -k` before the suite so it runs
+  freshly-installed code, degrading to a no-op + warning on non-launchd
+  hosts or when the launchd label is not registered. Eliminates the
+  version-skew variable that silently masked the `paused`-field
+  verification during Bug 12. Test infra only; the sole user-facing
+  change is the new status `version` field above.
+
 ## [0.6.6] - 2026-05-31
 
 ### Added

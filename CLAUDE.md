@@ -253,6 +253,28 @@ analysis from scratch.
    trade-off in the `tests/integration/conftest.py` module
    docstring.
 
+6. **Prod-marshal version-skew warning + opt-in restart** (auto-restart
+   fixture, v0.6.7). The autouse `pause_local_prod_marshal` fixture reads
+   the prod marshal's `version` (exposed on `/api/marshal/status`) and
+   logs a `prod_pause.version_skew` warning when it differs from the test
+   marshal's `ollama_marshal.__version__` — an always-on floor (Option B)
+   with zero outage, catching the stale-prod-code skew that silently
+   masked the `paused`-field verification during Bug 12 (2026-05-15).
+   Setting `MARSHAL_TEST_RESTART_PROD=1` additionally triggers a
+   `launchctl kickstart -k` restart of prod marshal before the suite
+   (Option A) so prod runs freshly-installed code; it degrades to a
+   no-op + warning when launchctl is unavailable (Linux) or the launchd
+   label (`MARSHAL_TEST_LAUNCHD_LABEL`, default `com.ollama-marshal`) is
+   not registered (`MARSHAL_TEST_RESTART_DRAIN_S`, default 10, sets the
+   pre-kickstart drain window). The `kickstart` runs off the event loop
+   via `asyncio.to_thread` with a 30s timeout, and a failed restart
+   resumes prod so it is never left frozen. Option C (fail-fast / skip
+   pause on mismatch) was
+   rejected — it would surrender the VRAM-contention protection the
+   autouse pause exists to provide. The pure version-compare helper lives
+   in `tests/integration/_version_skew.py` (unit-tested in
+   `tests/test_version_skew.py`).
+
 ## Documentation Rules
 
 Every PR keeps these docs in sync with code changes (no drift allowed):
