@@ -321,10 +321,12 @@ class SchedulerConfig(BaseModel):
             "After this many consecutive preload failures for the same "
             "model, give up and fail every queued envelope for that "
             "model with ``PreloadFailedError`` (surfaced to clients as "
-            "a 502). Without this, a permanently-unreachable model "
+            "a 503). Without this, a permanently-unreachable model "
             "would leave its envelopes parked in the queue forever. "
-            "Per-model failure state resets on the next successful "
-            "preload."
+            "Also bounds the cannot-fit / eviction-exhausted escape "
+            "valve (Bug C, v0.6.7): a model too large to ever fit gives "
+            "up after this many attempts instead of spinning. Per-model "
+            "failure state resets on the next successful preload."
         ),
     )
 

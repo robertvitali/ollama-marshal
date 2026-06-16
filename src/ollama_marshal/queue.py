@@ -17,8 +17,10 @@ class PreloadFailedError(Exception):
     ``scheduler.preload_max_consecutive_failures`` consecutive times for
     the same model — at which point keeping the envelope queued forever
     is worse than failing it. Surfaced to clients through the standard
-    error response path (a 502 today; v0.6.5 will propagate the class
-    name + reason in the response body).
+    error response path as a 503 (capacity class), with the class name +
+    reason propagated in the response body (since v0.6.5). Also raised by
+    the scheduler's cannot-fit / eviction-exhausted escape valve (Bug C,
+    v0.6.7) so an un-schedulable model fails cleanly instead of spinning.
     """
 
 

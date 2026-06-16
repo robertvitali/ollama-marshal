@@ -2909,6 +2909,147 @@ class TestPreloadBackoffStateMachine:
         sched.lifecycle.preload.assert_not_called()
         sched.lifecycle.unload.assert_not_called()
 
+    async def test_cannot_fit_records_failure_for_escape_valve(self):
+        """Bug C (v0.6.7): an eviction-exhausted cannot-fit records a failure.
+
+        The old behavior returned False from the cannot-fit branch
+        WITHOUT touching the failure-state machine, so ``forced_load`` /
+        critical preemption re-entered ``_ensure_model_loaded`` every
+        tick and spun hot. Recording the failure plants a cooldown — the
+        next call short-circuits before any eviction work (the bounded-CPU
+        property; the short-circuit itself is covered by
+        ``test_ensure_model_loaded_short_circuits_during_cooldown``).
+        """
+        memory = MagicMock()
+        memory.is_loaded.return_value = False
+        memory.can_fit_model.return_value = False  # never fits
+        memory.available_vram.return_value = 0
+        memory.refresh = AsyncMock()
+
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=50 * 1024**3)
+
+        sched = _make_scheduler(memory=memory, registry=registry)
+
+        with patch.object(sched, "_evict_one", new_callable=AsyncMock) as mock_evict:
+            mock_evict.return_value = False  # nothing to evict → cannot fit
+            result = await sched._ensure_model_loaded("big:latest")
+
+        assert result is False
+        # The fix: the cannot-fit branch now feeds the failure-state
+        # machine instead of silently returning. A single attempt records
+        # one failure (below the giveup threshold) and sets a cooldown.
+        assert "big:latest" in sched._preload_failures
+        assert sched._preload_failures["big:latest"].consecutive_failures == 1
+
+    async def test_cannot_fit_gives_up_after_max_failures(self):
+        """Bug C (v0.6.7): repeated cannot-fit drains the queue with a 503.
+
+        After ``preload_max_consecutive_failures`` eviction-exhausted
+        attempts the escape valve fires: every waiting envelope fails
+        with ``PreloadFailedError`` (503 capacity class) and the per-model
+        failure state clears. Includes a CRITICAL envelope alongside a
+        NORMAL one — critical is exactly the case Option B (cap
+        skip_count) would have missed, since critical requests are exempt
+        from skip-count increment.
+        """
+        from ollama_marshal.queue import PreloadFailedError
+
+        config = MarshalConfig(
+            programs={
+                "default": ProgramConfig(),
+                "crit-prog": ProgramConfig(priority=Priority.CRITICAL),
+            },
+        )
+        # Tighten threshold + backoff so the test stays snappy (mirrors
+        # test_max_consecutive_failures_fails_pending_envelopes).
+        config.scheduler.preload_max_consecutive_failures = 2
+        config.scheduler.preload_backoff_base_s = 0.001
+        config.scheduler.preload_backoff_max_s = 0.001
+
+        queues = ModelQueues()
+        crit_env = _make_envelope(model="big:latest", program_id="crit-prog")
+        normal_env = _make_envelope(model="big:latest", program_id="default")
+        await queues.enqueue(crit_env)
+        await queues.enqueue(normal_env)
+
+        memory = MagicMock()
+        memory.is_loaded.return_value = False
+        memory.can_fit_model.return_value = False
+        memory.available_vram.return_value = 0
+        memory.refresh = AsyncMock()
+
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=50 * 1024**3)
+
+        sched = _make_scheduler(
+            queues=queues, memory=memory, registry=registry, config=config
+        )
+
+        with patch.object(sched, "_evict_one", new_callable=AsyncMock) as mock_evict:
+            mock_evict.return_value = False
+            # Two attempts → failures hit the max on the 2nd; giveup fires.
+            # Sleep past the tiny cooldown so the 2nd attempt isn't
+            # short-circuited at the top of _ensure_model_loaded.
+            for _ in range(2):
+                await asyncio.sleep(0.005)
+                await sched._ensure_model_loaded("big:latest")
+
+        # Both envelopes — normal AND critical — failed with the 503-class
+        # error carrying the capacity message (not the load-failed one).
+        assert crit_env.done_event.is_set()
+        assert normal_env.done_event.is_set()
+        assert isinstance(crit_env.error, PreloadFailedError)
+        assert isinstance(normal_env.error, PreloadFailedError)
+        assert "out of capacity" in str(normal_env.error)
+        # Per-batch giveup, not permanent lockout — state clears so the
+        # next request for the model retries from scratch.
+        assert "big:latest" not in sched._preload_failures
+
+    async def test_cannot_fit_discards_needs_reload_to_restore_backoff(self):
+        """Bug C P1 (codex): cannot-fit must discard the ``_needs_reload`` entry.
+
+        A model flagged in ``_needs_reload`` (Ollama-side eviction)
+        bypasses the preload cooldown. If the cannot-fit branch returns
+        without dropping that marker, every 0.1s tick keeps bypassing the
+        cooldown, bumps the failure counter, and trips giveup prematurely
+        — defeating the backoff the fix relies on. The branch must drop
+        ``(model, chosen_url)`` (same as the post-``_attempt_preload``
+        discard) so the NEXT tick sees no bypass and short-circuits on the
+        cooldown.
+        """
+        memory = MagicMock()
+        memory.is_loaded.return_value = False
+        memory.can_fit_model.return_value = False
+        memory.available_vram.return_value = 0
+        memory.refresh = AsyncMock()
+
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=50 * 1024**3)
+
+        sched = _make_scheduler(memory=memory, registry=registry)
+        # Seed the Ollama-evicted reload marker → exercises bypass_cooldown.
+        sched._needs_reload.add(("big:latest", _PRIMARY_INSTANCE_URL))
+
+        with (
+            patch.object(sched, "_evict_one", new_callable=AsyncMock) as mock_evict,
+            patch("ollama_marshal.scheduler.backoff_delay", return_value=60.0),
+        ):
+            mock_evict.return_value = False
+            result1 = await sched._ensure_model_loaded("big:latest")
+
+            # The fix: the reload marker is dropped so the cooldown can hold.
+            assert ("big:latest", _PRIMARY_INSTANCE_URL) not in sched._needs_reload
+            assert result1 is False
+            assert sched._preload_failures["big:latest"].consecutive_failures == 1
+
+            # Next tick: no bypass now → the cooldown short-circuits before
+            # any eviction work and without bumping the counter again.
+            result2 = await sched._ensure_model_loaded("big:latest")
+            assert result2 is False
+            assert mock_evict.await_count == 1
+            assert sched._preload_failures["big:latest"].consecutive_failures == 1
+
 
 class TestUnexpectedUnloadReactivity:
     """v0.6.5 Bug 4: scheduler reacts to Ollama-side evictions on next tick.

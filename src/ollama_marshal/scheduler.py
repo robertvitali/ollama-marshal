@@ -885,25 +885,45 @@ class Scheduler:
         if self._preload_failures.pop(model, None) is not None:
             logger.info("scheduler.preload_failure_cleared", model=model)
 
-    async def _give_up_on_preload(self, model: str) -> None:
-        """Drain ``model``'s queue and fail every envelope with PreloadFailedError.
+    async def _give_up_on_preload(
+        self,
+        model: str,
+        *,
+        error: Exception | None = None,
+        reason: str = "preload_failed",
+    ) -> None:
+        """Drain ``model``'s queue and fail every waiting envelope.
 
         Called after the per-model failure counter reaches
         ``preload_max_consecutive_failures``. Clears the failure state
         so the next request for the same model starts a fresh backoff
         sequence — the cooldown is per-batch, not permanent.
+
+        Args:
+            model: The model whose queued envelopes are drained + failed.
+            error: Exception set on every drained envelope. Defaults to a
+                ``PreloadFailedError`` describing repeated load failures.
+                The Bug C cannot-fit / eviction-exhausted path (v0.6.7)
+                passes its own ``PreloadFailedError`` carrying a capacity
+                message so the client sees an accurate reason; both error
+                instances map to a 503 in ``server.py``.
+            reason: Tags the structured ``scheduler.preload_giving_up``
+                log so the load-failed and cannot-fit giveup sources stay
+                distinguishable in operations.
         """
         cfg = self.config.scheduler
         drained = await self.queues.dequeue_batch(model)
-        error = PreloadFailedError(
-            f"preload failed {cfg.preload_max_consecutive_failures} consecutive "
-            f"times for model {model!r}; giving up"
-        )
+        if error is None:
+            error = PreloadFailedError(
+                f"preload failed {cfg.preload_max_consecutive_failures} consecutive "
+                f"times for model {model!r}; giving up"
+            )
         for env in drained:
             env.fail(error)
         logger.error(
             "scheduler.preload_giving_up",
             model=model,
+            reason=reason,
             consecutive_failures=cfg.preload_max_consecutive_failures,
             failed_envelopes=len(drained),
         )
@@ -1448,6 +1468,45 @@ class Scheduler:
                 if is_reload:
                     self.memory.record_allocated_num_ctx(
                         model, 0, instance_url=chosen_url
+                    )
+                # Bug C (v0.6.7): this cannot-fit / eviction-exhausted
+                # branch used to return False WITHOUT touching the
+                # per-model failure-state machine, so ``forced_load`` and
+                # critical preemption re-entered ``_ensure_model_loaded``
+                # every 0.1s tick and spun hot — skip_count climbed past
+                # 6000 in ~30s with no escape valve, and the waiting
+                # request hung forever. Route the failure through the
+                # SAME backoff + giveup machine ``_attempt_preload`` uses:
+                # ``_record_preload_failure`` sets a cooldown so the next
+                # tick short-circuits at the top of this method (bounding
+                # CPU), and after ``preload_max_consecutive_failures``
+                # attempts ``_give_up_on_preload`` drains the queue and
+                # fails every waiting envelope with a 503. Both the
+                # forced_load (normal) and critical-preemption callers
+                # reach this branch, so both are covered.
+                #
+                # Drop any ``_needs_reload`` marker for the chosen instance
+                # FIRST — mirrors the post-``_attempt_preload`` discard
+                # below. A model flagged for Ollama-side reload bypasses
+                # the cooldown (``bypass_cooldown`` at the top of this
+                # method); leaving the marker in place would keep that
+                # bypass on, so every tick would skip the cooldown,
+                # re-enter, and bump the failure counter — converting the
+                # backoff into per-tick hammering and tripping giveup
+                # prematurely while transient contention might still clear
+                # (codex P1).
+                self._needs_reload.discard((model, chosen_url))
+                failures = self._record_preload_failure(model)
+                if failures >= self.config.scheduler.preload_max_consecutive_failures:
+                    await self._give_up_on_preload(
+                        model,
+                        error=PreloadFailedError(
+                            f"cannot fit model {model!r} "
+                            f"({round(model_size / (1024**3), 2)} GB) after "
+                            f"{self.config.scheduler.preload_max_consecutive_failures} "
+                            "attempts; marshal is out of capacity"
+                        ),
+                        reason="cannot_fit",
                     )
                 return False
 

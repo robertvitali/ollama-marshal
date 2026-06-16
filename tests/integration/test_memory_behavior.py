@@ -91,6 +91,29 @@ _REQUIRES_MODELS = pytest.mark.skipif(
 )
 
 
+def _required_model_pulled() -> bool:
+    """Sync check that REQUIRED_MODEL alone is present.
+
+    Used by single-model tests (e.g. the Bug C cannot-fit test) so they
+    don't skip just because the unrelated SECOND_MODEL is missing.
+    """
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            resp = client.get(f"{DEFAULT_OLLAMA_HOST}/api/tags")
+            resp.raise_for_status()
+            names = {m.get("name") for m in resp.json().get("models", [])}
+            return REQUIRED_MODEL in names
+    except (httpx.HTTPError, OSError):
+        return False
+
+
+_REQUIRES_REQUIRED_MODEL = pytest.mark.skipif(
+    not _required_model_pulled(),
+    reason=f"Required model {REQUIRED_MODEL!r} must be pulled "
+    f"(run `ollama pull {REQUIRED_MODEL}`)",
+)
+
+
 # Common headers — all tests use critical priority by default.
 _HDR_CRIT = {"X-Program-ID": PROGRAM_CRITICAL}
 _HDR_NORMAL = {"X-Program-ID": PROGRAM_NORMAL}
@@ -405,6 +428,104 @@ async def test_marshal_eviction_drains_then_unloads(tmp_marshal_paths):
         f"B served before all A's drained: A timestamps={a_served}, "
         f"B timestamp={b_served[0]}"
     )
+
+
+# ---------------------------------------------------------------------
+# 3b. Cannot-fit escape valve (Bug C, v0.6.7)
+# ---------------------------------------------------------------------
+
+
+@_REQUIRES_REQUIRED_MODEL
+@pytest.mark.timeout(120)
+async def test_cannot_fit_returns_503_not_livelock(tmp_marshal_paths):
+    """Bug C (v0.6.7): a model too large for the budget fails 503, fast.
+
+    Constrains marshal's memory budget to 200 MB — below any real model
+    — so the request can NEVER fit, and an empty Ollama means nothing is
+    evictable. Before the fix the scheduler spun forever (forced_load
+    <-> cannot_fit, skip_count past 6000 in ~30s) and the client hung.
+    The escape valve now routes the cannot-fit failure through the
+    per-model backoff + giveup machine: after
+    ``preload_max_consecutive_failures`` attempts the queue drains and
+    the waiting request gets a 503.
+
+    Uses CRITICAL priority on purpose. Critical requests are exempt from
+    skip-count increment, so this is the exact path Option B (cap
+    skip_count) could not have covered — it exercises
+    ``_handle_critical_preemption`` -> ``_ensure_model_loaded``.
+    """
+    # Pre-flight: empty Ollama so ``_evict_one`` has nothing to churn
+    # through (consistent with the eviction test's destructive
+    # convention; the autouse prod-pause fixture keeps :11435 from
+    # reloading underneath us).
+    async with httpx.AsyncClient(timeout=10) as preflight:
+        resp = await preflight.get(f"{DEFAULT_OLLAMA_HOST}/api/ps")
+        for m in resp.json().get("models", []):
+            name = m.get("name") or m.get("model")
+            if name:
+                await preflight.post(
+                    f"{DEFAULT_OLLAMA_HOST}/api/generate",
+                    json={"model": name, "prompt": "", "keep_alive": "0"},
+                )
+
+    cfg = MarshalConfig(
+        ollama=OllamaConfig(host=DEFAULT_OLLAMA_HOST),
+        proxy=ProxyConfig(host="127.0.0.1", port=11437),
+        # 200 MB budget — below any real model, so REQUIRED_MODEL can
+        # never fit no matter how much real VRAM is free.
+        memory=MemoryConfig(
+            total_ram="200MB",
+            os_overhead="0B",
+            safety_margin="0B",
+            poll_interval=1,
+        ),
+        scheduler=SchedulerConfig(
+            metrics_path=str(tmp_marshal_paths["metrics_path"]),
+            metrics_persist_interval_s=3600,
+            ollama_forward_timeout_s=INTEGRATION_FORWARD_TIMEOUT_S,
+            # Bound the escape valve tight so the 503 lands in well under
+            # 10s (vs the default 5 failures x exponential backoff).
+            preload_max_consecutive_failures=2,
+            preload_backoff_base_s=0.05,
+            preload_backoff_max_s=0.2,
+        ),
+        programs={
+            "default": ProgramConfig(),
+            PROGRAM_CRITICAL: ProgramConfig(priority=Priority.CRITICAL),
+        },
+        shutdown=ShutdownConfig(
+            mode=ShutdownMode.IMMEDIATE,
+            unload_models=True,
+            drain_timeout=10,
+        ),
+    )
+    app = make_test_app(cfg, tmp_marshal_paths)
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        LifespanManager(app),
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
+    ):
+        start = asyncio.get_running_loop().time()
+        resp = await client.post(
+            "/api/chat",
+            json={
+                "model": REQUIRED_MODEL,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+                "options": {"num_predict": 4},
+            },
+            headers=_HDR_CRIT,
+            timeout=30,
+        )
+        elapsed = asyncio.get_running_loop().time() - start
+
+    # Escape valve fired: a clean 503 (capacity class), not a hang.
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["error_type"] == "PreloadFailedError", body
+    assert "out of capacity" in body["error"], body
+    # Must fail fast — the whole point of Bug C is to stop the spin.
+    assert elapsed < 10, f"503 took {elapsed:.1f}s — escape valve too slow"
 
 
 # ---------------------------------------------------------------------

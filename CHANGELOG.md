@@ -30,6 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verification during Bug 12. Test infra only; the sole user-facing
   change is the new status `version` field above.
 
+### Fixed
+
+- **Scheduler livelock when a model can never fit (Bug C).** When a
+  requested model was too large for the memory budget and nothing was
+  evictable, `_ensure_model_loaded` returned from its cannot-fit branch
+  without recording a failure, so `forced_load` and critical preemption
+  re-entered every 0.1s tick and spun hot — `skip_count` climbed past
+  6000 in ~30s and the waiting request hung forever. The cannot-fit /
+  eviction-exhausted path now feeds the same per-model backoff + giveup
+  machine that load failures use: the backoff cooldown parks re-entry on
+  the next tick (bounding CPU), and after
+  `scheduler.preload_max_consecutive_failures` attempts the queue drains
+  and every waiting request fails with a `503` (`PreloadFailedError`,
+  message "out of capacity") instead of hanging. Covers both
+  normal-priority (forced-load) and critical-priority (preemption)
+  callers, since both route through `_ensure_model_loaded`.
+
 ## [0.6.6] - 2026-05-31
 
 ### Added
