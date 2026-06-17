@@ -32,6 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Scheduler no longer claims ownership of a foreign-loaded model
+  (Bug 13).** On a shared Ollama, another marshal or a human
+  `ollama run` could load a model in the window between marshal's last
+  `/api/ps` poll and its own preload; marshal's preload would then
+  succeed against the already-resident model and wrongly `mark_owned`
+  it, so `shutdown.unload_models` would tear down a model marshal never
+  loaded. `ModelLifecycle.preload` now returns a `LoadResult`
+  (`NEW_LOAD` / `ALREADY_LOADED` / `FAILED`) by snapshotting `/api/ps`
+  before the load, and the scheduler claims ownership only on
+  `NEW_LOAD`. An ambiguous pre-snapshot (a `/api/ps` read error) is
+  treated as already-loaded so an unreadable snapshot can never produce
+  a wrongful ownership claim. Preload still reports success in the
+  already-loaded case — the model is available to serve, it just isn't
+  owned.
 - **Scheduler livelock when a model can never fit (Bug C).** When a
   requested model was too large for the memory budget and nothing was
   evictable, `_ensure_model_loaded` returned from its cannot-fit branch

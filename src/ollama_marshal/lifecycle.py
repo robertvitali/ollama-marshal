@@ -12,6 +12,7 @@ working without modification. The scheduler always passes an explicit
 from __future__ import annotations
 
 import asyncio
+import enum
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -29,6 +30,55 @@ _LOAD_TIMEOUT = 3600
 _UNLOAD_TIMEOUT = 60
 _PS_POLL_INTERVAL = 1  # seconds
 _PS_POLL_MAX_WAIT = 120  # seconds
+
+
+class LoadResult(enum.Enum):
+    """Outcome of a ``ModelLifecycle.preload`` attempt (Bug 13).
+
+    Classifies a load by a ``/api/ps`` snapshot taken just before our
+    ``/api/generate``: ``NEW_LOAD`` when the model was absent in that
+    snapshot (so this call most likely caused the load), ``ALREADY_LOADED``
+    when it was already resident (loaded by another marshal or a human
+    ``ollama run`` on a shared Ollama, or already ours). On a shared
+    Ollama, claiming ownership (``memory.mark_owned``) of a model we did
+    not load would make our shutdown teardown unload it; the scheduler
+    therefore claims ownership only on ``NEW_LOAD``.
+
+    Best-effort, not a proof of authorship: the pre-snapshot only
+    *narrows* the race — a foreign loader can still slip in between the
+    snapshot and our ``/api/generate``, yielding a ``NEW_LOAD`` for a
+    model we did not actually load. The residual window is small (one
+    ``/api/ps`` round-trip) and was the accepted trade-off of the Bug 13
+    Option A fix; eliminating it entirely needs a cross-loader lease or
+    an exclusive-daemon assumption (a separate, larger change).
+    """
+
+    NEW_LOAD = "new_load"
+    ALREADY_LOADED = "already_loaded"
+    FAILED = "failed"
+
+    @property
+    def loaded(self) -> bool:
+        """True when the model is resident after the call (i.e. not FAILED).
+
+        Both ``NEW_LOAD`` and ``ALREADY_LOADED`` mean the model is
+        available to serve; only ``FAILED`` means it isn't. Callers that
+        only care about success read ``result.loaded``; callers that
+        gate ownership check ``result is LoadResult.NEW_LOAD``.
+        """
+        return self is not LoadResult.FAILED
+
+    def __bool__(self) -> bool:
+        """Truthiness mirrors ``loaded`` so ``if await preload(...):`` is safe.
+
+        Without this, every enum member would be truthy by default and a
+        caller that fell back to bare truthiness (``if result:``) would
+        treat ``FAILED`` as success. Aligning ``__bool__`` with ``loaded``
+        means ``FAILED`` is falsy and both success states are truthy — a
+        guard against a future or overlooked bool-style caller after the
+        ``preload`` return type changed from ``bool`` to ``LoadResult``.
+        """
+        return self.loaded
 
 
 class ModelLifecycle:
@@ -57,7 +107,7 @@ class ModelLifecycle:
         instance_url: str | None = None,
         load_timeout_s: int | None = None,
         is_known_model_check: Callable[[str], Awaitable[bool]] | None = None,
-    ) -> bool:
+    ) -> LoadResult:
         """Preload a model into Ollama's VRAM.
 
         Sends an empty-prompt request which triggers model loading, then
@@ -91,7 +141,13 @@ class ModelLifecycle:
                 the scheduler pass `registry.is_known_model`.
 
         Returns:
-            True if the model was successfully loaded.
+            A ``LoadResult``: ``NEW_LOAD`` if this call observably
+            loaded the model (absent from /api/ps before our request,
+            present after), ``ALREADY_LOADED`` if the model was already
+            resident when we arrived (foreign-loaded on a shared Ollama,
+            or already ours — the scheduler skips ``mark_owned`` so
+            shutdown never tears it down), or ``FAILED`` if the load did
+            not complete. Use ``result.loaded`` for plain success.
         """
         host = self._resolve_host(instance_url)
         timeout = _LOAD_TIMEOUT if load_timeout_s is None else load_timeout_s
@@ -124,7 +180,7 @@ class ModelLifecycle:
                     model=model,
                     instance=host,
                 )
-                return False
+                return LoadResult.FAILED
 
         logger.info(
             "lifecycle.preloading",
@@ -134,6 +190,16 @@ class ModelLifecycle:
         )
         try:
             async with httpx.AsyncClient() as client:
+                # Bug 13: snapshot residency BEFORE our load request. A
+                # model already in /api/ps was loaded by another marshal
+                # or a human ``ollama run`` in the window since our last
+                # poll; our /api/generate would succeed against it and,
+                # if the scheduler then claimed ownership, shutdown
+                # teardown would unload a model we never loaded. ``None``
+                # (a /api/ps error) is treated downstream as "possibly
+                # resident" so the ambiguous case never wrongly claims
+                # ownership.
+                already_present = await self._is_loaded_now(client, model, host)
                 payload: dict[str, Any] = {
                     "model": model,
                     "prompt": "",
@@ -165,20 +231,34 @@ class ModelLifecycle:
 
                 # Wait for model to appear in /api/ps on this instance.
                 loaded = await self._wait_for_model(client, model, host)
-                if loaded:
-                    logger.info(
-                        "lifecycle.preloaded",
-                        model=model,
-                        num_ctx=num_ctx,
-                        instance=host,
-                    )
-                else:
+                if not loaded:
                     logger.warning(
                         "lifecycle.preload_timeout",
                         model=model,
                         instance=host,
                     )
-                return loaded
+                    return LoadResult.FAILED
+                # Bug 13: only NEW_LOAD (definitively absent before our
+                # request) claims ownership. A True or unknown (None)
+                # pre-snapshot both resolve to ALREADY_LOADED so an
+                # ambiguous /api/ps read never produces a wrongful claim.
+                if already_present is not False:
+                    logger.info(
+                        "lifecycle.preload_already_loaded",
+                        model=model,
+                        instance=host,
+                        ps_snapshot=(
+                            "unknown" if already_present is None else "present"
+                        ),
+                    )
+                    return LoadResult.ALREADY_LOADED
+                logger.info(
+                    "lifecycle.preloaded",
+                    model=model,
+                    num_ctx=num_ctx,
+                    instance=host,
+                )
+                return LoadResult.NEW_LOAD
 
         except httpx.HTTPError:
             logger.error(
@@ -187,7 +267,7 @@ class ModelLifecycle:
                 instance=host,
                 exc_info=True,
             )
-            return False
+            return LoadResult.FAILED
 
     async def unload(
         self,
@@ -247,6 +327,59 @@ class ModelLifecycle:
         for model in models:
             await self.unload(model, instance_url=instance_url)
 
+    @staticmethod
+    def _ps_contains(data: Any, model: str) -> bool:
+        """True if ``model`` appears in an ``/api/ps`` payload.
+
+        Ollama keys loaded models under either ``name`` or ``model``
+        depending on version; match on both. Defends against a 200 whose
+        body isn't the expected object (``data`` not a dict, or an entry
+        not a dict) so a malformed/hostile response can't raise
+        ``AttributeError`` into the caller — returns False instead.
+        """
+        if not isinstance(data, dict):
+            return False
+        for m in data.get("models", []):
+            if isinstance(m, dict) and (
+                m.get("name") == model or m.get("model") == model
+            ):
+                return True
+        return False
+
+    async def _is_loaded_now(
+        self,
+        client: httpx.AsyncClient,
+        model: str,
+        host: str,
+    ) -> bool | None:
+        """Single-shot ``/api/ps`` residency check (Bug 13 pre-snapshot).
+
+        Args:
+            client: The httpx client to use.
+            model: The model name to check for.
+            host: Base URL of the instance to poll.
+
+        Returns:
+            ``True``/``False`` when ``/api/ps`` answers cleanly, or
+            ``None`` when residency cannot be determined (HTTP error or
+            a malformed/non-JSON payload). Callers treat ``None``
+            conservatively as "possibly resident" so an ambiguous
+            snapshot never leads to a wrongful ownership claim.
+        """
+        try:
+            resp = await client.get(f"{host}/api/ps", timeout=10)
+            resp.raise_for_status()
+            data: Any = resp.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        # A 200 with a non-dict body (``[]``, a string) can't be
+        # interpreted — treat as "can't determine" (None), which the
+        # caller resolves conservatively to ALREADY_LOADED so a malformed
+        # snapshot never drives a wrongful ownership claim.
+        if not isinstance(data, dict):
+            return None
+        return self._ps_contains(data, model)
+
     async def _wait_for_model(
         self,
         client: httpx.AsyncClient,
@@ -272,9 +405,8 @@ class ModelLifecycle:
                 )
                 resp.raise_for_status()
                 data: dict[str, Any] = resp.json()
-                for m in data.get("models", []):
-                    if m.get("name") == model or m.get("model") == model:
-                        return True
+                if self._ps_contains(data, model):
+                    return True
             except httpx.HTTPError:
                 pass
             await asyncio.sleep(_PS_POLL_INTERVAL)
@@ -313,12 +445,13 @@ class ModelLifecycle:
         """
         if model in loaded_models:
             return True
-        return await self.preload(
+        result = await self.preload(
             model,
             num_ctx=num_ctx,
             instance_url=instance_url,
             load_timeout_s=load_timeout_s,
         )
+        return result.loaded
 
     @staticmethod
     def override_keep_alive(request_body: dict[str, Any]) -> dict[str, Any]:

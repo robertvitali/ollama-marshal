@@ -42,6 +42,7 @@ from ollama_marshal.config import (
     ShutdownConfig,
     ShutdownMode,
 )
+from ollama_marshal.lifecycle import LoadResult
 from tests.integration._fault_proxy import fault_proxy
 from tests.integration.conftest import (
     DEFAULT_OLLAMA_HOST,
@@ -753,7 +754,7 @@ async def test_failed_preload_writes_sentinel_allocation(marshal_app, cleanup_mo
     original_preload = app.state._marshal_internals.lifecycle.preload
 
     async def failing_preload(*_args, **_kwargs):
-        return False
+        return LoadResult.FAILED
 
     app.state._marshal_internals.lifecycle.preload = failing_preload
     try:

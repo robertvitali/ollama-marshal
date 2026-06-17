@@ -52,8 +52,12 @@ from asgi_lifespan import LifespanManager
 
 from ollama_marshal.memory import LoadedModel
 from tests.integration.conftest import (
+    DEFAULT_OLLAMA_HOST,
+    INTEGRATION_FORWARD_TIMEOUT_S,
+    REQUIRED_MODEL,
     _ollama_reachable,
     make_test_app,
+    wait_for,
 )
 
 pytestmark = [
@@ -63,6 +67,28 @@ pytestmark = [
         reason="Ollama not running on :11434",
     ),
 ]
+
+
+def _required_model_pulled() -> bool:
+    """Sync check that REQUIRED_MODEL is in /api/tags."""
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            resp = client.get(f"{DEFAULT_OLLAMA_HOST}/api/tags")
+            resp.raise_for_status()
+            return any(
+                m.get("name") == REQUIRED_MODEL for m in resp.json().get("models", [])
+            )
+    except (httpx.HTTPError, OSError):
+        return False
+
+
+_REQUIRES_MODEL = pytest.mark.skipif(
+    not _required_model_pulled(),
+    reason=(
+        f"Required model {REQUIRED_MODEL!r} not pulled "
+        f"(run `ollama pull {REQUIRED_MODEL}`)"
+    ),
+)
 
 
 async def test_shutdown_unloads_only_owned_models(
@@ -167,3 +193,109 @@ async def test_shutdown_unloads_only_owned_models(
         assert instance_url == app.state._marshal_internals.memory.instances[0].url, (
             f"unload_all routed to wrong instance: {instance_url!r}"
         )
+
+
+@_REQUIRES_MODEL
+async def test_preload_of_foreign_loaded_model_skips_ownership(
+    marshal_app,
+) -> None:
+    """Bug 13: a preload that finds the model already resident must not claim it.
+
+    The unit suite covers the lifecycle pre-snapshot and the scheduler
+    ownership gate in isolation; this exercises the whole
+    scheduler -> lifecycle -> /api/ps -> memory chain against a live
+    Ollama daemon.
+
+    Steps:
+    1. Foreign-load REQUIRED_MODEL directly into Ollama, bypassing
+       marshal entirely (simulating another marshal or a human
+       ``ollama run`` on the shared daemon).
+    2. Drive ``scheduler._attempt_preload`` for that model. We call the
+       private method directly on purpose: a real /api/chat request
+       would take the already-loaded fast path
+       (``_forward_loaded_model_requests``) and never reach
+       ``_attempt_preload`` — so it could not exercise the preload
+       classification this bug is about. The lifecycle pre-snapshot
+       sees the model already in /api/ps and returns ALREADY_LOADED, so
+       the scheduler skips ``mark_owned``.
+    3. Assert the preload reported success (the model is available to
+       serve) but ownership was NOT claimed — a later
+       shutdown.unload_models would leave the foreign model alone.
+    """
+    _client, app = marshal_app
+    internals = app.state._marshal_internals
+    scheduler = internals.scheduler
+    memory = internals.memory
+    lifecycle = internals.lifecycle
+    primary_url = memory.instances[0].url
+
+    async def _resident_in_ollama() -> bool:
+        """True iff REQUIRED_MODEL is in Ollama's /api/ps right now."""
+        async with httpx.AsyncClient(timeout=5) as probe:
+            r = await probe.get(f"{DEFAULT_OLLAMA_HOST}/api/ps")
+            r.raise_for_status()
+            return any(
+                m.get("name") == REQUIRED_MODEL or m.get("model") == REQUIRED_MODEL
+                for m in r.json().get("models", [])
+            )
+
+    # Snapshot residency BEFORE we touch anything. On a shared daemon the
+    # model may already be resident (e.g. left loaded by prod's in-flight
+    # work); if so, cleanup must NOT unload it — that would tear down
+    # shared state the test did not create.
+    was_resident_before = await _resident_in_ollama()
+
+    # 1. Foreign-load directly into Ollama (not via marshal) with a long
+    #    keep_alive. Empty prompt loads the model without generating
+    #    tokens — the same mechanism marshal's own preload uses.
+    async with httpx.AsyncClient(timeout=INTEGRATION_FORWARD_TIMEOUT_S) as raw:
+        resp = await raw.post(
+            f"{DEFAULT_OLLAMA_HOST}/api/generate",
+            json={"model": REQUIRED_MODEL, "prompt": "", "keep_alive": "5m"},
+        )
+        resp.raise_for_status()
+
+    # Determinism: confirm the model is actually visible in /api/ps
+    # before driving the preload, so the lifecycle pre-snapshot reliably
+    # sees it already-resident rather than racing /api/ps visibility lag.
+    await wait_for(
+        _resident_in_ollama,
+        timeout=15,
+        description=f"{REQUIRED_MODEL} visible in /api/ps after foreign load",
+    )
+
+    # Spy on mark_owned so we assert the ownership decision directly,
+    # delegating to the real implementation so any side effects stay
+    # representative.
+    mark_owned_calls: list[tuple[str, str]] = []
+    original_mark_owned = memory.mark_owned
+
+    def spy_mark_owned(model: str, instance_url: str) -> None:
+        mark_owned_calls.append((model, instance_url))
+        original_mark_owned(model, instance_url)
+
+    memory.mark_owned = spy_mark_owned
+
+    try:
+        # 2. Drive the real preload path against the already-resident model.
+        loaded = await scheduler._attempt_preload(
+            REQUIRED_MODEL, num_ctx=None, instance_url=primary_url
+        )
+
+        # 3a. Preload reports success — the model IS available to serve.
+        assert loaded is True, "preload of an already-resident model should succeed"
+        # 3b. ... but ownership was NOT claimed (the Bug 13 fix). Marshal
+        # never loaded this model, so shutdown must not unload it.
+        assert (REQUIRED_MODEL, primary_url) not in mark_owned_calls, (
+            "scheduler claimed ownership of a foreign-loaded model — Bug 13 "
+            f"ownership gate is broken; mark_owned_calls={mark_owned_calls!r}"
+        )
+        assert REQUIRED_MODEL not in memory.get_owned_loaded_models().get(
+            primary_url, set()
+        )
+    finally:
+        memory.mark_owned = original_mark_owned
+        # Only unload if the test introduced the model. If it was already
+        # resident before we started, leave shared daemon state untouched.
+        if not was_resident_before:
+            await lifecycle.unload(REQUIRED_MODEL, instance_url=primary_url)

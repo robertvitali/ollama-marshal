@@ -13,7 +13,7 @@ from typing import Any
 import structlog
 
 from ollama_marshal.config import MarshalConfig, Priority
-from ollama_marshal.lifecycle import ModelLifecycle
+from ollama_marshal.lifecycle import LoadResult, ModelLifecycle
 from ollama_marshal.memory import MemoryManager
 from ollama_marshal.queue import ModelQueues, PreloadFailedError, RequestEnvelope
 from ollama_marshal.registry import ModelRegistry
@@ -980,21 +980,39 @@ class Scheduler:
         # from Ollama between enqueue and preload time would otherwise
         # ride the full retry budget. Passing the registry predicate
         # through makes lifecycle short-circuit before /api/generate.
-        success = await self.lifecycle.preload(
+        result = await self.lifecycle.preload(
             model,
             num_ctx=num_ctx,
             instance_url=instance_url,
             load_timeout_s=self.config.scheduler.ollama_forward_timeout_s,
             is_known_model_check=self.registry.is_known_model,
         )
-        if success:
+        if result.loaded:
             self._clear_preload_failure(model)
-            # Claim ownership so shutdown.unload_models only tears down
-            # models THIS marshal loaded — not models loaded by another
-            # marshal or a human against the same Ollama. Auto-released
-            # by MemoryManager when the next /api/ps poll observes the
-            # model gone (whether marshal-initiated or external).
-            self.memory.mark_owned(model, instance_url)
+            if result is LoadResult.NEW_LOAD:
+                # Claim ownership only for a NEW_LOAD — the model was
+                # absent in /api/ps just before our load (Bug 13). This is
+                # best-effort, not proof of authorship: a foreign loader
+                # can still slip into the small window between that
+                # snapshot and our /api/generate (accepted residual of the
+                # Option A fix). shutdown.unload_models then tears down
+                # models we believe we loaded; ownership is auto-released
+                # by MemoryManager when the next /api/ps poll observes the
+                # model gone (marshal-initiated or external).
+                self.memory.mark_owned(model, instance_url)
+            else:
+                # ALREADY_LOADED: the model was resident when we arrived
+                # — another marshal or a human loaded it on this shared
+                # Ollama (or it was already ours). Skipping mark_owned
+                # keeps our shutdown teardown from unloading a model we
+                # did not load. The request still succeeds; the model is
+                # available to serve.
+                logger.info(
+                    "scheduler.preload_already_loaded",
+                    model=model,
+                    instance=instance_url,
+                    reason="skip_ownership_claim_foreign_or_prior_load",
+                )
             return True
         failures = self._record_preload_failure(model)
         if failures >= self.config.scheduler.preload_max_consecutive_failures:

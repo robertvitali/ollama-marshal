@@ -163,8 +163,8 @@ async def test_preload_storm_eliminated_when_ollama_disconnects(tmp_marshal_path
         # finds the model "missing" and tries to preload.
         proxy.fake_response("/api/ps", {"models": []}, times=None)
         # Disconnect every preload call. lifecycle.preload catches the
-        # httpx exception and returns False, bumping the per-model
-        # failure counter. The storm pre-fix regression would consume
+        # httpx exception and returns LoadResult.FAILED, bumping the
+        # per-model failure counter. The storm pre-fix regression would consume
         # ~10 of these per second; post-fix bounds at ~3.
         proxy.disconnect_next("/api/generate", times=99)
 

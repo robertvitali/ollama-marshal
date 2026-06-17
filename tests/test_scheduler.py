@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from ollama_marshal.config import MarshalConfig, Priority, ProgramConfig
+from ollama_marshal.lifecycle import LoadResult
 from ollama_marshal.queue import ModelQueues, RequestEnvelope
 from ollama_marshal.scheduler import (
     BurstHints,
@@ -124,7 +125,7 @@ def _make_scheduler(
         registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
     if lifecycle is None:
         lifecycle = MagicMock()
-        lifecycle.preload = AsyncMock(return_value=True)
+        lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
         lifecycle.unload = AsyncMock(return_value=True)
     # Always stamp multi-instance defaults so routing has the data it
     # needs, even when the test built its own memory/registry mocks.
@@ -486,7 +487,7 @@ class TestBinPackModels:
         registry.get_or_estimate_size = AsyncMock(return_value=2 * 1024**3)
 
         lifecycle = MagicMock()
-        lifecycle.preload = AsyncMock(return_value=True)
+        lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
 
         sched = _make_scheduler(
             queues=queues,
@@ -576,7 +577,7 @@ class TestBinPackModels:
         registry.get_or_estimate_size = AsyncMock(return_value=2 * 1024**3)
 
         lifecycle = MagicMock()
-        lifecycle.preload = AsyncMock(return_value=False)
+        lifecycle.preload = AsyncMock(return_value=LoadResult.FAILED)
 
         sched = _make_scheduler(
             queues=queues,
@@ -662,7 +663,7 @@ class TestBinPackSkipCounters:
         registry.get_or_estimate_size = AsyncMock(return_value=1 * 1024**3)
 
         lifecycle = MagicMock()
-        lifecycle.preload = AsyncMock(return_value=True)
+        lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
 
         sched = _make_scheduler(
             queues=queues,
@@ -771,7 +772,7 @@ class TestEnsureModelLoaded:
         registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
 
         lifecycle = MagicMock()
-        lifecycle.preload = AsyncMock(return_value=True)
+        lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
 
         sched = _make_scheduler(memory=memory, registry=registry, lifecycle=lifecycle)
 
@@ -805,7 +806,7 @@ class TestEnsureModelLoaded:
         registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
 
         lifecycle = MagicMock()
-        lifecycle.preload = AsyncMock(return_value=True)
+        lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
 
         sched = _make_scheduler(memory=memory, registry=registry, lifecycle=lifecycle)
 
@@ -841,7 +842,7 @@ class TestEnsureModelLoaded:
         registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
 
         lifecycle = MagicMock()
-        lifecycle.preload = AsyncMock(return_value=False)
+        lifecycle.preload = AsyncMock(return_value=LoadResult.FAILED)
 
         sched = _make_scheduler(memory=memory, registry=registry, lifecycle=lifecycle)
 
@@ -1340,7 +1341,7 @@ class TestEnsureModelLoadedReloadOnNeed:
         memory.record_allocated_num_ctx = MagicMock()
 
         lifecycle = MagicMock()
-        lifecycle.preload = AsyncMock(return_value=True)
+        lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
         lifecycle.unload = AsyncMock(return_value=True)
 
         sched = _make_scheduler(memory=memory, lifecycle=lifecycle)
@@ -1376,7 +1377,7 @@ class TestEnsureModelLoadedReloadOnNeed:
         registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
 
         lifecycle = MagicMock()
-        lifecycle.preload = AsyncMock(return_value=True)
+        lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
         lifecycle.unload = AsyncMock(return_value=True)
 
         queues = ModelQueues()
@@ -1442,7 +1443,7 @@ class TestEnsureModelLoadedReloadOnNeed:
 
         lifecycle = MagicMock()
         # Preload fails.
-        lifecycle.preload = AsyncMock(return_value=False)
+        lifecycle.preload = AsyncMock(return_value=LoadResult.FAILED)
         lifecycle.unload = AsyncMock(return_value=True)
 
         sched = _make_scheduler(memory=memory, registry=registry, lifecycle=lifecycle)
@@ -2763,7 +2764,7 @@ class TestPreloadBackoffStateMachine:
     async def test_preload_in_cooldown_is_skipped(self):
         """``_attempt_preload`` returns False without calling lifecycle.preload."""
         sched = _make_scheduler()
-        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
 
         # Plant a fresh cooldown 60s in the future.
         from ollama_marshal.scheduler import _PreloadFailureState
@@ -2783,7 +2784,7 @@ class TestPreloadBackoffStateMachine:
     async def test_preload_success_clears_failure_state(self):
         """A successful preload removes the model's failure entry."""
         sched = _make_scheduler()
-        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
 
         from ollama_marshal.scheduler import _PreloadFailureState
 
@@ -2825,7 +2826,7 @@ class TestPreloadBackoffStateMachine:
         await queues.enqueue(env2)
 
         sched = _make_scheduler(queues=queues, config=cfg)
-        sched.lifecycle.preload = AsyncMock(return_value=False)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.FAILED)
 
         # 3 attempts → failures hit the max on the 3rd, giveup fires.
         for _ in range(3):
@@ -2870,7 +2871,7 @@ class TestPreloadBackoffStateMachine:
         """
         cfg = _make_config(**{"scheduler.ollama_forward_timeout_s": 1234})
         sched = _make_scheduler(config=cfg)
-        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
 
         await sched._attempt_preload(
             "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
@@ -2894,7 +2895,7 @@ class TestPreloadBackoffStateMachine:
         from ollama_marshal.scheduler import _PreloadFailureState
 
         sched = _make_scheduler()
-        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
         sched.lifecycle.unload = AsyncMock(return_value=True)
         sched._preload_failures["llama3:latest"] = _PreloadFailureState(
             consecutive_failures=2,
@@ -3097,7 +3098,7 @@ class TestUnexpectedUnloadReactivity:
         from ollama_marshal.scheduler import _PreloadFailureState
 
         sched = _make_scheduler()
-        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
         # Plant a fresh cooldown that would normally block bin-pack.
         sched._preload_failures["llama3:latest"] = _PreloadFailureState(
             consecutive_failures=2,
@@ -3131,7 +3132,7 @@ class TestUnexpectedUnloadReactivity:
         from ollama_marshal.scheduler import _PreloadFailureState
 
         sched = _make_scheduler()
-        sched.lifecycle.preload = AsyncMock(return_value=False)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.FAILED)
         sched._preload_failures["llama3:latest"] = _PreloadFailureState(
             consecutive_failures=1,
             cooldown_until=time.monotonic() + 60.0,
@@ -3157,7 +3158,7 @@ class TestUnexpectedUnloadReactivity:
         loaded model.
         """
         sched = _make_scheduler()
-        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
         sched._needs_reload.add(("llama3:latest", _PRIMARY_INSTANCE_URL))
         sched._needs_reload.add(("llama3:latest", "http://other:11434"))
         await sched.queues.enqueue(_make_envelope(model="llama3:latest"))
@@ -3183,7 +3184,7 @@ class TestUnexpectedUnloadReactivity:
         from ollama_marshal.scheduler import _PreloadFailureState
 
         sched = _make_scheduler()
-        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
         sched.lifecycle.unload = AsyncMock(return_value=True)
         sched._preload_failures["llama3:latest"] = _PreloadFailureState(
             consecutive_failures=2,
@@ -3210,7 +3211,7 @@ class TestPreloadOwnershipClaim:
 
     async def test_successful_preload_marks_owned(self):
         sched = _make_scheduler()
-        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
 
         result = await sched._attempt_preload(
             "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
@@ -3221,9 +3222,27 @@ class TestPreloadOwnershipClaim:
             "llama3:latest", _PRIMARY_INSTANCE_URL
         )
 
+    async def test_already_loaded_preload_does_not_mark_owned(self):
+        # Bug 13: a model already resident when we arrived (foreign-loaded
+        # on a shared Ollama, or already ours) comes back ALREADY_LOADED.
+        # _attempt_preload still reports success — the model IS available
+        # to serve — but must NOT claim ownership, else
+        # shutdown.unload_models would tear down a model we never loaded.
+        sched = _make_scheduler()
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.ALREADY_LOADED)
+
+        result = await sched._attempt_preload(
+            "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
+        )
+
+        assert result is True
+        sched.memory.mark_owned.assert_not_called()
+        # The success path still clears any prior failure backoff.
+        assert "llama3:latest" not in sched._preload_failures
+
     async def test_failed_preload_does_not_mark_owned(self):
         sched = _make_scheduler()
-        sched.lifecycle.preload = AsyncMock(return_value=False)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.FAILED)
 
         result = await sched._attempt_preload(
             "llama3:latest", num_ctx=None, instance_url=_PRIMARY_INSTANCE_URL
@@ -3238,7 +3257,7 @@ class TestPreloadOwnershipClaim:
         from ollama_marshal.scheduler import _PreloadFailureState
 
         sched = _make_scheduler()
-        sched.lifecycle.preload = AsyncMock(return_value=True)
+        sched.lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
         sched._preload_failures["llama3:latest"] = _PreloadFailureState(
             consecutive_failures=2,
             cooldown_until=time.monotonic() + 60.0,

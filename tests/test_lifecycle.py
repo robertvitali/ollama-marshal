@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from ollama_marshal.lifecycle import ModelLifecycle
+from ollama_marshal.lifecycle import LoadResult, ModelLifecycle
 
 OLLAMA_HOST = "http://localhost:11434"
 
@@ -13,6 +13,14 @@ OLLAMA_HOST = "http://localhost:11434"
 @pytest.fixture
 def lifecycle():
     return ModelLifecycle(OLLAMA_HOST)
+
+
+def _ps_response(models: list[dict[str, str]]) -> MagicMock:
+    """Build a mock ``httpx.Response`` for an ``/api/ps`` payload."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.json.return_value = {"models": models}
+    resp.raise_for_status = MagicMock()
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -50,22 +58,44 @@ class TestOverrideKeepAlive:
 
 
 # ---------------------------------------------------------------------------
+# LoadResult (Bug 13)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadResult:
+    def test_loaded_property(self):
+        assert LoadResult.NEW_LOAD.loaded is True
+        assert LoadResult.ALREADY_LOADED.loaded is True
+        assert LoadResult.FAILED.loaded is False
+
+    def test_bool_mirrors_loaded(self):
+        # Guards a future/overlooked bare-truthiness caller: FAILED must
+        # be falsy, both success states truthy, after preload's return
+        # type changed from bool to LoadResult.
+        assert bool(LoadResult.NEW_LOAD) is True
+        assert bool(LoadResult.ALREADY_LOADED) is True
+        assert bool(LoadResult.FAILED) is False
+
+
+# ---------------------------------------------------------------------------
 # preload
 # ---------------------------------------------------------------------------
 
 
 class TestPreload:
     async def test_preload_success(self, lifecycle):
+        # Bug 13: absent in the pre-snapshot /api/ps, present after our
+        # /api/generate → we observably loaded it → NEW_LOAD.
         mock_post_response = MagicMock(spec=httpx.Response)
-        mock_ps_response = MagicMock(spec=httpx.Response)
-        mock_ps_response.json.return_value = {
-            "models": [{"name": "llama3:latest", "model": "llama3:latest"}]
-        }
-        mock_ps_response.raise_for_status = MagicMock()
 
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.post = AsyncMock(return_value=mock_post_response)
-        mock_client.get = AsyncMock(return_value=mock_ps_response)
+        mock_client.get = AsyncMock(
+            side_effect=[
+                _ps_response([]),
+                _ps_response([{"name": "llama3:latest", "model": "llama3:latest"}]),
+            ]
+        )
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -74,7 +104,7 @@ class TestPreload:
         ):
             result = await lifecycle.preload("llama3:latest")
 
-        assert result is True
+        assert result is LoadResult.NEW_LOAD
         mock_client.post.assert_awaited_once()
         call_kwargs = mock_client.post.call_args
         assert call_kwargs[1]["json"]["model"] == "llama3:latest"
@@ -82,16 +112,18 @@ class TestPreload:
         assert call_kwargs[1]["json"]["keep_alive"] == "24h"
 
     async def test_preload_model_matched_by_model_field(self, lifecycle):
+        # Membership matches on the ``model`` field even when ``name``
+        # differs. Absent-before / present-after → NEW_LOAD.
         mock_post_response = MagicMock(spec=httpx.Response)
-        mock_ps_response = MagicMock(spec=httpx.Response)
-        mock_ps_response.json.return_value = {
-            "models": [{"name": "other-name", "model": "llama3:latest"}]
-        }
-        mock_ps_response.raise_for_status = MagicMock()
 
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.post = AsyncMock(return_value=mock_post_response)
-        mock_client.get = AsyncMock(return_value=mock_ps_response)
+        mock_client.get = AsyncMock(
+            side_effect=[
+                _ps_response([]),
+                _ps_response([{"name": "other-name", "model": "llama3:latest"}]),
+            ]
+        )
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -100,7 +132,7 @@ class TestPreload:
         ):
             result = await lifecycle.preload("llama3:latest")
 
-        assert result is True
+        assert result is LoadResult.NEW_LOAD
 
     async def test_preload_timeout_model_never_appears(self, lifecycle):
         mock_post_response = MagicMock(spec=httpx.Response)
@@ -124,11 +156,14 @@ class TestPreload:
         ):
             result = await lifecycle.preload("llama3:latest")
 
-        assert result is False
+        assert result is LoadResult.FAILED
 
     async def test_preload_http_error(self, lifecycle):
+        # The pre-snapshot /api/ps (Bug 13) runs before /api/generate, so
+        # give .get a clean empty response; the POST error is what we test.
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.post = AsyncMock(side_effect=httpx.HTTPError("connection refused"))
+        mock_client.get = AsyncMock(return_value=_ps_response([]))
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -137,7 +172,7 @@ class TestPreload:
         ):
             result = await lifecycle.preload("llama3:latest")
 
-        assert result is False
+        assert result is LoadResult.FAILED
 
     async def test_preload_short_circuits_when_model_unknown(self, lifecycle):
         # Defense in depth (v0.6.6): when a known-model predicate is
@@ -161,8 +196,10 @@ class TestPreload:
                 "uninstalled:model", is_known_model_check=predicate
             )
 
-        assert result is False
+        assert result is LoadResult.FAILED
         mock_client.post.assert_not_awaited()
+        # Short-circuit happens before the client block, so the Bug 13
+        # pre-snapshot /api/ps never fires either.
         mock_client.get.assert_not_awaited()
 
     async def test_preload_returns_false_on_404_from_generate(self, lifecycle):
@@ -185,9 +222,10 @@ class TestPreload:
 
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.post = AsyncMock(return_value=mock_response)
-        # _wait_for_model uses .get on the same client — must not be
-        # reached. AsyncMock will track if it was called.
-        mock_client.get = AsyncMock()
+        # The Bug 13 pre-snapshot makes one /api/ps call before the POST;
+        # _wait_for_model's poll loop (additional .get calls) must NOT be
+        # reached after the 404.
+        mock_client.get = AsyncMock(return_value=_ps_response([]))
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -196,22 +234,23 @@ class TestPreload:
         ):
             result = await lifecycle.preload("removed:model")
 
-        assert result is False
-        # _wait_for_model must not have been invoked — no /api/ps poll.
-        mock_client.get.assert_not_called()
+        assert result is LoadResult.FAILED
+        # Exactly one /api/ps call — the pre-snapshot. The 404
+        # short-circuits before _wait_for_model, so no poll loop runs.
+        mock_client.get.assert_awaited_once()
 
     async def test_preload_proceeds_when_model_known(self, lifecycle):
         # Sanity check: a True predicate must NOT block the normal path.
         mock_post_response = MagicMock(spec=httpx.Response)
-        mock_ps_response = MagicMock(spec=httpx.Response)
-        mock_ps_response.json.return_value = {
-            "models": [{"name": "llama3:latest", "model": "llama3:latest"}]
-        }
-        mock_ps_response.raise_for_status = MagicMock()
 
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.post = AsyncMock(return_value=mock_post_response)
-        mock_client.get = AsyncMock(return_value=mock_ps_response)
+        mock_client.get = AsyncMock(
+            side_effect=[
+                _ps_response([]),
+                _ps_response([{"name": "llama3:latest", "model": "llama3:latest"}]),
+            ]
+        )
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -225,8 +264,89 @@ class TestPreload:
                 "llama3:latest", is_known_model_check=predicate
             )
 
-        assert result is True
+        assert result is LoadResult.NEW_LOAD
         mock_client.post.assert_awaited_once()
+
+    async def test_preload_already_loaded_when_present_before(self, lifecycle):
+        # Bug 13: the model is ALREADY in the pre-snapshot /api/ps — a
+        # foreign marshal or human loaded it on this shared Ollama (or it
+        # was already ours). Our /api/generate succeeds against the
+        # resident model, but we must report ALREADY_LOADED so the
+        # scheduler skips ownership and shutdown can't unload it.
+        mock_post_response = MagicMock(spec=httpx.Response)
+        present = {"name": "llama3:latest", "model": "llama3:latest"}
+
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post = AsyncMock(return_value=mock_post_response)
+        mock_client.get = AsyncMock(
+            side_effect=[_ps_response([present]), _ps_response([present])]
+        )
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "ollama_marshal.lifecycle.httpx.AsyncClient", return_value=mock_client
+        ):
+            result = await lifecycle.preload("llama3:latest")
+
+        assert result is LoadResult.ALREADY_LOADED
+
+    async def test_preload_ambiguous_ps_snapshot_treated_as_already_loaded(
+        self, lifecycle
+    ):
+        # Bug 13: when the pre-snapshot /api/ps errors (None), we cannot
+        # tell whether the model was already resident. Default to
+        # ALREADY_LOADED so an ambiguous read never produces a wrongful
+        # ownership claim — the conservative direction.
+        mock_post_response = MagicMock(spec=httpx.Response)
+        present = {"name": "llama3:latest", "model": "llama3:latest"}
+
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post = AsyncMock(return_value=mock_post_response)
+        # First .get (pre-snapshot) errors → None; second .get
+        # (_wait_for_model) shows the model present so the load resolves.
+        mock_client.get = AsyncMock(
+            side_effect=[httpx.HTTPError("ps down"), _ps_response([present])]
+        )
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "ollama_marshal.lifecycle.httpx.AsyncClient", return_value=mock_client
+        ):
+            result = await lifecycle.preload("llama3:latest")
+
+        assert result is LoadResult.ALREADY_LOADED
+
+    async def test_preload_non_dict_ps_snapshot_treated_as_already_loaded(
+        self, lifecycle
+    ):
+        # Bug 13: a 200 whose /api/ps body isn't an object (e.g. a JSON
+        # list) can't be interpreted, so _is_loaded_now returns None and
+        # preload resolves it conservatively to ALREADY_LOADED — never a
+        # wrongful ownership claim on a malformed snapshot.
+        mock_post_response = MagicMock(spec=httpx.Response)
+        non_dict_resp = MagicMock(spec=httpx.Response)
+        non_dict_resp.json.return_value = []  # not a dict
+        non_dict_resp.raise_for_status = MagicMock()
+        present = {"name": "llama3:latest", "model": "llama3:latest"}
+
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post = AsyncMock(return_value=mock_post_response)
+        # Pre-snapshot returns the non-dict body; _wait_for_model then
+        # sees the model present so the load resolves.
+        mock_client.get = AsyncMock(
+            side_effect=[non_dict_resp, _ps_response([present])]
+        )
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "ollama_marshal.lifecycle.httpx.AsyncClient", return_value=mock_client
+        ):
+            result = await lifecycle.preload("llama3:latest")
+
+        assert result is LoadResult.ALREADY_LOADED
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +596,10 @@ class TestEnsureLoaded:
 
     async def test_not_loaded_triggers_preload(self, lifecycle):
         with patch.object(
-            lifecycle, "preload", new_callable=AsyncMock, return_value=True
+            lifecycle,
+            "preload",
+            new_callable=AsyncMock,
+            return_value=LoadResult.NEW_LOAD,
         ) as mock_preload:
             result = await lifecycle.ensure_loaded("llama3:latest", set())
 
@@ -490,7 +613,7 @@ class TestEnsureLoaded:
 
     async def test_not_loaded_preload_fails(self, lifecycle):
         with patch.object(
-            lifecycle, "preload", new_callable=AsyncMock, return_value=False
+            lifecycle, "preload", new_callable=AsyncMock, return_value=LoadResult.FAILED
         ):
             result = await lifecycle.ensure_loaded("llama3:latest", set())
 
@@ -498,7 +621,10 @@ class TestEnsureLoaded:
 
     async def test_different_model_not_in_set(self, lifecycle):
         with patch.object(
-            lifecycle, "preload", new_callable=AsyncMock, return_value=True
+            lifecycle,
+            "preload",
+            new_callable=AsyncMock,
+            return_value=LoadResult.NEW_LOAD,
         ) as mock_preload:
             result = await lifecycle.ensure_loaded("mistral:latest", {"llama3:latest"})
 
