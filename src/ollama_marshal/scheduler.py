@@ -480,6 +480,26 @@ class Scheduler:
         # payload and dashboard. Populated in _forward_single, cleared on
         # idle/forced eviction so dropped models don't show stale callers.
         self._active_programs: dict[str, dict[str, float]] = {}
+        # Anti-starvation floor (co-residency stopgap, v0.6.7). A normal-
+        # priority model whose oldest pending request has waited longer than
+        # ``scheduler.starvation_trigger_s`` is protected from critical-
+        # priority eviction for up to ``scheduler.starvation_protect_cap_s``,
+        # so a CRITICAL program can't starve a long normal batch for hours.
+        # ``_starvation_protected_since``: model -> monotonic ts protection
+        # began this episode. ``_starvation_protect_cooldown_until``: model ->
+        # monotonic ts before which it can't re-protect (set when an episode
+        # hits the cap, so a deferred CRITICAL request gets its turn).
+        # ``_starvation_protected``: the set computed each tick that
+        # ``_evict_one`` excludes from eviction candidates.
+        self._starvation_protected_since: dict[str, float] = {}
+        self._starvation_protect_cooldown_until: dict[str, float] = {}
+        self._starvation_protected: set[str] = set()
+        # Set by ``_evict_one`` when it declined to evict ONLY because the
+        # viable victims were starvation-protected (vs genuinely nothing to
+        # evict). ``_ensure_model_loaded`` reads it to DEFER the load (retry
+        # next tick) instead of routing a possibly-CRITICAL request through
+        # the Bug C cannot-fit giveup machine, which would 503 it.
+        self._eviction_deferred_by_floor = False
         # X-Burst-Size hints (sequential-submission programs declaring
         # "I have more requests coming for this model"). Used by the
         # eviction scorer to keep loaded models alive across silent gaps
@@ -757,6 +777,12 @@ class Scheduler:
         # Step 1: Forward requests for models already loaded
         await self._forward_loaded_model_requests()
 
+        # Step 1.5: Recompute the anti-starvation protected set BEFORE any
+        # eviction happens this tick (co-residency stopgap). A long-starved
+        # normal model is shielded from the critical preemption + eviction
+        # steps below so a CRITICAL program can't starve it indefinitely.
+        await self._update_starvation_protection()
+
         # Step 2: Handle critical priority preemption
         await self._handle_critical_preemption()
 
@@ -809,6 +835,13 @@ class Scheduler:
         pause — both would create misleading state for the post-resume
         drain.
         """
+        # The anti-starvation floor's normal-tick update (and its expiry)
+        # doesn't run while paused, so clear the protected set here: bypass
+        # (test) traffic gets the strongest dispatch guarantee and must not
+        # be blocked by a stale protection entry from before the pause (codex
+        # P2). The since/cooldown bookkeeping persists and is recomputed by
+        # _update_starvation_protection on the first normal tick after resume.
+        self._starvation_protected = set()
         models = await self.queues.peek_models()
         for model in models:
             pending = await self.queues.pending_for_model(model)
@@ -1152,6 +1185,117 @@ class Scheduler:
                 env.tier_label = tier_label
                 env.routing_reason = RoutingReason.ALREADY_LOADED.value
 
+    def _priority_map_from_pending(
+        self,
+        all_pending: list[RequestEnvelope],
+        loaded_models: Any,
+    ) -> dict[str, str]:
+        """Map each model to ``"critical"`` or ``"normal"``.
+
+        A model is ``"critical"`` if ANY pending request for it comes from
+        a CRITICAL-priority program, else ``"normal"``. Every loaded model
+        gets an entry (default ``"normal"``) so callers can classify a
+        model with no pending requests. Shared by the eviction scorer and
+        the anti-starvation floor so they agree on priority.
+        """
+        priorities: dict[str, str] = {}
+        for envelope in all_pending:
+            prog_cfg = self.config.get_program_config(envelope.program_id)
+            if prog_cfg.priority == Priority.CRITICAL:
+                priorities[envelope.model] = "critical"
+            elif envelope.model not in priorities:
+                priorities[envelope.model] = "normal"
+        for model_name in loaded_models:
+            priorities.setdefault(model_name, "normal")
+        return priorities
+
+    async def _update_starvation_protection(self) -> None:
+        """Recompute the normal-priority models protected from eviction.
+
+        Anti-starvation floor (co-residency stopgap, v0.6.7). A loaded
+        normal-priority model whose OLDEST pending request has waited
+        longer than ``scheduler.starvation_trigger_s`` is "starved" and
+        joins ``self._starvation_protected``, which ``_evict_one`` excludes
+        — so the critical preemption + eviction steps can't tear it down.
+        Protection lasts at most ``scheduler.starvation_protect_cap_s`` per
+        episode; after the cap the model drops out of protection for an
+        equal cooldown window so a CRITICAL request deferred behind it gets
+        its turn (bounding how long a stuck normal batch holds VRAM).
+
+        ``wait_time`` (not ``_last_activity``) is the signal on purpose:
+        ``_last_activity`` is stamped on every dispatch including a
+        retry-exhausted failure, so it would reset while a batch is failing
+        — exactly the starvation case the floor must catch. The oldest
+        pending request's wait can't be reset by a failed dispatch.
+        """
+        cfg = self.config.scheduler
+        if not cfg.starvation_floor_enabled:
+            if self._starvation_protected:
+                self._starvation_protected = set()
+            self._starvation_protected_since.clear()
+            self._starvation_protect_cooldown_until.clear()
+            return
+
+        now = time.monotonic()
+        all_pending = await self.queues.get_all_sorted_by_arrival()
+        loaded = self.memory.get_loaded_models()
+        priorities = self._priority_map_from_pending(all_pending, loaded)
+
+        # Oldest pending wait per model — all_pending is arrival-sorted, so
+        # the first envelope seen for a model is its oldest.
+        oldest_wait: dict[str, float] = {}
+        for env in all_pending:
+            if env.model not in oldest_wait:
+                oldest_wait[env.model] = env.wait_time
+
+        protected: set[str] = set()
+        starved_now: set[str] = set()
+        for model in loaded:
+            if priorities.get(model) != "normal":
+                continue
+            wait = oldest_wait.get(model)
+            if wait is None or wait < cfg.starvation_trigger_s:
+                continue
+            starved_now.add(model)
+            cooldown_until = self._starvation_protect_cooldown_until.get(model)
+            if cooldown_until is not None and now < cooldown_until:
+                # Post-cap cooldown in effect — let critical have its turn.
+                continue
+            since = self._starvation_protected_since.get(model)
+            if since is None:
+                self._starvation_protected_since[model] = now
+                protected.add(model)
+            elif now - since > cfg.starvation_protect_cap_s:
+                # Episode hit the cap: drop protection and bar re-protection
+                # for an equal cooldown so a deferred CRITICAL load proceeds.
+                del self._starvation_protected_since[model]
+                self._starvation_protect_cooldown_until[model] = (
+                    now + cfg.starvation_protect_cap_s
+                )
+            else:
+                protected.add(model)
+
+        # Models no longer starved (drained or progressing) reset BOTH their
+        # protection episode AND any pending cooldown. A later starvation of
+        # the same model is a fresh workload that deserves fresh protection,
+        # not a leftover cooldown from a prior episode that would wrongly deny
+        # it (codex P2). Still-starved models in their post-cap cooldown stay
+        # in starved_now, so their cooldown correctly survives here.
+        for model in list(self._starvation_protected_since):
+            if model not in starved_now:
+                del self._starvation_protected_since[model]
+        for model in list(self._starvation_protect_cooldown_until):
+            if model not in starved_now:
+                del self._starvation_protect_cooldown_until[model]
+
+        if protected != self._starvation_protected:
+            logger.info(
+                "scheduler.starvation_protected",
+                models=sorted(protected),
+                trigger_s=cfg.starvation_trigger_s,
+            )
+        self._starvation_protected = protected
+
     async def _handle_critical_preemption(self) -> None:
         """Check for critical-priority requests that need preemption."""
         all_pending = await self.queues.get_all_sorted_by_arrival()
@@ -1168,7 +1312,14 @@ class Scheduler:
                 program=envelope.program_id,
             )
             num_ctx = await self._max_num_ctx_for_pending(envelope.model)
-            await self._ensure_model_loaded(envelope.model, num_ctx=num_ctx)
+            loaded = await self._ensure_model_loaded(envelope.model, num_ctx=num_ctx)
+            if not loaded and self._eviction_deferred_by_floor:
+                # The anti-starvation floor deferred THIS critical model (a
+                # protected normal batch holds the VRAM it needs). Keep
+                # scanning — a later critical model may still load by evicting
+                # an UNprotected candidate (codex P2). Only a success or a
+                # terminal non-floor outcome ends preemption for this tick.
+                continue
             break  # Handle one preemption per tick
 
     async def _handle_unskippable_requests(self) -> None:
@@ -1413,6 +1564,12 @@ class Scheduler:
         Returns:
             True if the model is now loaded at the requested size.
         """
+        # Reset the floor-defer flag so a False return from THIS call can be
+        # attributed correctly by callers (e.g. _handle_critical_preemption
+        # reads it to decide whether to keep scanning). It is set True only if
+        # this call's eviction loop is blocked solely by starvation-protected
+        # victims; any other return path leaves it False.
+        self._eviction_deferred_by_floor = False
         # Per-model preload backoff (v0.6.4+): bail before doing any
         # eviction work when a recent preload failed and we're still
         # within the cooldown window. Without the early return,
@@ -1471,6 +1628,29 @@ class Scheduler:
         while not self.memory.can_fit_model(model_size):
             evicted = await self._evict_one(model)
             if not evicted:
+                if self._eviction_deferred_by_floor:
+                    # Co-residency anti-starvation floor (v0.6.7): the only
+                    # eviction victims were starvation-protected normal
+                    # models. DEFER this load — the protected batch drains or
+                    # its cap expires within ``starvation_protect_cap_s`` —
+                    # instead of routing this (possibly CRITICAL) request
+                    # through the Bug C cannot-fit giveup below, which would
+                    # 503 a legitimate request. No failure is recorded; the
+                    # caller retries on the next tick, by which time the
+                    # protection may have cleared.
+                    logger.info(
+                        "scheduler.load_deferred_by_starvation_floor",
+                        model=model,
+                        instance=chosen_url,
+                    )
+                    if is_reload:
+                        # We already unloaded to reload bigger; the model is
+                        # gone. Keep the 0 sentinel so a later request can't
+                        # silently dispatch against a slot we don't have.
+                        self.memory.record_allocated_num_ctx(
+                            model, 0, instance_url=chosen_url
+                        )
+                    return False
                 logger.error(
                     "scheduler.cannot_fit_model",
                     model=model,
@@ -1601,33 +1781,32 @@ class Scheduler:
             for model_name, boost in burst_boosts.items():
                 pending_counts[model_name] = pending_counts.get(model_name, 0) + boost
 
-        # Build priority map: use the highest priority of any pending
-        # request for each loaded model (critical > normal)
-        program_priorities: dict[str, str] = {}
+        # Build priority map (critical > normal) for the eviction scorer,
+        # shared with the anti-starvation floor so both agree on priority.
         all_pending = await self.queues.get_all_sorted_by_arrival()
-        for envelope in all_pending:
-            prog_cfg = self.config.get_program_config(envelope.program_id)
-            current = program_priorities.get(envelope.model, "normal")
-            if prog_cfg.priority == Priority.CRITICAL:
-                program_priorities[envelope.model] = "critical"
-            elif envelope.model not in program_priorities:
-                program_priorities[envelope.model] = current
-        # Ensure all loaded models have an entry (default normal)
-        for model_name in self.memory.get_loaded_models():
-            if model_name not in program_priorities:
-                program_priorities[model_name] = "normal"
+        program_priorities = self._priority_map_from_pending(
+            all_pending, self.memory.get_loaded_models()
+        )
 
         candidates = self.memory.get_eviction_candidates(
             pending_counts, program_priorities
         )
 
-        # Don't evict the model we're trying to load
+        # Don't evict the model we're trying to load.
         candidates = [c for c in candidates if c != needed_for]
 
-        if not candidates:
+        # Anti-starvation floor: never evict a normal model currently
+        # protected from critical preemption. If the ONLY viable victims are
+        # protected, flag the defer so ``_ensure_model_loaded`` waits for the
+        # protection window instead of failing this (possibly CRITICAL)
+        # request through the Bug C cannot-fit giveup machine.
+        evictable = [c for c in candidates if c not in self._starvation_protected]
+        if not evictable:
+            self._eviction_deferred_by_floor = bool(candidates)
             return False
+        self._eviction_deferred_by_floor = False
 
-        target = candidates[0]
+        target = evictable[0]
         target_instance = self.memory.find_instance_for(target)
         logger.info(
             "scheduler.evicting",
@@ -1637,18 +1816,35 @@ class Scheduler:
             instance=target_instance,
         )
 
-        # Drain pending requests for the eviction target first (drain-before-evict)
-        pending = await self.queues.pending_count(target)
-        if pending > 0:
-            batch = await self.queues.dequeue_batch(target)
-            if batch:
-                logger.info(
-                    "scheduler.drain_before_evict",
-                    model=target,
-                    request_count=len(batch),
-                )
-                self._tag_batch_with_instance(batch, target_instance)
-                await self._process_batch(batch)
+        # Drain pending requests for the eviction target first
+        # (drain-before-evict) — UNLESS the target just exhausted its
+        # anti-starvation protected window and is in the post-cap cooldown.
+        # In that case draining a long normal backlog sequentially would
+        # re-starve the higher-priority (often CRITICAL) load the cap exists
+        # to unblock — defeating the bound the cap is supposed to provide
+        # (codex P1). The undrained requests stay queued and are served once
+        # the model reloads on a later tick, after the higher-priority work.
+        in_starvation_cooldown = (
+            self._starvation_protect_cooldown_until.get(target, 0.0) > time.monotonic()
+        )
+        if in_starvation_cooldown:
+            logger.info(
+                "scheduler.evict_skip_drain_starvation_cooldown",
+                model=target,
+                instance=target_instance,
+            )
+        else:
+            pending = await self.queues.pending_count(target)
+            if pending > 0:
+                batch = await self.queues.dequeue_batch(target)
+                if batch:
+                    logger.info(
+                        "scheduler.drain_before_evict",
+                        model=target,
+                        request_count=len(batch),
+                    )
+                    self._tag_batch_with_instance(batch, target_instance)
+                    await self._process_batch(batch)
 
         self.memory.mark_intended_unload(target, instance_url=target_instance)
         success = await self.lifecycle.unload(target, instance_url=target_instance)
@@ -1656,6 +1852,13 @@ class Scheduler:
             self.metrics.evictions += 1
             self._last_activity.pop(target, None)
             self._active_programs.pop(target, None)
+            # Drop any anti-starvation bookkeeping for the evicted model so
+            # entries can't linger after it leaves VRAM (it's never the
+            # protected target — _evict_one excludes protected models — but
+            # it may carry a post-cap cooldown entry).
+            self._starvation_protected_since.pop(target, None)
+            self._starvation_protect_cooldown_until.pop(target, None)
+            self._starvation_protected.discard(target)
             await self.memory.refresh()
         return success
 

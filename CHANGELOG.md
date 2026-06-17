@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Anti-starvation floor for normal-priority batches (co-residency
+  stopgap).** A CRITICAL-priority program (which can preempt without
+  bound) could starve a long-running normal-priority batch for hours by
+  repeatedly evicting its model — the normal batch's requests surfaced as
+  failures and got written as data. The scheduler now protects a normal
+  model from critical-priority eviction once its oldest pending request
+  has waited longer than `scheduler.starvation_trigger_s` (default 120s),
+  for up to `scheduler.starvation_protect_cap_s` per episode (default
+  180s), after which protection drops for an equal cooldown so a deferred
+  CRITICAL request gets its turn. While a protected batch holds the VRAM,
+  a CRITICAL load is *deferred* (retried next tick), not failed. New
+  config knobs `scheduler.starvation_floor_enabled` (default on),
+  `starvation_trigger_s`, `starvation_protect_cap_s`. This is the
+  fairness-floor half of the co-residency work; the memory-aware
+  concurrent-large-model cap depends on the memory-subsystem rework and
+  lands separately.
 - **`version` field on `/api/marshal/status`.** The status payload now
   reports the marshal's own version (`ollama_marshal.__version__`),
   distinct from `/api/version` which passes through to Ollama. Lets

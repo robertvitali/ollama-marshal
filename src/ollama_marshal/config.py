@@ -237,6 +237,42 @@ class SchedulerConfig(BaseModel):
             "this value. Defends against program_id-flooding attacks."
         ),
     )
+    starvation_floor_enabled: bool = Field(
+        default=True,
+        description=(
+            "Anti-starvation floor: protect a long-starved normal-priority "
+            "model from critical-priority eviction for a bounded window, so "
+            "a CRITICAL program (which can preempt without bound) can't starve "
+            "a long-running normal batch for hours. Set False to restore the "
+            "pre-floor behavior (CRITICAL preempts normal without a fairness "
+            "ceiling)."
+        ),
+    )
+    starvation_trigger_s: float = Field(
+        default=120.0,
+        gt=0,
+        description=(
+            "Seconds a normal-priority model's OLDEST pending request must "
+            "have waited (with no successful dispatch) before the floor marks "
+            "it starved and protects it from critical-priority eviction. "
+            "Larger = the floor only intervenes on sustained starvation "
+            "(favors CRITICAL responsiveness); smaller = the floor protects "
+            "normal batches sooner. Only meaningful when "
+            "starvation_floor_enabled is True."
+        ),
+    )
+    starvation_protect_cap_s: float = Field(
+        default=180.0,
+        gt=0,
+        description=(
+            "Maximum seconds a starved normal-priority model stays "
+            "eviction-protected in one episode. After the cap, protection "
+            "drops for an equal cooldown window so a CRITICAL request that "
+            "was deferred gets its turn — bounding how long a stuck normal "
+            "batch can hold VRAM against critical work. Only meaningful when "
+            "starvation_floor_enabled is True."
+        ),
+    )
     burst_hint_max_live: int = Field(
         default=256,
         description=(

@@ -129,14 +129,30 @@ GET /api/marshal/debug
 3. Skip limit — per-request counter; after max_skips, force-load the model.
    CRITICAL programs are EXEMPT from skip increment (their dedicated
    preemption path in step 5 already guarantees forced load).
-4. Eviction — least disruptive: fewest pending, lowest priority, oldest
-5. Priority — normal (drain-then-evict) vs critical (can preempt)
+4. Eviction — least disruptive: fewest pending, lowest priority, oldest.
+   A starvation-protected normal model (step 8) is excluded from
+   eviction candidates.
+5. Priority — normal (drain-then-evict) vs critical (can preempt), but
+   critical preemption is bounded by the anti-starvation floor (step 8).
 6. Immediate — if model already loaded, forward without queuing
 7. Pause — when `admin.pause` flips `_dispatch_paused`, the scheduler
    suspends queue draining. Bypass-flagged envelopes
    (`X-Marshal-Test-Bypass` header) still dispatch. Resume picks up
    where it left off; auto-resume failsafe fires after the configured
    timeout if no explicit resume arrives.
+8. Anti-starvation floor (v0.6.7, `scheduler.starvation_floor_enabled`,
+   default on) — `_update_starvation_protection` (a per-tick step before
+   critical preemption) marks a normal-priority model "protected" once its
+   OLDEST pending request has waited longer than `starvation_trigger_s`,
+   so `_evict_one` won't let critical preemption evict it. Protection
+   lasts at most `starvation_protect_cap_s` per episode, then drops for an
+   equal cooldown so a deferred critical request proceeds. The signal is
+   the oldest pending request's `wait_time`, NOT `_last_activity` (which
+   is stamped even on a retry-exhausted dispatch and so would reset during
+   the exact starvation it must detect). When a protected model holds the
+   VRAM a critical load needs, `_ensure_model_loaded` DEFERS the load
+   (retries next tick) instead of routing it through the Bug C cannot-fit
+   giveup — a deferred critical request waits, it is not 503'd.
 
 ## Testing Rules
 

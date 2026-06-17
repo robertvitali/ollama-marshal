@@ -77,6 +77,22 @@ scheduler:
                                        # Defends against program_id-flooding attacks.
   burst_hint_max_live: 256         # Max live (program, model) hints stored. New pairs are
                                     # dropped when full; existing pair refreshes always succeed.
+  starvation_floor_enabled: true   # MARSHAL_SCHEDULER_STARVATION_FLOOR_ENABLED — anti-
+                                    # starvation floor. Protect a long-starved normal-priority
+                                    # model from critical-priority eviction for a bounded
+                                    # window, so a CRITICAL program (which can preempt without
+                                    # bound) can't starve a long normal batch for hours. Set
+                                    # false to restore unbounded CRITICAL preemption.
+  starvation_trigger_s: 120.0      # MARSHAL_SCHEDULER_STARVATION_TRIGGER_S — seconds a normal
+                                    # model's OLDEST pending request must have waited (no
+                                    # successful dispatch) before the floor protects it.
+                                    # Larger favors CRITICAL responsiveness; smaller protects
+                                    # normal batches sooner.
+  starvation_protect_cap_s: 180.0  # MARSHAL_SCHEDULER_STARVATION_PROTECT_CAP_S — max seconds a
+                                    # starved model stays protected in one episode. After the
+                                    # cap, protection drops for an equal cooldown so a deferred
+                                    # CRITICAL request gets its turn — bounding how long a stuck
+                                    # normal batch can hold VRAM against critical work.
   metrics_path: "~/.ollama-marshal/metrics.json"   # MARSHAL_SCHEDULER_METRICS_PATH —
                                                     # where lifetime counters persist across
                                                     # restarts.

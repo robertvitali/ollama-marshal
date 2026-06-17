@@ -3270,3 +3270,213 @@ class TestPreloadOwnershipClaim:
         assert result is False
         sched.memory.mark_owned.assert_not_called()
         sched.lifecycle.preload.assert_not_called()
+
+
+def _starvation_config(**scheduler_overrides):
+    """MarshalConfig with normal + critical programs for floor tests."""
+    cfg = _make_config()
+    for key, value in scheduler_overrides.items():
+        setattr(cfg.scheduler, key, value)
+    cfg.programs = {
+        "default": ProgramConfig(),
+        "normal-prog": ProgramConfig(priority=Priority.NORMAL),
+        "critical-prog": ProgramConfig(priority=Priority.CRITICAL),
+    }
+    return cfg
+
+
+def _waited_envelope(model, program_id, waited_s):
+    """Build an envelope whose ``wait_time`` reports ``waited_s`` seconds."""
+    env = _make_envelope(model=model, program_id=program_id)
+    env.arrived_at = time.monotonic() - waited_s
+    return env
+
+
+class TestStarvationFloor:
+    """Co-residency stopgap (v0.6.7): anti-starvation eviction protection."""
+
+    async def test_starved_normal_model_protected_critical_and_young_not(self):
+        sched = _make_scheduler(
+            config=_starvation_config(
+                starvation_floor_enabled=True,
+                starvation_trigger_s=100.0,
+                starvation_protect_cap_s=50.0,
+            )
+        )
+        sched.memory.get_loaded_models.return_value = {"nm", "cm", "ym"}
+        sched.queues.get_all_sorted_by_arrival = AsyncMock(
+            return_value=[
+                _waited_envelope("nm", "normal-prog", 200),  # starved normal
+                _waited_envelope("cm", "critical-prog", 200),  # critical: exempt
+                _waited_envelope("ym", "normal-prog", 10),  # too young
+            ]
+        )
+
+        await sched._update_starvation_protection()
+
+        assert sched._starvation_protected == {"nm"}
+
+    async def test_disabled_floor_protects_nothing(self):
+        sched = _make_scheduler(
+            config=_starvation_config(
+                starvation_floor_enabled=False,
+                starvation_trigger_s=100.0,
+            )
+        )
+        sched.memory.get_loaded_models.return_value = {"nm"}
+        sched.queues.get_all_sorted_by_arrival = AsyncMock(
+            return_value=[_waited_envelope("nm", "normal-prog", 999)]
+        )
+
+        await sched._update_starvation_protection()
+
+        assert sched._starvation_protected == set()
+
+    async def test_protection_caps_then_enters_cooldown(self):
+        sched = _make_scheduler(
+            config=_starvation_config(
+                starvation_floor_enabled=True,
+                starvation_trigger_s=100.0,
+                starvation_protect_cap_s=50.0,
+            )
+        )
+        sched.memory.get_loaded_models.return_value = {"nm"}
+        sched.queues.get_all_sorted_by_arrival = AsyncMock(
+            return_value=[_waited_envelope("nm", "normal-prog", 200)]
+        )
+        # Episode began 60s ago — past the 50s cap.
+        sched._starvation_protected_since["nm"] = time.monotonic() - 60
+
+        await sched._update_starvation_protection()
+
+        assert "nm" not in sched._starvation_protected
+        assert "nm" not in sched._starvation_protected_since
+        assert "nm" in sched._starvation_protect_cooldown_until
+
+    async def test_cooldown_blocks_reprotection(self):
+        sched = _make_scheduler(
+            config=_starvation_config(
+                starvation_floor_enabled=True,
+                starvation_trigger_s=100.0,
+                starvation_protect_cap_s=50.0,
+            )
+        )
+        sched.memory.get_loaded_models.return_value = {"nm"}
+        sched.queues.get_all_sorted_by_arrival = AsyncMock(
+            return_value=[_waited_envelope("nm", "normal-prog", 200)]
+        )
+        # In an active cooldown window — must NOT re-protect even though starved.
+        sched._starvation_protect_cooldown_until["nm"] = time.monotonic() + 30
+
+        await sched._update_starvation_protection()
+
+        assert "nm" not in sched._starvation_protected
+
+    async def test_drained_model_clears_episode(self):
+        sched = _make_scheduler(
+            config=_starvation_config(
+                starvation_floor_enabled=True,
+                starvation_trigger_s=100.0,
+            )
+        )
+        sched.memory.get_loaded_models.return_value = {"nm"}
+        # No pending requests → not starved → episode should clear.
+        sched.queues.get_all_sorted_by_arrival = AsyncMock(return_value=[])
+        sched._starvation_protected_since["nm"] = time.monotonic()
+        sched._starvation_protect_cooldown_until["nm"] = time.monotonic() + 30
+
+        await sched._update_starvation_protection()
+
+        assert "nm" not in sched._starvation_protected
+        assert "nm" not in sched._starvation_protected_since
+        # Cooldown must clear too (codex P2): a drained model is a fresh
+        # workload and a later episode deserves fresh protection.
+        assert "nm" not in sched._starvation_protect_cooldown_until
+
+    async def test_evict_one_skips_drain_for_cooldown_target(self):
+        # codex P1: a model evicted while in its post-cap cooldown must NOT
+        # be drain-before-evicted — draining a long backlog would re-starve
+        # the higher-priority load the cap exists to unblock.
+        sched = _make_scheduler()
+        sched.memory.get_loaded_models.return_value = {"cooled"}
+        sched.memory.get_eviction_candidates.return_value = ["cooled"]
+        sched.lifecycle.unload = AsyncMock(return_value=True)
+        sched._starvation_protect_cooldown_until["cooled"] = time.monotonic() + 30
+        sched.queues.pending_count = AsyncMock(return_value=5)
+        sched.queues.dequeue_batch = AsyncMock(return_value=[])
+
+        result = await sched._evict_one("new-model")
+
+        assert result is True
+        sched.queues.dequeue_batch.assert_not_called()  # drain skipped
+        sched.lifecycle.unload.assert_called_once()
+
+    async def test_critical_preemption_continues_past_floor_deferred_model(self):
+        # codex P2: a floor-deferred FIRST critical model must not block
+        # later critical models that could load by evicting unprotected
+        # victims. _handle_critical_preemption should keep scanning.
+        sched = _make_scheduler(config=_starvation_config())
+        sched.queues.get_all_sorted_by_arrival = AsyncMock(
+            return_value=[
+                _make_envelope(model="c1", program_id="critical-prog"),
+                _make_envelope(model="c2", program_id="critical-prog"),
+            ]
+        )
+        sched.memory.is_loaded.return_value = False
+        sched._max_num_ctx_for_pending = AsyncMock(return_value=None)
+        calls: list[str] = []
+
+        async def fake_ensure(model, num_ctx=None):
+            calls.append(model)
+            if model == "c1":
+                sched._eviction_deferred_by_floor = True  # floor-deferred
+                return False
+            sched._eviction_deferred_by_floor = False
+            return True  # c2 loads by evicting an unprotected victim
+
+        sched._ensure_model_loaded = fake_ensure
+
+        await sched._handle_critical_preemption()
+
+        assert calls == ["c1", "c2"]
+
+    async def test_bypass_only_clears_starvation_protection(self):
+        # codex P2: bypass (test) traffic must not be blocked by a stale
+        # protected entry frozen in during admin pause.
+        sched = _make_scheduler()
+        sched._starvation_protected = {"m"}
+        sched.queues.peek_models = AsyncMock(return_value=[])
+
+        await sched._tick_bypass_only()
+
+        assert sched._starvation_protected == set()
+
+    async def test_evict_one_excludes_protected_and_sets_defer_flag(self):
+        sched = _make_scheduler()
+        sched.memory.get_loaded_models.return_value = {"protected"}
+        sched.memory.get_eviction_candidates.return_value = ["protected"]
+        sched._starvation_protected = {"protected"}
+
+        result = await sched._evict_one("new-model")
+
+        assert result is False
+        assert sched._eviction_deferred_by_floor is True
+        sched.lifecycle.unload.assert_not_called()
+
+    async def test_ensure_model_loaded_defers_when_blocked_by_floor(self):
+        sched = _make_scheduler()
+        sched.memory.is_loaded.return_value = False
+        sched.memory.can_fit_model.return_value = False
+        sched.memory.get_loaded_models.return_value = {"protected"}
+        sched.memory.get_eviction_candidates.return_value = ["protected"]
+        sched._starvation_protected = {"protected"}
+        sched.registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
+
+        result = await sched._ensure_model_loaded("new-model", num_ctx=None)
+
+        # Deferred, NOT failed: returns False, records no preload failure
+        # (so the Bug C giveup machine never fires and the request isn't
+        # 503'd) and never reaches the actual preload.
+        assert result is False
+        assert "new-model" not in sched._preload_failures
+        sched.lifecycle.preload.assert_not_called()
