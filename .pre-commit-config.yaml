@@ -52,10 +52,6 @@ repos:
       # prod marshal at :11435 for the duration of the suite so it
       # doesn't compete for Ollama VRAM. Requires Ollama running on
       # localhost:11434.
-      #
-      # Operators can skip this hook with `git push --no-verify` for
-      # WIP branches; the assumption is that PRs are pushed to ready
-      # branches that should pass the suite cleanly.
       - id: pytest-integration
         name: pytest (integration tests, on push)
         entry: uv run --extra dev pytest tests/integration/ -m integration -q --no-cov
