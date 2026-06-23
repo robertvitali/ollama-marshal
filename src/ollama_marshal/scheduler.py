@@ -774,6 +774,13 @@ class Scheduler:
                 instance=instance_url,
             )
 
+        # Step 0.5: Self-learning footprint feedback (Memory rework M1).
+        # Record each loaded model's live /api/ps VRAM against the num_ctx
+        # marshal loaded it at, so the registry's (model, num_ctx)
+        # footprint converges on measured truth over time. Pure
+        # observation — no dispatch, no eviction.
+        self._learn_measured_vram()
+
         # Step 1: Forward requests for models already loaded
         await self._forward_loaded_model_requests()
 
@@ -810,6 +817,38 @@ class Scheduler:
         unexpected = self.memory.take_unexpected_unload_count()
         if unexpected > 0:
             self.metrics.unexpected_unloads += unexpected
+
+    def _learn_measured_vram(self) -> None:
+        """Feed observed live VRAM back into the registry (self-learning, M1).
+
+        For every model loaded on every instance, correlate the live
+        ``/api/ps`` ``size_vram`` (from the memory poller) with the
+        ``num_ctx`` marshal preloaded that model at AND the instance's
+        ``kv_cache_type``, and record the triple in the registry. Over
+        time this builds an authoritative, self-evolving
+        ``(model, kv_cache_type, num_ctx) -> VRAM`` map that
+        ``get_total_footprint`` prefers over estimates. Pure observation —
+        never dispatches or evicts.
+
+        Skips entries where the live size is 0 (not yet measured /
+        CPU-only) or the allocated num_ctx is unknown — the latter means
+        the model was loaded by something other than this marshal (no
+        ``record_allocated_num_ctx`` call), so we can't attribute a
+        context length to the measurement. ``record_measured_vram`` only
+        touches disk when a value actually changes, so calling this every
+        tick is cheap once sizes stabilize.
+        """
+        for inst in self.memory.instances:
+            loaded = self.memory.get_loaded_models_on(inst.url)
+            for name, model in loaded.items():
+                if model.size_vram <= 0:
+                    continue
+                num_ctx = self.memory.get_allocated_num_ctx(name, instance_url=inst.url)
+                if num_ctx is None or num_ctx <= 0:
+                    continue
+                self.registry.record_measured_vram(
+                    name, inst.kv_cache_type, num_ctx, model.size_vram
+                )
 
     async def _tick_bypass_only(self) -> None:
         """During admin pause, dispatch only bypass-flagged envelopes.

@@ -154,6 +154,20 @@ GET /api/marshal/debug
    (retries next tick) instead of routing it through the Bug C cannot-fit
    giveup — a deferred critical request waits, it is not 503'd.
 
+Self-learning footprint feedback (v0.6.7, Memory rework M1/M1.5): a
+per-tick Step 0.5 (`_learn_measured_vram`, before Step 1) correlates each
+loaded model's live `/api/ps` `size_vram` with the `num_ctx` marshal
+loaded it at and the instance's `kv_cache_type`, recording a HIGH-WATER
+value per `(model, kv_cache_type, num_ctx)` triple in the registry
+(`record_measured_vram` → `model_vram.json`). `get_total_footprint`
+prefers this measured value (returned as-is — it already includes KV, so
+no separate KV slot is added), then an anchored `estimate_vram`
+(interpolate/extrapolate from measured points for the same model+KV,
+monotonic floor), then the legacy weights+KV estimate. The store only
+ever rises (a smaller-context or partial reading never lowers a remembered
+peak). The live-memory read, budget reconciliation, and
+attempt-and-learn failure recording are M2 (not yet built).
+
 ## Testing Rules
 
 - Unit tests: mock Ollama responses via httpx, target 95%+ coverage
@@ -290,6 +304,19 @@ analysis from scratch.
    autouse pause exists to provide. The pure version-compare helper lives
    in `tests/integration/_version_skew.py` (unit-tested in
    `tests/test_version_skew.py`).
+
+7. **Subprocess registry isolation via `MARSHAL_STATE_DIR`** (Memory M1,
+   v0.6.7). In-process tests redirect registry state through
+   `app.state.{registry,metadata,vram}_path`, but the `marshal_subprocess`
+   fixture spawns a real `ollama-marshal start` process that can't take
+   those app.state overrides. Before M1 this was benign (the only registry
+   writers — `benchmark_model` / metadata probe — are gated off by
+   `benchmark_on_startup=false`), but the M1 self-learning feedback loop
+   writes `model_vram.json` on every model load regardless. The fixture
+   now sets `MARSHAL_STATE_DIR=<tmp>` in the subprocess env so all three
+   registry files land in the per-test temp dir, never the user's real
+   `~/.ollama-marshal`. The env var is read at `ModelRegistry`
+   construction (`_state_dir()`), so explicit path args still win over it.
 
 ## Documentation Rules
 

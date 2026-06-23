@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -43,8 +45,43 @@ _KV_PRECISION_MULTIPLIER: dict[KVCacheType, float] = {
     KVCacheType.Q4_0: 0.25,
 }
 
-_DEFAULT_REGISTRY_PATH = Path.home() / ".ollama-marshal" / "model_sizes.json"
-_DEFAULT_METADATA_PATH = Path.home() / ".ollama-marshal" / "model_metadata.json"
+# Registry on-disk filenames, all under the state dir (see _state_dir).
+_REGISTRY_FILENAME = "model_sizes.json"
+_METADATA_FILENAME = "model_metadata.json"
+# Self-evolving measured-VRAM store (Memory rework M1). Keyed by
+# (model, num_ctx) — unlike ``model_sizes.json`` (model-only), this
+# captures that real VRAM is dominated by KV cache, which scales with
+# context length. Fed live from the scheduler tick correlating /api/ps
+# ``size_vram`` with the num_ctx marshal loaded each model at. Kept in a
+# SEPARATE file from ``model_sizes.json`` deliberately: the legacy
+# ``_sizes`` store and its consumers (``is_benchmarked``,
+# ``benchmark_unknown`` candidate detection, ``list_models``, doctor,
+# status) stay untouched as the fallback, minimizing blast radius on the
+# central admission path. ``get_total_footprint`` prefers this store.
+_VRAM_FILENAME = "model_vram.json"
+
+# Env var that overrides the directory holding the registry's on-disk
+# state (sizes, metadata, vram). See ``_state_dir``.
+_STATE_DIR_ENV = "MARSHAL_STATE_DIR"
+
+
+def _state_dir() -> Path:
+    """Directory for marshal's on-disk registry state.
+
+    Defaults to ``~/.ollama-marshal``; overridable via the
+    ``MARSHAL_STATE_DIR`` env var. Read at construction time (not import
+    time) so a subprocess marshal — which can't receive the per-test
+    ``app.state.*_path`` overrides that in-process tests use — can still
+    redirect ALL registry files (sizes, metadata, vram) to a temp dir,
+    keeping the integration suite from clobbering the user's production
+    ``~/.ollama-marshal`` state. Explicit constructor path args still win
+    over this default.
+    """
+    override = os.environ.get(_STATE_DIR_ENV)
+    if override:
+        return Path(override)
+    return Path.home() / ".ollama-marshal"
+
 
 # Quantization → bytes-per-parameter map for the size estimator fallback
 # (registry.py:get_or_estimate_size). The on-disk model_sizes.json cache
@@ -237,11 +274,30 @@ class ModelRegistry:
         ollama_host: str = "http://localhost:11434",
         registry_path: Path | None = None,
         metadata_path: Path | None = None,
+        vram_path: Path | None = None,
     ) -> None:
         self.ollama_host = ollama_host
-        self.registry_path = registry_path or _DEFAULT_REGISTRY_PATH
-        self.metadata_path = metadata_path or _DEFAULT_METADATA_PATH
+        state_dir = _state_dir()
+        self.registry_path = registry_path or (state_dir / _REGISTRY_FILENAME)
+        self.metadata_path = metadata_path or (state_dir / _METADATA_FILENAME)
+        self.vram_path = vram_path or (state_dir / _VRAM_FILENAME)
         self._sizes: dict[str, int] = {}
+        # Memory rework M1: measured full VRAM keyed by
+        # (model, kv_cache_type, num_ctx).
+        # ``_measured_vram[model][kv_value][num_ctx]`` is the HIGH-WATER
+        # /api/ps ``size_vram`` observed when the model was loaded at
+        # ``num_ctx`` on an instance running that KV-cache precision —
+        # weights + KV + runner overhead at that context, peak across
+        # observations (KV grows as a slot fills during inference, so the
+        # max is the safe footprint). The KV-cache-type axis matters
+        # because the SAME model+ctx uses ~half the KV VRAM at q8_0 vs
+        # f16; model WEIGHT quant needs no axis (it's encoded in the model
+        # name/tag). Self-evolving via ``record_measured_vram`` (fed from
+        # the scheduler tick) and consulted first by
+        # ``get_total_footprint``. ``kv_value`` is the ``KVCacheType``
+        # string value (e.g. "f16") so it round-trips through JSON.
+        # Persisted to ``model_vram.json`` under ``_state_dir()``.
+        self._measured_vram: dict[str, dict[str, dict[int, int]]] = {}
         # Bug 9: per-model disk-size estimate sourced from /api/tags during
         # `_sync_with_ollama`. Used as a fallback by `get_or_estimate_size`
         # when `_sizes` (measured VRAM from benchmark_model) has no entry.
@@ -288,6 +344,7 @@ class ModelRegistry:
         """Load cached registry and sync with current Ollama models."""
         self._load_cache()
         self._load_metadata_cache()
+        self._load_vram_cache()
         await self._sync_with_ollama()
 
     def _load_cache(self) -> None:
@@ -357,6 +414,227 @@ class ModelRegistry:
             "model_registry.metadata_cache_saved", model_count=len(self._metadata)
         )
 
+    def _load_vram_cache(self) -> None:
+        """Load measured VRAM keyed by (model, kv_cache_type, num_ctx).
+
+        Schema: ``{model_name: {kv_value: {num_ctx_str: bytes_int}}}``.
+        JSON object keys are always strings, so ``num_ctx`` is coerced
+        back to int on load; ``kv_value`` stays a string (the
+        ``KVCacheType`` value). Mirrors ``_load_cache``'s corrupt-
+        tolerance: a parse failure or wrong shape logs a warning and
+        starts empty rather than crashing startup. Per-entry malformations
+        (non-dict level, non-int ctx or size, non-positive values, empty
+        kv key) are skipped, not fatal.
+        """
+        if not self.vram_path.exists():
+            return
+        try:
+            data = json.loads(self.vram_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            logger.warning(
+                "model_registry.vram_cache_corrupt", path=str(self.vram_path)
+            )
+            self._measured_vram = {}
+            return
+        if not isinstance(data, dict):
+            self._measured_vram = {}
+            return
+        loaded: dict[str, dict[str, dict[int, int]]] = {}
+        for model, by_kv in data.items():
+            if not isinstance(by_kv, dict):
+                continue
+            kv_map: dict[str, dict[int, int]] = {}
+            for kv_value, by_ctx in by_kv.items():
+                if not (isinstance(kv_value, str) and kv_value) or not isinstance(
+                    by_ctx, dict
+                ):
+                    continue
+                inner: dict[int, int] = {}
+                for ctx_str, size in by_ctx.items():
+                    try:
+                        ctx_i = int(ctx_str)
+                        size_i = int(size)
+                    except (TypeError, ValueError):
+                        continue
+                    if ctx_i > 0 and size_i > 0:
+                        inner[ctx_i] = size_i
+                if inner:
+                    kv_map[kv_value] = inner
+            if kv_map:
+                loaded[model] = kv_map
+        self._measured_vram = loaded
+        if loaded:
+            logger.info("model_registry.vram_cache_loaded", model_count=len(loaded))
+
+    def _save_vram_cache(self) -> None:
+        """Write the measured-VRAM cache to disk (num_ctx keys as strings)."""
+        self.vram_path.parent.mkdir(parents=True, exist_ok=True)
+        serialized = {
+            model: {
+                kv_value: {str(ctx): size for ctx, size in by_ctx.items()}
+                for kv_value, by_ctx in by_kv.items()
+            }
+            for model, by_kv in self._measured_vram.items()
+        }
+        self.vram_path.write_text(json.dumps(serialized, indent=2) + "\n")
+        logger.debug(
+            "model_registry.vram_cache_saved", model_count=len(self._measured_vram)
+        )
+
+    def record_measured_vram(
+        self,
+        model: str,
+        kv_cache_type: KVCacheType,
+        num_ctx: int,
+        size_vram: int,
+    ) -> None:
+        """Record observed full VRAM for ``model`` (self-learning).
+
+        Fed from the scheduler's per-tick feedback loop, which correlates
+        the live ``/api/ps`` ``size_vram`` of a loaded model with the
+        ``num_ctx`` marshal preloaded it at AND the ``kv_cache_type`` of
+        the instance it loaded on. This is the authoritative, self-evolving
+        footprint source consulted first by ``get_total_footprint``.
+
+        HIGH-WATER MARK semantics: the stored value for a
+        (model, kv_cache_type, num_ctx) triple only ever RISES. A later
+        observation that is lower (KV not yet populated right after load, a
+        partial measurement, or simply a run that happened to use less)
+        never lowers the remembered peak — so a smaller-context-window run
+        in the future can't shrink the footprint history learned from a
+        heavier run. This is the conservative direction for admission
+        control: over-remembering memory avoids overcommit / OOM,
+        under-remembering risks it. Each triple is its own high-water key,
+        so a heavy 32k f16 run and a light 4k q8_0 run of the same model
+        are remembered independently and neither pulls the other down.
+
+        No-ops on non-positive ``num_ctx`` or ``size_vram`` — a 0 from
+        /api/ps means "not measured / CPU-only", which must not poison the
+        store. Only writes to disk when the high-water mark actually rises,
+        so the per-tick caller doesn't churn the cache file once a size has
+        stabilized.
+
+        Args:
+            model: Model name.
+            kv_cache_type: KV-cache precision of the instance the model
+                loaded on (f16/q8_0/q4_0).
+            num_ctx: The slot context length the model was loaded with.
+            size_vram: Full VRAM bytes observed in /api/ps.
+        """
+        if num_ctx <= 0 or size_vram <= 0:
+            return
+        by_kv = self._measured_vram.setdefault(model, {})
+        by_ctx = by_kv.setdefault(kv_cache_type.value, {})
+        existing = by_ctx.get(num_ctx)
+        if existing is not None and size_vram <= existing:
+            # High-water mark: never lower a remembered peak.
+            return
+        by_ctx[num_ctx] = size_vram
+        self._save_vram_cache()
+
+    def get_measured_vram(
+        self,
+        model: str,
+        kv_cache_type: KVCacheType,
+        num_ctx: int,
+    ) -> int | None:
+        """Return the measured full VRAM for an exact (model, kv, num_ctx).
+
+        Exact-match only — interpolation/extrapolation across context sizes
+        is ``estimate_vram`` (M1.5). Returns None when no measurement
+        exists for that precise triple.
+        """
+        return (
+            self._measured_vram.get(model, {}).get(kv_cache_type.value, {}).get(num_ctx)
+        )
+
+    @staticmethod
+    def _bracketing_anchors(
+        points: list[tuple[int, int]], num_ctx: int
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Pick two (ctx, size) anchors to draw the estimate line through.
+
+        ``points`` is sorted ascending by ctx, has >= 2 entries, and
+        ``num_ctx`` is not equal to any anchor ctx. Below the range -> the
+        two lowest points; above -> the two highest (both extrapolate);
+        inside -> the immediate lower/upper bracket (interpolate).
+        """
+        if num_ctx < points[0][0]:
+            return points[0], points[1]
+        if num_ctx > points[-1][0]:
+            return points[-2], points[-1]
+        lower, upper = points[0], points[1]
+        for i in range(len(points) - 1):
+            if points[i][0] < num_ctx < points[i + 1][0]:
+                lower, upper = points[i], points[i + 1]
+                break
+        return lower, upper
+
+    def estimate_vram(
+        self,
+        model: str,
+        kv_cache_type: KVCacheType,
+        num_ctx: int,
+    ) -> int | None:
+        """Estimate VRAM for an unmeasured (model, kv, num_ctx) from anchors.
+
+        VRAM is ~ ``weights (constant) + KV (linear in num_ctx)``, so
+        measured high-water points for the same (model, kv_cache_type) let
+        us anchor on real data instead of the param-count guess (M1.5):
+
+        * **>= 2 points**: fit a line through the two measured contexts
+          nearest ``num_ctx`` and evaluate it there (interpolate within the
+          measured range, extrapolate beyond it).
+        * **1 point**: anchor on it and add the architectural KV delta from
+          metadata (``get_kv_per_slot_scaled``). If metadata is missing,
+          reuse the single measured value (the monotonic floor below keeps
+          that safe).
+        * **0 points**: return None so the caller falls back to the base
+          param-count estimate chain.
+
+        A monotonic safety floor is always applied: the result is never
+        less than the largest measured size at any context <= ``num_ctx`` —
+        a bigger context can only need more VRAM, so we never estimate
+        below a known smaller-context requirement (the same conservative
+        principle as the high-water mark).
+
+        Returns None when there are no measured points for the model at
+        this KV precision, OR when ``num_ctx <= 0`` — a "no specific
+        context" sentinel (the scheduler passes 0 when a request carries no
+        injected num_ctx). Feeding 0 to the anchor math would extrapolate
+        the line down toward ctx 0 and can yield a zero/negative footprint,
+        which would falsely admit a model as nearly free; deferring to the
+        caller's base estimate is correct and safe there.
+        """
+        if num_ctx <= 0:
+            return None
+        by_ctx = self._measured_vram.get(model, {}).get(kv_cache_type.value, {})
+        if not by_ctx:
+            return None
+        points = sorted(by_ctx.items())  # [(ctx, size), ...] ascending
+
+        if num_ctx in by_ctx:
+            est = by_ctx[num_ctx]
+        elif len(points) >= 2:
+            (c_lo, s_lo), (c_hi, s_hi) = self._bracketing_anchors(points, num_ctx)
+            slope = (s_hi - s_lo) / (c_hi - c_lo)
+            # ceil, not int(): round admission estimates UP so we never
+            # under-count VRAM (truncating down risks overcommit / OOM).
+            est = math.ceil(s_lo + slope * (num_ctx - c_lo))
+        else:
+            c0, s0 = points[0]
+            kv_at = self.get_kv_per_slot_scaled(model, kv_cache_type, ctx=num_ctx)
+            kv_at0 = self.get_kv_per_slot_scaled(model, kv_cache_type, ctx=c0)
+            if kv_at is not None and kv_at0 is not None:
+                est = s0 + (kv_at - kv_at0)
+            else:
+                est = s0
+
+        # Monotonic floor: never below the largest measured size at a
+        # context <= num_ctx (a bigger context can't need less VRAM).
+        floor = max((size for ctx, size in points if ctx <= num_ctx), default=0)
+        return max(est, floor, 0)
+
     async def _sync_with_ollama(self) -> None:
         """Sync the registry against models currently downloaded in Ollama.
 
@@ -418,13 +696,16 @@ class ModelRegistry:
             self._known_models = new_set
             self._known_models_last_sync = time.monotonic()
 
-            # Remove entries for deleted models (from both on-disk caches).
+            # Remove entries for deleted models (from all on-disk caches).
             stale = set(self._sizes.keys()) - new_set
             meta_stale = set(self._metadata.keys()) - new_set
+            vram_stale = set(self._measured_vram.keys()) - new_set
             for model in stale:
                 del self._sizes[model]
             for model in meta_stale:
                 del self._metadata[model]
+            for model in vram_stale:
+                del self._measured_vram[model]
 
             # Drop tag-size estimates for models no longer in /api/tags.
             # Not persisted, so no save_cache call.
@@ -456,6 +737,8 @@ class ModelRegistry:
 
             if stale:
                 self._save_cache()
+            if vram_stale:
+                self._save_vram_cache()
             if seeded:
                 logger.info(
                     "model_registry.tag_size_estimates_refreshed",
@@ -776,21 +1059,26 @@ class ModelRegistry:
         return dict(self._sizes)
 
     def remove_model(self, model: str) -> None:
-        """Remove a model from the registry (both size and metadata caches).
+        """Remove a model from the registry (size, metadata, and VRAM caches).
 
         Args:
             model: The model name to remove.
         """
         size_changed = model in self._sizes
         meta_changed = model in self._metadata
+        vram_changed = model in self._measured_vram
         if size_changed:
             del self._sizes[model]
         if meta_changed:
             del self._metadata[model]
+        if vram_changed:
+            del self._measured_vram[model]
         if size_changed:
             self._save_cache()
         if meta_changed:
             self._save_metadata_cache()
+        if vram_changed:
+            self._save_vram_cache()
 
     async def probe_metadata(self, model: str) -> ModelMetadata | None:
         """Fetch architecture metadata from `/api/show` and cache it.
@@ -1021,10 +1309,24 @@ class ModelRegistry:
     ) -> int:
         """Estimate total VRAM footprint of `model` at `num_ctx` on an instance.
 
-        Footprint = model weights + KV slot at this context length, with
-        the slot scaled to the instance's precision. Used by routing's
-        ``probe_fit`` to decide whether a request would actually fit on a
-        given instance without evicting work.
+        Precedence:
+
+        1. **Measured (model, kv_cache_type, num_ctx)** from
+           ``_measured_vram`` (Memory rework M1). The exact /api/ps
+           ``size_vram`` observed when the model was last loaded at this
+           context on this KV precision — already includes weights + KV +
+           runner overhead, so returned AS-IS. Adding a separate KV slot
+           on top would double-count the KV the measurement captured (the
+           bug the old ``size + kv`` path carried whenever
+           ``get_or_estimate_size`` returned a measurement).
+        2. **Anchored estimate** from measured points at OTHER contexts
+           for the same (model, kv_cache_type) — ``estimate_vram`` (M1.5).
+           Interpolates/extrapolates real data, far tighter than the
+           param-count guess.
+        3. **Base estimate** = model weights (``get_or_estimate_size``) +
+           KV slot at this context, scaled to the instance precision. Used
+           until the self-learning store has ANY measurement for the model
+           at this KV precision.
 
         Args:
             model: Model name.
@@ -1036,6 +1338,12 @@ class ModelRegistry:
             metadata isn't cached (conservative — better to under-
             estimate KV than refuse the request).
         """
+        measured = self.get_measured_vram(model, kv_cache_type, num_ctx)
+        if measured is not None:
+            return measured
+        anchored = self.estimate_vram(model, kv_cache_type, num_ctx)
+        if anchored is not None:
+            return anchored
         size = await self.get_or_estimate_size(model)
         kv = self.get_kv_per_slot_scaled(model, kv_cache_type, ctx=num_ctx) or 0
         return size + kv

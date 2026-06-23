@@ -143,6 +143,7 @@ def tmp_marshal_paths(tmp_path: Path) -> dict[str, Path]:
     return {
         "registry_path": tmp_path / "model_sizes.json",
         "metadata_path": tmp_path / "model_metadata.json",
+        "vram_path": tmp_path / "model_vram.json",
         "audit_path": tmp_path / "audit.jsonl",
         "metrics_path": tmp_path / "metrics.json",
     }
@@ -242,6 +243,7 @@ def make_test_app(cfg: MarshalConfig, tmp_marshal_paths: dict[str, Path]) -> Fas
     app.state.metrics_path = tmp_marshal_paths["metrics_path"]
     app.state.registry_path = tmp_marshal_paths["registry_path"]
     app.state.metadata_path = tmp_marshal_paths["metadata_path"]
+    app.state.vram_path = tmp_marshal_paths["vram_path"]
     return app
 
 
@@ -435,6 +437,15 @@ def build_test_config_yaml(
         "  metrics_persist_interval_s: 3600",
         f"  ollama_forward_timeout_s: {INTEGRATION_FORWARD_TIMEOUT_S}",
         f"  idle_eviction_minutes: {idle_eviction_minutes}",
+        # Keep the subprocess marshal's metrics off the user's real
+        # ~/.ollama-marshal. MARSHAL_STATE_DIR isolates the registry files
+        # but metrics_path is its own config key, saved unconditionally on
+        # shutdown, so it must be redirected here too.
+        *(
+            [f"  metrics_path: {str(metrics_path)!r}"]
+            if metrics_path is not None
+            else []
+        ),
         "shutdown:",
         '  mode: "immediate"',
         "  drain_timeout: 5",
@@ -506,6 +517,13 @@ async def marshal_subprocess(
             "--host",
             "127.0.0.1",
         ],
+        # MARSHAL_STATE_DIR redirects the registry's on-disk state
+        # (model_sizes/metadata/vram.json) into the per-test tmp dir. The
+        # subprocess can't take the in-process ``app.state.*_path``
+        # overrides, so without this the subprocess marshal — and the M1
+        # self-learning feedback loop in particular — would write measured
+        # VRAM into the user's real ``~/.ollama-marshal``.
+        env={**os.environ, "MARSHAL_STATE_DIR": str(tmp_path)},
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,  # avoid PIPE deadlock if marshal logs >64KB
     )

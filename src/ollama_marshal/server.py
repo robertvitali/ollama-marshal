@@ -60,17 +60,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _started_at = time.monotonic()
 
     # Initialize components. ModelRegistry's on-disk cache paths can
-    # be overridden via `app.state.registry_path` and
-    # `app.state.metadata_path` — only used by integration tests so
-    # the suite doesn't clobber the user's production-marshal registry
-    # at ~/.ollama-marshal/. Production code never sets these
-    # attributes; the registry uses its built-in defaults.
+    # be overridden via `app.state.registry_path`,
+    # `app.state.metadata_path`, and `app.state.vram_path` — only used
+    # by integration tests so the suite doesn't clobber the user's
+    # production-marshal registry at ~/.ollama-marshal/. Production code
+    # never sets these attributes; the registry uses its built-in
+    # defaults.
     _queues = ModelQueues()
     _memory = MemoryManager(_config)
     _registry = ModelRegistry(
         ollama_host=_config.ollama.host,
         registry_path=getattr(app.state, "registry_path", None),
         metadata_path=getattr(app.state, "metadata_path", None),
+        vram_path=getattr(app.state, "vram_path", None),
     )
     _lifecycle = ModelLifecycle(ollama_host=_config.ollama.host)
     _scheduler = Scheduler(

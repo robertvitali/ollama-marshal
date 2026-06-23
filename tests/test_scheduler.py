@@ -9,7 +9,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from ollama_marshal.config import MarshalConfig, Priority, ProgramConfig
+from ollama_marshal.config import KVCacheType, MarshalConfig, Priority, ProgramConfig
 from ollama_marshal.lifecycle import LoadResult
 from ollama_marshal.queue import ModelQueues, RequestEnvelope
 from ollama_marshal.scheduler import (
@@ -3480,3 +3480,47 @@ class TestStarvationFloor:
         assert result is False
         assert "new-model" not in sched._preload_failures
         sched.lifecycle.preload.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Self-learning measured-VRAM feedback loop (Memory rework M1)
+# ---------------------------------------------------------------------------
+
+
+class TestLearnMeasuredVram:
+    """`_learn_measured_vram` feeds live /api/ps VRAM back into the registry."""
+
+    def test_records_live_vram_against_allocated_num_ctx(self):
+        memory = MagicMock()
+        registry = MagicMock()
+        registry.record_measured_vram = MagicMock()
+        sched = _make_scheduler(memory=memory, registry=registry)
+        # Override AFTER construction — _apply_instance_defaults resets
+        # get_loaded_models_on to {}.
+        loaded_model = MagicMock(size_vram=2_000_000_000)
+        memory.get_loaded_models_on.return_value = {"m:1": loaded_model}
+        memory.get_allocated_num_ctx.return_value = 4096
+
+        sched._learn_measured_vram()
+
+        # Default single-instance config runs f16 KV cache.
+        registry.record_measured_vram.assert_called_once_with(
+            "m:1", KVCacheType.F16, 4096, 2_000_000_000
+        )
+
+    def test_skips_zero_size_and_unknown_num_ctx(self):
+        memory = MagicMock()
+        registry = MagicMock()
+        registry.record_measured_vram = MagicMock()
+        sched = _make_scheduler(memory=memory, registry=registry)
+        memory.get_loaded_models_on.return_value = {
+            "zero:1": MagicMock(size_vram=0),  # not yet measured / CPU-only
+            "noctx:1": MagicMock(size_vram=1_000),  # ctx unknown below
+        }
+        memory.get_allocated_num_ctx.side_effect = lambda name, instance_url=None: (
+            None if name == "noctx:1" else 4096
+        )
+
+        sched._learn_measured_vram()
+
+        registry.record_measured_vram.assert_not_called()

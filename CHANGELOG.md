@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Self-learning measured-VRAM footprint, keyed by (model,
+  kv_cache_type, num_ctx).** Marshal now learns each model's real VRAM
+  from live `/api/ps` observations instead of trusting disk-size/param
+  estimates. The scheduler tick correlates a loaded model's live
+  `size_vram` with the `num_ctx` it was loaded at and the instance's
+  KV-cache precision, recording a **high-water mark** per
+  `(model, kv_cache_type, num_ctx)` triple (a later, lower reading never
+  lowers a remembered peak; each context size and KV precision is its own
+  independent key, so a heavy 32k-context run and a light 4k run never
+  pull each other down). `get_total_footprint` consults this measured
+  store first — returning the measurement directly, which also fixes a
+  latent double-count where the old path added a KV slot on top of a
+  measurement that already included KV. Persisted to `model_vram.json`
+  (corrupt-tolerant load), pruned when a model is removed/uninstalled.
+  For contexts not yet measured, `estimate_vram` anchors on the measured
+  points for the same `(model, kv_cache_type)` — linear fit across two
+  points, or a single point plus the architectural KV delta — with a
+  monotonic floor that never estimates below a known smaller-context
+  requirement. (Memory-subsystem rework M1 + M1.5; the live-memory read,
+  budget reconciliation, and attempt-and-learn failure recording land in
+  M2.)
+- **`MARSHAL_STATE_DIR` env override for the registry's on-disk state.**
+  Redirects `model_sizes.json` / `model_metadata.json` / `model_vram.json`
+  away from the default `~/.ollama-marshal`. Used by the integration suite
+  so a subprocess marshal (which can't take the in-process
+  `app.state.*_path` overrides) doesn't write learned VRAM into the user's
+  production state.
 - **Anti-starvation floor for normal-priority batches (co-residency
   stopgap).** A CRITICAL-priority program (which can preempt without
   bound) could starve a long-running normal-priority batch for hours by

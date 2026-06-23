@@ -219,3 +219,6 @@ __marimo__/
 
 # Claude Code local state (per-user; never committed)
 .claude/
+
+# oh-my-claudecode orchestration state (per-worktree; never committed)
+.omc/

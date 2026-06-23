@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from ollama_marshal.config import KVCacheType
 from ollama_marshal.registry import ModelMetadata, ModelRegistry
 
 PATCH_ASYNC_CLIENT = "ollama_marshal.registry.httpx.AsyncClient"
@@ -22,6 +23,7 @@ def registry(tmp_path):
     return ModelRegistry(
         ollama_host="http://localhost:11434",
         registry_path=tmp_path / "model_sizes.json",
+        vram_path=tmp_path / "model_vram.json",
     )
 
 
@@ -41,6 +43,7 @@ def populated_registry(tmp_path, populated_cache):
     reg = ModelRegistry(
         ollama_host="http://localhost:11434",
         registry_path=populated_cache,
+        vram_path=tmp_path / "model_vram.json",
     )
     reg._load_cache()
     return reg
@@ -1513,6 +1516,286 @@ class TestGetTotalFootprint:
         size = await registry.get_total_footprint("x:1", 1024, KVCacheType.F16)
         # Equal to model size (KV slot contribution falls back to 0).
         assert size == 4 * 1024**3
+
+    async def test_prefers_measured_vram_returned_directly_no_kv_added(self, registry):
+        """A measured (model, kv, num_ctx) is returned as-is — no KV added.
+
+        The measurement already includes weights + KV at that context, so
+        adding ``kv_per_slot`` again would double-count. Seed metadata so
+        the estimate path WOULD add a nonzero KV slot, proving the measured
+        branch bypasses it.
+        """
+        _seed_metadata(registry)
+        registry._sizes["x:1"] = 4 * 1024**3
+        registry.record_measured_vram("x:1", KVCacheType.F16, 1024, 9 * 1024**3)
+        got = await registry.get_total_footprint("x:1", 1024, KVCacheType.F16)
+        assert got == 9 * 1024**3
+
+    async def test_single_measured_point_drives_anchored_estimate(self, registry):
+        """One measured point anchors the estimate for other contexts (M1.5).
+
+        With metadata present, a request at a larger ctx returns the
+        measured anchor plus the architectural KV delta — strictly above
+        the anchor, never the raw param-count base estimate.
+        """
+        _seed_metadata(registry)
+        registry._sizes["x:1"] = 4 * 1024**3
+        registry.record_measured_vram("x:1", KVCacheType.F16, 1024, 9 * 1024**3)
+        got = await registry.get_total_footprint("x:1", 2048, KVCacheType.F16)
+        assert got > 9 * 1024**3
+
+    async def test_measured_kv_type_does_not_satisfy_other_kv_type(self, registry):
+        """A measurement on f16 must not be returned for a q8_0 lookup."""
+        _seed_metadata(registry)
+        registry._sizes["x:1"] = 4 * 1024**3
+        registry.record_measured_vram("x:1", KVCacheType.F16, 1024, 9 * 1024**3)
+        # No q8_0 measurement / anchor -> base estimate path, not 9 GiB.
+        got = await registry.get_total_footprint("x:1", 1024, KVCacheType.Q8_0)
+        assert got != 9 * 1024**3
+
+    async def test_footprint_at_ctx_zero_uses_base_not_anchor(self, registry):
+        """num_ctx=0 falls to the base weights estimate, not an anchored 0.
+
+        Regression for the below-zero extrapolation: with measured points,
+        an unguarded line through them evaluates to ~0 bytes at ctx 0, which
+        would falsely admit the model as nearly free.
+        """
+        registry._sizes["m:1"] = 4 * 1024**3
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 10 * 1024**3)
+        registry.record_measured_vram("m:1", KVCacheType.F16, 8192, 20 * 1024**3)
+        got = await registry.get_total_footprint("m:1", 0, KVCacheType.F16)
+        # Base = weights (4 GiB) + KV slot at ctx 0 (0). Never 0, never the
+        # anchored extrapolation toward ctx 0.
+        assert got == 4 * 1024**3
+
+
+# ---------------------------------------------------------------------------
+# Measured-VRAM store, keyed by (model, kv_cache_type, num_ctx) — Memory M1
+# ---------------------------------------------------------------------------
+
+
+class TestMeasuredVramStore:
+    """`record_measured_vram` / `get_measured_vram` + high-water + persistence."""
+
+    def test_record_then_get_exact_match(self, registry):
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        assert registry.get_measured_vram("m:1", KVCacheType.F16, 4096) == 5 * 1024**3
+
+    def test_get_miss_returns_none(self, registry):
+        assert registry.get_measured_vram("m:1", KVCacheType.F16, 4096) is None
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        # Same model+kv, different ctx is still a miss (exact-match keying).
+        assert registry.get_measured_vram("m:1", KVCacheType.F16, 8192) is None
+
+    def test_kv_cache_type_is_an_independent_key(self, registry):
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 8 * 1024**3)
+        registry.record_measured_vram("m:1", KVCacheType.Q8_0, 4096, 5 * 1024**3)
+        assert registry.get_measured_vram("m:1", KVCacheType.F16, 4096) == 8 * 1024**3
+        assert registry.get_measured_vram("m:1", KVCacheType.Q8_0, 4096) == 5 * 1024**3
+
+    def test_record_ignores_nonpositive_ctx(self, registry):
+        registry.record_measured_vram("m:1", KVCacheType.F16, 0, 5 * 1024**3)
+        registry.record_measured_vram("m:1", KVCacheType.F16, -1, 5 * 1024**3)
+        assert registry.get_measured_vram("m:1", KVCacheType.F16, 0) is None
+        assert "m:1" not in registry._measured_vram
+
+    def test_record_ignores_nonpositive_size(self, registry):
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 0)
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, -1)
+        assert registry.get_measured_vram("m:1", KVCacheType.F16, 4096) is None
+        assert "m:1" not in registry._measured_vram
+
+    def test_high_water_mark_does_not_lower(self, registry):
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 4 * 1024**3)
+        # A later smaller observation must not lower the remembered peak.
+        assert registry.get_measured_vram("m:1", KVCacheType.F16, 4096) == 5 * 1024**3
+
+    def test_high_water_mark_rises(self, registry):
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 6 * 1024**3)
+        assert registry.get_measured_vram("m:1", KVCacheType.F16, 4096) == 6 * 1024**3
+
+    def test_smaller_ctx_run_does_not_lower_larger_ctx_history(self, registry):
+        # Heavy 32k run learned first; later a light 4k run of the same
+        # model must not pull the 32k high-water mark down.
+        registry.record_measured_vram("m:1", KVCacheType.F16, 32768, 10 * 1024**3)
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        assert registry.get_measured_vram("m:1", KVCacheType.F16, 32768) == 10 * 1024**3
+        assert registry.get_measured_vram("m:1", KVCacheType.F16, 4096) == 5 * 1024**3
+
+    def test_save_skipped_when_high_water_not_raised(self, registry):
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        registry._save_vram_cache = MagicMock()  # type: ignore[method-assign]
+        # Equal value → no rise → no write.
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        # Lower value → no rise → no write.
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 4 * 1024**3)
+        registry._save_vram_cache.assert_not_called()
+        # Higher value → rise → one write.
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 6 * 1024**3)
+        registry._save_vram_cache.assert_called_once()
+
+    def test_persistence_roundtrip(self, registry, tmp_path):
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        registry.record_measured_vram("m:1", KVCacheType.Q8_0, 32768, 10 * 1024**3)
+        # Fresh registry reading the same on-disk file.
+        reloaded = ModelRegistry(
+            ollama_host="http://localhost:11434",
+            registry_path=tmp_path / "model_sizes.json",
+            vram_path=registry.vram_path,
+        )
+        reloaded._load_vram_cache()
+        assert reloaded.get_measured_vram("m:1", KVCacheType.F16, 4096) == 5 * 1024**3
+        assert (
+            reloaded.get_measured_vram("m:1", KVCacheType.Q8_0, 32768) == 10 * 1024**3
+        )
+
+    def test_load_corrupt_json_starts_empty(self, tmp_path):
+        path = tmp_path / "model_vram.json"
+        path.write_text("{not valid json")
+        reg = ModelRegistry(vram_path=path)
+        reg._load_vram_cache()
+        assert reg._measured_vram == {}
+
+    def test_load_non_dict_starts_empty(self, tmp_path):
+        path = tmp_path / "model_vram.json"
+        path.write_text(json.dumps([1, 2, 3]))
+        reg = ModelRegistry(vram_path=path)
+        reg._load_vram_cache()
+        assert reg._measured_vram == {}
+
+    def test_load_skips_malformed_entries(self, tmp_path):
+        path = tmp_path / "model_vram.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "good:1": {"f16": {"4096": 5_000_000_000}},
+                    "bad-kv-level:1": ["not", "a", "dict"],
+                    "bad-inner:1": {"f16": ["nope"]},
+                    "empty-kv-key:1": {"": {"4096": 5}},
+                    "bad-ctx:1": {"f16": {"notanint": 5}},
+                    "bad-size:1": {"f16": {"4096": "notanint"}},
+                    "nonpositive:1": {"f16": {"0": 5, "4096": -1}},
+                }
+            )
+        )
+        reg = ModelRegistry(vram_path=path)
+        reg._load_vram_cache()
+        assert reg._measured_vram == {"good:1": {"f16": {4096: 5_000_000_000}}}
+
+    def test_remove_model_drops_measured_vram(self, registry):
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        registry.remove_model("m:1")
+        assert registry.get_measured_vram("m:1", KVCacheType.F16, 4096) is None
+        assert "m:1" not in registry._measured_vram
+
+    async def test_sync_prunes_measured_for_uninstalled_model(self, registry):
+        registry._measured_vram = {
+            "kept:1": {"f16": {4096: 5_000_000_000}},
+            "gone:1": {"f16": {4096: 9_000_000_000}},
+        }
+        registry._fetch_models_with_size = AsyncMock(  # type: ignore[method-assign]
+            return_value=[("kept:1", 100)]
+        )
+        await registry._sync_with_ollama()
+        assert "gone:1" not in registry._measured_vram
+        assert "kept:1" in registry._measured_vram
+
+
+# ---------------------------------------------------------------------------
+# Anchored VRAM estimation from measured points — Memory rework M1.5
+# ---------------------------------------------------------------------------
+
+
+class TestEstimateVram:
+    """`estimate_vram` interpolates/extrapolates from measured anchors."""
+
+    def test_returns_none_with_no_points(self, registry):
+        assert registry.estimate_vram("m:1", KVCacheType.F16, 4096) is None
+
+    def test_two_point_linear_interpolation(self, registry):
+        # 4k -> 4 GiB, 8k -> 6 GiB (line: weights 2 GiB + 0.5 GiB per 1k).
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 4 * 1024**3)
+        registry.record_measured_vram("m:1", KVCacheType.F16, 8192, 6 * 1024**3)
+        # Midpoint 6144 -> 5 GiB.
+        assert registry.estimate_vram("m:1", KVCacheType.F16, 6144) == 5 * 1024**3
+
+    def test_two_point_extrapolation_above_range(self, registry):
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 4 * 1024**3)
+        registry.record_measured_vram("m:1", KVCacheType.F16, 8192, 6 * 1024**3)
+        # 12288 continues the same line -> 8 GiB.
+        assert registry.estimate_vram("m:1", KVCacheType.F16, 12288) == 8 * 1024**3
+
+    def test_monotonic_floor_never_below_smaller_ctx_measurement(self, registry):
+        # Noisy data: 4k measured HIGHER than 8k (4k run peaked). The line
+        # at 6144 dips to ~9 GiB, but the 4k=10 GiB floor holds it up.
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 10 * 1024**3)
+        registry.record_measured_vram("m:1", KVCacheType.F16, 8192, 8 * 1024**3)
+        assert registry.estimate_vram("m:1", KVCacheType.F16, 6144) == 10 * 1024**3
+
+    def test_single_point_with_metadata_adds_kv_delta(self, registry):
+        _seed_metadata(registry, model="m:1")
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        # Larger ctx -> anchor + positive KV delta -> strictly more.
+        got = registry.estimate_vram("m:1", KVCacheType.F16, 8192)
+        assert got is not None
+        assert got > 5 * 1024**3
+
+    def test_single_point_without_metadata_holds_floor(self, registry):
+        # No metadata -> no KV delta -> reuse anchor; the monotonic floor
+        # keeps it at the 4k requirement for a larger ctx.
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        assert registry.estimate_vram("m:1", KVCacheType.F16, 8192) == 5 * 1024**3
+
+    def test_estimate_is_kv_type_scoped(self, registry):
+        # Points exist only on f16; a q8_0 estimate has no anchors -> None.
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 5 * 1024**3)
+        assert registry.estimate_vram("m:1", KVCacheType.Q8_0, 4096) is None
+
+    def test_returns_none_for_nonpositive_ctx(self, registry):
+        # num_ctx <= 0 ("no specific context" sentinel) must NOT extrapolate
+        # the line down toward ctx 0 and yield a zero/negative footprint.
+        registry.record_measured_vram("m:1", KVCacheType.F16, 4096, 10 * 1024**3)
+        registry.record_measured_vram("m:1", KVCacheType.F16, 8192, 20 * 1024**3)
+        assert registry.estimate_vram("m:1", KVCacheType.F16, 0) is None
+        assert registry.estimate_vram("m:1", KVCacheType.F16, -1) is None
+
+    def test_rounds_up_not_down(self, registry):
+        # ceil, not int(): an estimate landing between integers rounds UP so
+        # admission never under-counts VRAM.
+        registry.record_measured_vram("m:1", KVCacheType.F16, 1000, 1000)
+        registry.record_measured_vram("m:1", KVCacheType.F16, 3000, 2001)
+        # Line: slope = 1001/2000 = 0.5005; at 2000 -> 1000 + 0.5005*1000
+        # = 1500.5 -> ceil 1501 (int() would truncate to 1500).
+        assert registry.estimate_vram("m:1", KVCacheType.F16, 2000) == 1501
+
+
+# ---------------------------------------------------------------------------
+# MARSHAL_STATE_DIR env override for registry default paths (M1 isolation)
+# ---------------------------------------------------------------------------
+
+
+class TestStateDirEnvOverride:
+    """`MARSHAL_STATE_DIR` redirects all default registry paths."""
+
+    def test_env_overrides_all_default_paths(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MARSHAL_STATE_DIR", str(tmp_path))
+        reg = ModelRegistry(ollama_host="http://localhost:11434")
+        assert reg.registry_path == tmp_path / "model_sizes.json"
+        assert reg.metadata_path == tmp_path / "model_metadata.json"
+        assert reg.vram_path == tmp_path / "model_vram.json"
+
+    def test_explicit_path_args_win_over_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MARSHAL_STATE_DIR", str(tmp_path / "env"))
+        explicit = tmp_path / "explicit_vram.json"
+        reg = ModelRegistry(vram_path=explicit)
+        assert reg.vram_path == explicit
+
+    def test_default_without_env_is_home(self, monkeypatch):
+        monkeypatch.delenv("MARSHAL_STATE_DIR", raising=False)
+        reg = ModelRegistry()
+        assert reg.vram_path == Path.home() / ".ollama-marshal" / "model_vram.json"
 
 
 # ---------------------------------------------------------------------------
