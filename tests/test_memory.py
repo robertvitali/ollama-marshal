@@ -45,6 +45,8 @@ def _make_config(
     safety_margin="2GB",
     poll_interval=5,
     host="http://localhost:11434",
+    live_memory_enabled=True,
+    live_memory_ewma_alpha=0.3,
 ):
     return MarshalConfig(
         ollama=OllamaConfig(host=host),
@@ -53,6 +55,8 @@ def _make_config(
             os_overhead=os_overhead,
             safety_margin=safety_margin,
             poll_interval=poll_interval,
+            live_memory_enabled=live_memory_enabled,
+            live_memory_ewma_alpha=live_memory_ewma_alpha,
         ),
     )
 
@@ -71,8 +75,16 @@ def _ps_response(*models):
     }
 
 
-def _make_manager(total_ram="64GB"):
-    config = _make_config(total_ram=total_ram)
+def _make_manager(
+    total_ram="64GB",
+    live_memory_enabled=True,
+    live_memory_ewma_alpha=0.3,
+):
+    config = _make_config(
+        total_ram=total_ram,
+        live_memory_enabled=live_memory_enabled,
+        live_memory_ewma_alpha=live_memory_ewma_alpha,
+    )
     with patch("ollama_marshal.memory.psutil"):
         return MemoryManager(config)
 
@@ -388,6 +400,178 @@ class TestCanFitModel:
     def test_zero_size_model_fits(self):
         manager = _make_manager(total_ram="64GB")
         assert manager.can_fit_model(0) is True
+
+
+# ---------------------------------------------------------------------------
+# Live-aware admission (Memory rework M2)
+# ---------------------------------------------------------------------------
+
+
+_GB = 1024**3
+
+
+class TestLiveAwareAdmission:
+    """available_vram = min(static_headroom, smoothed_live - safety_margin)."""
+
+    def test_cold_no_sample_returns_static(self):
+        # Before any poll samples live memory, admission is static-only so
+        # cold-start behavior matches the pre-M2 path.
+        manager = _make_manager(total_ram="64GB")
+        assert manager.live_available() is None
+        assert manager.available_vram() == (64 - 4 - 2) * _GB
+
+    def test_override_seam_returns_injected_without_psutil(self):
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 12 * _GB
+        # _read_live_available short-circuits to the override; psutil is the
+        # construction-time MagicMock and must not be consulted here.
+        assert manager._read_live_available() == 12 * _GB
+        manager.sample_live_available()
+        assert manager.live_available() == 12 * _GB
+
+    def test_min_picks_live_when_tighter(self):
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 10 * _GB
+        manager.sample_live_available()
+        # Live (10GB) - safety_margin (2GB) = 8GB beats static 58GB.
+        assert manager.available_vram() == (10 - 2) * _GB
+
+    def test_min_picks_static_when_live_looser(self):
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 200 * _GB
+        manager.sample_live_available()
+        # Static 58GB is tighter than live 200GB-2GB; static wins.
+        assert manager.available_vram() == (64 - 4 - 2) * _GB
+
+    def test_can_fit_respects_live_pressure(self):
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 10 * _GB
+        manager.sample_live_available()
+        # 8GB live headroom: a 20GB model is refused even though the static
+        # budget (58GB) would admit it; a 4GB model still fits.
+        assert manager.can_fit_model(20 * _GB) is False
+        assert manager.can_fit_model(4 * _GB) is True
+
+    def test_available_can_go_negative_under_extreme_pressure(self):
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 1 * _GB
+        manager.sample_live_available()
+        # 1GB live - 2GB margin = -1GB. Truthful negative; can_fit refuses all.
+        assert manager.available_vram() == -1 * _GB
+        assert manager.can_fit_model(0) is False
+
+    def test_disabled_ignores_live_and_returns_static(self):
+        manager = _make_manager(total_ram="64GB", live_memory_enabled=False)
+        manager._live_available_override = 1 * _GB
+        manager.sample_live_available()
+        # Disabled: sample is a no-op, EWMA stays None, admission is static.
+        assert manager.live_available() is None
+        assert manager.available_vram() == (64 - 4 - 2) * _GB
+
+    def test_ewma_first_sample_is_exact(self):
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 30 * _GB
+        manager.sample_live_available()
+        assert manager.live_available() == 30 * _GB
+
+    def test_ewma_blends_subsequent_samples(self):
+        manager = _make_manager(total_ram="64GB", live_memory_ewma_alpha=0.3)
+        manager._live_available_override = 100 * _GB
+        manager.sample_live_available()
+        manager._live_available_override = 0
+        manager.sample_live_available()
+        # 0.3*0 + 0.7*100GB = 70GB.
+        assert manager.live_available() == 70 * _GB
+
+    def test_live_read_failure_keeps_prior_ewma(self):
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 50 * _GB
+        manager.sample_live_available()
+        manager._live_available_override = None
+        with patch(
+            "ollama_marshal.memory.psutil.virtual_memory",
+            side_effect=RuntimeError("boom"),
+        ):
+            manager.sample_live_available()  # read fails -> EWMA untouched
+        assert manager.live_available() == 50 * _GB
+
+    async def test_poll_loop_samples_live_after_refresh(self):
+        # Mocks only boundaries (httpx.AsyncClient + the override seam +
+        # stdlib asyncio.sleep); refresh() and sample_live_available() run
+        # for real so this exercises actual EWMA behavior, not call wiring.
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 20 * _GB
+        mock_client = _mock_async_client(MagicMock())
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"models": []}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        with (
+            patch(PATCH_ASYNC_CLIENT, return_value=mock_client),
+            patch(
+                "ollama_marshal.memory.asyncio.sleep",
+                side_effect=asyncio.CancelledError,
+            ),
+        ):
+            try:
+                await manager._poll_loop()
+            except asyncio.CancelledError:
+                pass
+        assert manager.live_available() == 20 * _GB
+
+    async def test_poll_loop_samples_live_even_when_refresh_raises(self):
+        # codex P2: a refresh() failure must not freeze the EWMA — the live
+        # sample is a SEPARATE guarded step. Force refresh() to raise through
+        # the httpx boundary (AsyncClient __aenter__ raises), mocking only
+        # the boundary + stdlib sleep (never an internal method), then assert
+        # the live sample still ran.
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 15 * _GB
+        failing_client = MagicMock()
+        failing_client.__aenter__ = AsyncMock(side_effect=RuntimeError("boom"))
+        failing_client.__aexit__ = AsyncMock(return_value=False)
+        with (
+            patch(PATCH_ASYNC_CLIENT, return_value=failing_client),
+            patch(
+                "ollama_marshal.memory.asyncio.sleep",
+                side_effect=asyncio.CancelledError,
+            ),
+        ):
+            try:
+                await manager._poll_loop()
+            except asyncio.CancelledError:
+                pass
+        assert manager.live_available() == 15 * _GB
+
+
+class TestLivePressureBlocks:
+    """live_pressure_blocks: True only when the LIVE term bars the load."""
+
+    def test_disabled_never_blocks(self):
+        manager = _make_manager(total_ram="64GB", live_memory_enabled=False)
+        manager._live_available_override = 1 * _GB
+        manager.sample_live_available()
+        assert manager.live_pressure_blocks(40 * _GB) is False
+
+    def test_unsampled_never_blocks(self):
+        manager = _make_manager(total_ram="64GB")
+        assert manager.live_available() is None
+        assert manager.live_pressure_blocks(40 * _GB) is False
+
+    def test_blocks_when_live_headroom_below_size(self):
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 10 * _GB
+        manager.sample_live_available()
+        # live headroom = 10 - 2 (margin) = 8GB; a 20GB model can't fit live.
+        assert manager.live_pressure_blocks(20 * _GB) is True
+
+    def test_does_not_block_when_live_has_room(self):
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 50 * _GB
+        manager.sample_live_available()
+        # live headroom 48GB >= 20GB: the static budget is the blocker, not
+        # live — eviction can address it, so this is not a live block.
+        assert manager.live_pressure_blocks(20 * _GB) is False
 
 
 # ---------------------------------------------------------------------------

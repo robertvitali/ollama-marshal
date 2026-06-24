@@ -1624,10 +1624,58 @@ class Scheduler:
 
         decision = await self._resolve_routing(model, num_ctx)
         chosen_url = decision.instance.url
+        model_size = await self.registry.get_or_estimate_size(model)
+
+        # Live-aware admission (M2) MUST run BEFORE any destructive unload
+        # (codex). The ``unload_from`` promotion cleanup and the
+        # reload-on-need unload below both delete an already-loaded copy; if
+        # live pressure is going to make us refuse the (re)load, doing the
+        # refusal AFTER those unloads would still destroy a loaded copy and
+        # then refuse — violating the gate-new-only posture (a q4->f16
+        # promotion under live pressure would unload the q4 copy, then refuse
+        # the f16 load, leaving the model not loaded at all). Decide refusal
+        # up front. Skip the check when the model is already loaded at an
+        # adequate slot on ``chosen_url``: serving that copy consumes no new
+        # memory, so it must succeed regardless of live pressure (the
+        # is_loaded_on fast-path below returns it). ``live_pressure_blocks``
+        # is True only when the box can't fit the model no matter how many
+        # co-resident models we evict (the freed RAM won't surface in the
+        # live EWMA until the next poll) — so eviction would be destructive
+        # AND futile; refuse without it, routed through the same bounded
+        # backoff/giveup as the eviction-exhausted path (a transient spike
+        # retries, a genuinely out-of-RAM box 503s, nothing hangs). It is
+        # False when live admission is off/unsampled or when live has room
+        # (then the static budget is the blocker, which the evict loop CAN
+        # address).
+        loaded_adequately = self.memory.is_loaded_on(model, chosen_url) and (
+            num_ctx is None
+            or not self.memory.needs_reload(model, num_ctx, instance_url=chosen_url)
+        )
+        if not loaded_adequately and self.memory.live_pressure_blocks(model_size):
+            logger.warning(
+                "scheduler.load_blocked_by_live_pressure",
+                model=model,
+                instance=chosen_url,
+                size_gb=round(model_size / (1024**3), 2),
+                live_available_gb=round(
+                    (self.memory.live_available() or 0) / (1024**3), 2
+                ),
+            )
+            # Nothing has been unloaded yet (this is BEFORE unload_from and
+            # the reload-on-need unload), so is_reload=False — there is no
+            # lost slot to sentinel.
+            await self._fail_preload_out_of_capacity(
+                model,
+                chosen_url,
+                model_size,
+                is_reload=False,
+            )
+            return False
 
         # Unload stale-tier copies of the same model first (e.g. a
         # promotion off q4_0 returns ``unload_from=[q4]``). Done
-        # BEFORE the new preload so VRAM frees up first.
+        # BEFORE the new preload so VRAM frees up first. Safe here: live
+        # admission already passed above, so we won't unload then refuse.
         for stale in decision.unload_from:
             self.memory.mark_intended_unload(model, instance_url=stale.url)
             await self.lifecycle.unload(model, instance_url=stale.url)
@@ -1661,9 +1709,10 @@ class Scheduler:
             await self.memory.refresh()
             is_reload = True
 
-        model_size = await self.registry.get_or_estimate_size(model)
-
         # Evict if needed (global budget — see MemoryManager docstring).
+        # Live pressure was already handled up front, so a can_fit_model
+        # failure here is a static-budget shortfall the evict loop CAN
+        # address by freeing VRAM marshal's own models hold.
         while not self.memory.can_fit_model(model_size):
             evicted = await self._evict_one(model)
             if not evicted:
@@ -1696,55 +1745,19 @@ class Scheduler:
                     size_gb=round(model_size / (1024**3), 2),
                     available_gb=round(self.memory.available_vram() / (1024**3), 2),
                 )
-                # Failed preload after a successful unload is the worst
-                # case: model is now gone but we couldn't replace it.
-                # Mark allocation as 0 (sentinel) so future calls to
-                # `needs_reload` return True until a successful preload
-                # writes the real value, instead of "defensively"
-                # returning False (which would silently truncate).
-                if is_reload:
-                    self.memory.record_allocated_num_ctx(
-                        model, 0, instance_url=chosen_url
-                    )
-                # Bug C (v0.6.7): this cannot-fit / eviction-exhausted
-                # branch used to return False WITHOUT touching the
-                # per-model failure-state machine, so ``forced_load`` and
-                # critical preemption re-entered ``_ensure_model_loaded``
-                # every 0.1s tick and spun hot — skip_count climbed past
-                # 6000 in ~30s with no escape valve, and the waiting
-                # request hung forever. Route the failure through the
-                # SAME backoff + giveup machine ``_attempt_preload`` uses:
-                # ``_record_preload_failure`` sets a cooldown so the next
-                # tick short-circuits at the top of this method (bounding
-                # CPU), and after ``preload_max_consecutive_failures``
-                # attempts ``_give_up_on_preload`` drains the queue and
-                # fails every waiting envelope with a 503. Both the
-                # forced_load (normal) and critical-preemption callers
-                # reach this branch, so both are covered.
-                #
-                # Drop any ``_needs_reload`` marker for the chosen instance
-                # FIRST — mirrors the post-``_attempt_preload`` discard
-                # below. A model flagged for Ollama-side reload bypasses
-                # the cooldown (``bypass_cooldown`` at the top of this
-                # method); leaving the marker in place would keep that
-                # bypass on, so every tick would skip the cooldown,
-                # re-enter, and bump the failure counter — converting the
-                # backoff into per-tick hammering and tripping giveup
-                # prematurely while transient contention might still clear
-                # (codex P1).
-                self._needs_reload.discard((model, chosen_url))
-                failures = self._record_preload_failure(model)
-                if failures >= self.config.scheduler.preload_max_consecutive_failures:
-                    await self._give_up_on_preload(
-                        model,
-                        error=PreloadFailedError(
-                            f"cannot fit model {model!r} "
-                            f"({round(model_size / (1024**3), 2)} GB) after "
-                            f"{self.config.scheduler.preload_max_consecutive_failures} "
-                            "attempts; marshal is out of capacity"
-                        ),
-                        reason="cannot_fit",
-                    )
+                # Eviction is exhausted: nothing left to free and the model
+                # still doesn't fit the static budget. Route through the
+                # shared bounded backoff + giveup machine (Bug C escape
+                # valve) — the same handling the M2 live-pressure refusal
+                # uses. See ``_fail_preload_out_of_capacity`` for the
+                # is_reload-sentinel + needs_reload-discard-first + backoff
+                # ordering rationale.
+                await self._fail_preload_out_of_capacity(
+                    model,
+                    chosen_url,
+                    model_size,
+                    is_reload=is_reload,
+                )
                 return False
 
         success = await self._attempt_preload(
@@ -1775,6 +1788,59 @@ class Scheduler:
             # failed. Don't pretend we have an allocation we don't.
             self.memory.record_allocated_num_ctx(model, 0, instance_url=chosen_url)
         return success
+
+    async def _fail_preload_out_of_capacity(
+        self,
+        model: str,
+        chosen_url: str,
+        model_size: int,
+        *,
+        is_reload: bool,
+    ) -> None:
+        """Route an out-of-capacity preload through the bounded backoff machine.
+
+        Shared by the eviction-exhausted (static-budget) path and the M2
+        live-pressure path — both have already decided eviction cannot make
+        ``model`` fit, so neither evicts here. Mirrors the Bug C escape
+        valve: record a per-model preload failure so the next tick
+        short-circuits on the cooldown (bounding CPU), and after
+        ``preload_max_consecutive_failures`` attempts drain the queue with a
+        503 instead of hanging the waiting request forever. Both the
+        ``forced_load`` (normal) and critical-preemption callers reach this
+        path, so both are covered.
+
+        Args:
+            model: The model that couldn't be loaded.
+            chosen_url: Instance the load targeted.
+            model_size: Estimated weights size in bytes (for the error text).
+            is_reload: True when the model was unloaded to reload at a larger
+                num_ctx and never came back — keeps the 0 allocation sentinel
+                so a later request can't dispatch against a slot we lost.
+        """
+        if is_reload:
+            # Model was unloaded then the (re)load failed: keep the 0
+            # sentinel so ``needs_reload`` stays True until a real preload
+            # writes the size, instead of silently truncating against a slot
+            # we don't have.
+            self.memory.record_allocated_num_ctx(model, 0, instance_url=chosen_url)
+        # Drop the needs_reload marker FIRST: a flagged model bypasses the
+        # preload cooldown (``bypass_cooldown`` at the top of
+        # ``_ensure_model_loaded``), so leaving it on would convert the
+        # jittered backoff into per-tick hammering and trip giveup
+        # prematurely while transient contention might still clear (codex P1).
+        self._needs_reload.discard((model, chosen_url))
+        failures = self._record_preload_failure(model)
+        if failures >= self.config.scheduler.preload_max_consecutive_failures:
+            await self._give_up_on_preload(
+                model,
+                error=PreloadFailedError(
+                    f"cannot fit model {model!r} "
+                    f"({round(model_size / (1024**3), 2)} GB) after "
+                    f"{self.config.scheduler.preload_max_consecutive_failures} "
+                    "attempts; marshal is out of capacity"
+                ),
+                reason="cannot_fit",
+            )
 
     async def _tag_pending_with_decision(
         self,

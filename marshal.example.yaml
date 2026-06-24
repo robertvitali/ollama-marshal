@@ -52,6 +52,19 @@ memory:
   os_overhead: "4GB"               # MARSHAL_MEMORY_OS_OVERHEAD — reserved for OS
   safety_margin: "2GB"             # MARSHAL_MEMORY_SAFETY_MARGIN — buffer
   poll_interval: 5                 # MARSHAL_MEMORY_POLL_INTERVAL — seconds between /api/ps polls
+  # Live-aware admission (Memory rework M2). When on, marshal gates NEW
+  # model loads on the live OS-available RAM sampled each poll, not just
+  # the startup-frozen configured budget — effective headroom becomes
+  # min(configured_headroom, smoothed_live_available − safety_margin), so a
+  # load is refused whenever EITHER the budget OR the live OS says it won't
+  # fit (catches non-Ollama RAM consumers the static budget is blind to).
+  # Gate-new-only: never evicts an already-loaded model on a live dip. Set
+  # false to restore pure static-budget admission (v0.6.6 and earlier).
+  live_memory_enabled: true        # MARSHAL_MEMORY_LIVE_MEMORY_ENABLED
+  # EWMA smoothing weight for the live reading (0 < alpha <= 1). Each poll
+  # blends ewma = alpha*sample + (1-alpha)*ewma; higher = more responsive,
+  # lower = steadier. 0.3 ≈ a 15-20s window at the default 5s poll.
+  live_memory_ewma_alpha: 0.3      # MARSHAL_MEMORY_LIVE_MEMORY_EWMA_ALPHA
 
 # Scheduler
 scheduler:

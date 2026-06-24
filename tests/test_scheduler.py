@@ -72,6 +72,17 @@ def _apply_instance_defaults(memory, registry, config):
     # legacy behavior was equivalent).
     memory.is_loaded_on.side_effect = lambda model, _url: bool(memory.is_loaded(model))
     memory.find_instance_for.return_value = _PRIMARY_INSTANCE_URL
+    # M2 live-aware admission: default live_pressure_blocks to "not blocked"
+    # on every memory mock so the early-return in _ensure_model_loaded
+    # doesn't fire just because an unconfigured MagicMock is truthy. Guarded
+    # (mirrors get_total_footprint below) so a test exercising the
+    # live-pressure path can set live_pressure_blocks.return_value = True
+    # before building the scheduler and keep it. live_available feeds only
+    # the warning log on that branch; default it to a real int.
+    if isinstance(memory.live_pressure_blocks.return_value, MagicMock):
+        memory.live_pressure_blocks.return_value = False
+    if isinstance(memory.live_available.return_value, MagicMock):
+        memory.live_available.return_value = 0
     # Likewise, a test that didn't bother to set memory.refresh = AsyncMock
     # still needs an awaitable refresh for the routing-aware load path.
     if not isinstance(memory.refresh, AsyncMock):
@@ -849,6 +860,102 @@ class TestEnsureModelLoaded:
         result = await sched._ensure_model_loaded("fail:latest")
         assert result is False
         assert sched.metrics.model_swaps == 0
+
+    async def test_live_pressure_refuses_without_eviction(self):
+        """M2 (codex P1): live pressure refuses the load without evicting.
+
+        When the LIVE OS reading (not the static budget) is the blocker,
+        evicting marshal's own loaded models is destructive AND futile (the
+        freed RAM won't surface in the EWMA until the next poll). The
+        gate-new-only posture: refuse without touching co-resident models,
+        and route through the bounded backoff so it's an escape valve, not a
+        livelock — never a preload attempt against a box that's out of RAM.
+        """
+        memory = MagicMock()
+        memory.is_loaded.return_value = False
+        # Static budget alone WOULD admit it; the live term is the blocker.
+        memory.can_fit_model.return_value = True
+        memory.live_pressure_blocks.return_value = True
+        memory.live_available.return_value = 1 * 1024**3
+        memory.refresh = AsyncMock()
+
+        registry = MagicMock()
+        registry.get_or_estimate_size = AsyncMock(return_value=4 * 1024**3)
+
+        lifecycle = MagicMock()
+        lifecycle.preload = AsyncMock(return_value=LoadResult.NEW_LOAD)
+        lifecycle.unload = AsyncMock(return_value=True)
+
+        sched = _make_scheduler(memory=memory, registry=registry, lifecycle=lifecycle)
+
+        # Real _ensure_model_loaded control flow — assert through collaborator
+        # effects, not by patching the internal _evict_one (codex P3).
+        result = await sched._ensure_model_loaded("big:latest")
+
+        assert result is False
+        # Refused at the early-return BEFORE the evict loop: no eviction side
+        # effect (eviction would call lifecycle.unload) and no preload
+        # against a box that can't fit it. Because can_fit_model is True, a
+        # regression that dropped the early-return would skip the evict loop
+        # and PRELOAD successfully (recording no failure) — so these
+        # assertions pin the refuse-without-eviction behavior specifically.
+        lifecycle.unload.assert_not_called()
+        lifecycle.preload.assert_not_called()
+        # Routed through the same bounded backoff machine as cannot-fit.
+        assert "big:latest" in sched._preload_failures
+        assert sched._preload_failures["big:latest"].consecutive_failures == 1
+
+    async def test_live_pressure_refuses_before_promotion_unload(self):
+        """M2 (codex HIGH): live-pressure refusal precedes unload_from cleanup.
+
+        A q4->f16 promotion returns unload_from=[q4]. The refusal must happen
+        BEFORE that destructive cleanup — otherwise marshal would unload the
+        loaded q4 copy and THEN refuse, leaving the model not loaded at all
+        (gate-new-only violation). Uses a REAL routing decision (real
+        _resolve_routing + pick_instance), and asserts the q4 copy survives
+        (no unload), nothing is preloaded, and the failure is recorded.
+        """
+        from ollama_marshal.config import KVCacheType, OllamaInstance
+        from ollama_marshal.routing import FitProbe
+
+        f16_url = "http://localhost:11434"
+        q4_url = "http://localhost:11454"
+        config = MarshalConfig(
+            instances=[
+                OllamaInstance(url=f16_url, kv_cache_type=KVCacheType.F16),
+                OllamaInstance(url=q4_url, kv_cache_type=KVCacheType.Q4_0),
+            ],
+        )
+        sched = _make_scheduler(config=config)
+        # Model loaded ONLY on the q4 tier → routing promotes to f16 with
+        # unload_from=[q4]. is_loaded_on must be URL-aware so the f16
+        # chosen_url reads as NOT loaded (else loaded_adequately would
+        # short-circuit the live check).
+        sched.memory.is_loaded_on.side_effect = lambda m, url: (
+            m == "big:latest" and url == q4_url
+        )
+        sched.memory.needs_reload.return_value = False
+        sched.memory.loaded_on.return_value = {f16_url: set(), q4_url: {"big:latest"}}
+        sched.memory.probe_fit.return_value = FitProbe(
+            fits=True, would_evict_non_idle=False
+        )
+        sched.memory.can_fit_model.return_value = True
+        sched.memory.live_pressure_blocks.return_value = True
+        sched.memory.live_available.return_value = 1 * 1024**3
+
+        # Sanity: routing really does promote with unload_from=[q4].
+        decision = await sched._resolve_routing("big:latest", num_ctx=8192)
+        assert decision.instance.url == f16_url
+        assert [i.url for i in decision.unload_from] == [q4_url]
+
+        result = await sched._ensure_model_loaded("big:latest", num_ctx=8192)
+
+        assert result is False
+        # The q4 copy was NOT unloaded (refusal precedes unload_from), and
+        # nothing was preloaded against a box that can't fit it.
+        sched.lifecycle.unload.assert_not_called()
+        sched.lifecycle.preload.assert_not_called()
+        assert "big:latest" in sched._preload_failures
 
 
 # ---------------------------------------------------------------------------

@@ -165,8 +165,40 @@ no separate KV slot is added), then an anchored `estimate_vram`
 (interpolate/extrapolate from measured points for the same model+KV,
 monotonic floor), then the legacy weights+KV estimate. The store only
 ever rises (a smaller-context or partial reading never lowers a remembered
-peak). The live-memory read, budget reconciliation, and
-attempt-and-learn failure recording are M2 (not yet built).
+peak).
+
+Live-aware admission (v0.6.7, Memory rework M2,
+`memory.live_memory_enabled`, default on): the configured budget
+(`memory.py:_calculate_budget`) is frozen at startup and blind to
+non-Ollama RAM consumers (other apps, OS/wired pressure) — `used_vram`
+only subtracts models visible in `/api/ps`. M2 makes `available_vram`
+the conservative `min(static_headroom, smoothed_live_available −
+safety_margin)`, where the live term is `psutil.virtual_memory().
+available` sampled once per poll (in `_poll_loop`, NOT in the scheduler's
+mid-tick `refresh` calls) and smoothed with an EWMA
+(`live_memory_ewma_alpha`, default 0.3). So a NEW load is admitted only
+when BOTH the static budget AND the live OS agree it fits — strictly
+tightening admission, never loosening. Cold start (no sample yet) and
+`live_memory_enabled=False` both fall back to the pre-M2 static-only
+path. **Gate-new-only:** a live-RAM dip never evicts an already-loaded
+model. When the LIVE term (not the static budget) blocks a new load,
+`live_pressure_blocks` makes the scheduler (`_ensure_model_loaded`)
+REFUSE it up front — BEFORE any destructive unload (the `unload_from`
+promotion cleanup and the reload-on-need unload), so a q4→f16 promotion
+under live pressure can't unload the old copy and then refuse — and
+WITHOUT running the evict-to-fit loop — evicting co-resident
+models there would be destructive AND futile, since the freed RAM
+wouldn't surface in the EWMA until the next poll, so the loop would churn
+through every victim and still fail. The refusal routes through the same
+bounded backoff/giveup as the eviction-exhausted path
+(`_fail_preload_out_of_capacity`, the Bug C escape valve): a transient
+spike retries, a genuinely out-of-RAM box 503s, nothing hangs. STATIC-
+budget eviction (evict-to-fit on a new admission, when the live term has
+room) is unchanged. `available_vram` can read negative under live
+pressure (truthful — `can_fit_model` then refuses every new load).
+Test/integration injection seam: set `_live_available_override` (bypasses
+psutil) and call `sample_live_available`. Observability (status + doctor)
+is M3; integration tests under simulated pressure are M4.
 
 ## Testing Rules
 

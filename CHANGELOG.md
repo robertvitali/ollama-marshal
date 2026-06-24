@@ -30,6 +30,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requirement. (Memory-subsystem rework M1 + M1.5; the live-memory read,
   budget reconciliation, and attempt-and-learn failure recording land in
   M2.)
+- **Live-aware admission control (`memory.live_memory_enabled`, default
+  on).** Admission no longer trusts only the startup-frozen configured
+  budget, which is blind to non-Ollama RAM consumers (other apps, OS
+  pressure) and so could over-admit until Ollama silently evicted or the
+  box swapped. Marshal now samples the live OS-available RAM each poll,
+  smooths it with an EWMA (`memory.live_memory_ewma_alpha`, default 0.3),
+  and admits a **new** model only when the conservative
+  `min(configured_headroom, smoothed_live_available − safety_margin)`
+  says it fits — refusing whenever EITHER the budget OR the live OS
+  disagrees. This strictly tightens admission (never loosens it) and is
+  **gate-new-only**: a live-RAM dip never evicts an already-loaded model.
+  When the live term (not the static budget) is the blocker, the new load
+  is refused WITHOUT evicting any co-resident model — routed through the
+  same bounded backoff/giveup as the eviction-exhausted path, so a
+  transient spike retries and an out-of-RAM box returns a 503 rather than
+  churning through victims or hanging. Static-budget eviction (evict-to-fit
+  on a new admission, when live has room) is unchanged. Cold start (before
+  the first sample) and `live_memory_enabled:
+  false` both fall back to the previous static-budget behavior.
+  (Memory-subsystem rework M2; status/doctor observability is M3,
+  integration tests under simulated pressure are M4.)
 - **`MARSHAL_STATE_DIR` env override for the registry's on-disk state.**
   Redirects `model_sizes.json` / `model_metadata.json` / `model_vram.json`
   away from the default `~/.ollama-marshal`. Used by the integration suite

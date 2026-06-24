@@ -170,6 +170,36 @@ class MemoryConfig(BaseModel):
         default=5,
         description="Seconds between /api/ps polls",
     )
+    live_memory_enabled: bool = Field(
+        default=True,
+        description=(
+            "Live-aware admission (Memory rework M2): gate NEW model loads "
+            "on the live OS-available RAM sampled each poll, not just the "
+            "startup-frozen configured budget. Effective headroom becomes "
+            "min(configured_headroom, smoothed_live_available - safety_margin), "
+            "so marshal refuses a new load whenever EITHER the configured "
+            "budget OR the live OS reading says it won't fit — catching "
+            "non-Ollama RAM consumers (other apps, OS pressure) that the "
+            "static budget is blind to. Gate-new-only: never evicts an "
+            "already-loaded model on a live-RAM dip (evict-to-fit on a new "
+            "admission is the pre-existing path, unchanged). Set False to "
+            "restore the pure static-budget behavior (v0.6.6 and earlier)."
+        ),
+    )
+    live_memory_ewma_alpha: float = Field(
+        default=0.3,
+        gt=0,
+        le=1,
+        description=(
+            "Smoothing weight for the live OS-available reading. Each poll "
+            "blends the new sample as ewma = alpha*sample + (1-alpha)*ewma, "
+            "so transient RAM spikes don't flap admission at the margin. "
+            "Higher = more responsive to the latest reading (less smoothing); "
+            "lower = steadier (longer effective memory). 0.3 gives roughly a "
+            "15-20s effective window at the default 5s poll interval. Only "
+            "meaningful when live_memory_enabled is True."
+        ),
+    )
 
 
 class SchedulerConfig(BaseModel):

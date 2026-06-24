@@ -102,6 +102,24 @@ class MemoryManager:
         # at least one entry (legacy ``ollama.host`` is auto-promoted).
         self._instances: list[OllamaInstance] = list(config.instances)
         self._poll_interval = config.memory.poll_interval
+        # Live-aware admission (Memory rework M2). The configured budget
+        # (``_budget``) is frozen at startup and blind to non-Ollama RAM
+        # consumers (other apps, OS pressure). ``_live_available_ewma`` is
+        # a smoothed sample of the OS's reported available bytes, refreshed
+        # once per poll. ``available_vram`` takes the conservative min of
+        # the static headroom and this live reading so a new load is
+        # admitted only when BOTH agree it fits. None until the first
+        # sample — before that, admission falls back to static-only so
+        # cold-start behavior matches the pre-M2 (static-budget) path.
+        self._live_memory_enabled = config.memory.live_memory_enabled
+        self._live_ewma_alpha = config.memory.live_memory_ewma_alpha
+        self._live_available_ewma: float | None = None
+        # Test-injection seam: when set, ``_read_live_available`` returns
+        # this instead of polling psutil. Lets unit + integration tests
+        # drive admission under simulated memory pressure deterministically
+        # (Memory rework M4) without patching psutil at the import site.
+        # Prod never sets it.
+        self._live_available_override: int | None = None
         # Per-instance loaded models. Outer key is instance URL, inner
         # key is model name.
         self._loaded_models: dict[str, dict[str, LoadedModel]] = {
@@ -227,6 +245,18 @@ class MemoryManager:
                 raise
             except Exception:
                 logger.warning("memory.poll_error", exc_info=True)
+            # Sample live OS-available RAM once per poll on the same cadence
+            # as the /api/ps view (M2). A SEPARATE guarded step, not chained
+            # after ``refresh`` in the same try: the live reading is
+            # independent of Ollama, so a /api/ps refresh failure must not
+            # skip the sample and freeze the EWMA (codex P2). Kept out of
+            # ``refresh`` itself so the scheduler's explicit mid-tick
+            # ``refresh`` calls stay pure /api/ps reads and only the
+            # background loop drives the EWMA.
+            try:
+                self.sample_live_available()
+            except Exception:
+                logger.warning("memory.live_sample_error", exc_info=True)
             await asyncio.sleep(self._poll_interval)
 
     async def refresh(self) -> None:
@@ -459,9 +489,109 @@ class MemoryManager:
             for m in loaded.values()
         )
 
+    def _read_live_available(self) -> int | None:
+        """Read the OS's currently-available RAM in bytes (or None on error).
+
+        Returns ``_live_available_override`` when set (test injection seam,
+        M4) without touching psutil. Otherwise reads
+        ``psutil.virtual_memory().available`` — the bytes the OS reports
+        free RIGHT NOW, already net of every process (our models, foreign
+        Ollama copies, and non-Ollama consumers alike). A psutil failure is
+        logged and returns None so the caller keeps the prior EWMA rather
+        than crashing the poll loop on a transient read error.
+        """
+        if self._live_available_override is not None:
+            return self._live_available_override
+        try:
+            return int(psutil.virtual_memory().available)
+        except Exception:
+            logger.warning("memory.live_read_failed", exc_info=True)
+            return None
+
+    def sample_live_available(self) -> None:
+        """Fold one live-available reading into the smoothed EWMA (M2).
+
+        No-op when live-aware admission is disabled or the read fails. The
+        first successful sample seeds the EWMA exactly; subsequent samples
+        blend per ``ewma = alpha*sample + (1-alpha)*ewma``. Called once per
+        poll by ``_poll_loop`` (and directly by tests).
+        """
+        if not self._live_memory_enabled:
+            return
+        sample = self._read_live_available()
+        if sample is None:
+            return
+        if self._live_available_ewma is None:
+            self._live_available_ewma = float(sample)
+        else:
+            alpha = self._live_ewma_alpha
+            self._live_available_ewma = (
+                alpha * sample + (1.0 - alpha) * self._live_available_ewma
+            )
+
+    def live_available(self) -> int | None:
+        """Smoothed live OS-available bytes (EWMA), or None before any sample.
+
+        Read-only view of the M2 live-memory signal for diagnostics and
+        the upcoming M3 status/doctor observability. None means no poll has
+        sampled live memory yet (admission is running static-only).
+        """
+        if self._live_available_ewma is None:
+            return None
+        return int(self._live_available_ewma)
+
     def available_vram(self) -> int:
-        """Get remaining VRAM available for loading models (global)."""
-        return self._budget.available - self.used_vram()
+        """Get remaining VRAM available for loading a NEW model (global).
+
+        Pre-M2 this was purely the static headroom
+        ``budget.available - used_vram()`` — blind to non-Ollama RAM
+        consumers. With live-aware admission on (M2, the default), the
+        result is the conservative minimum of that static headroom and the
+        smoothed live OS-available reading (less the safety margin), so a
+        new load is admitted only when BOTH the configured budget and the
+        live OS agree it fits. This strictly tightens admission; it never
+        loosens it.
+
+        Falls back to static-only when live-aware admission is disabled OR
+        no poll has sampled live memory yet (cold start), so behavior
+        matches the pre-M2 path until the first sample lands.
+
+        Can return a value below zero under live pressure — that's
+        intentional and correct (``can_fit_model`` then refuses every new
+        load until pressure eases). It does NOT trigger eviction of
+        already-loaded models on its own; eviction stays driven by a new
+        admission's evict-to-fit loop in the scheduler.
+        """
+        static = self._budget.available - self.used_vram()
+        if not self._live_memory_enabled or self._live_available_ewma is None:
+            return static
+        live_headroom = int(self._live_available_ewma) - self._budget.safety_margin
+        return min(static, live_headroom)
+
+    def live_pressure_blocks(self, model_size: int) -> bool:
+        """Whether LIVE OS memory (not the static budget) bars a new load (M2).
+
+        True only when live-aware admission is on, a sample exists, AND the
+        smoothed live headroom (``ewma - safety_margin``) is below
+        ``model_size`` — i.e. the box physically can't fit the model
+        regardless of how many of MARSHAL's own loaded models get evicted.
+        Evicting frees real RAM, but the freed bytes don't surface in the
+        EWMA until the next poll, so the scheduler's evict-to-fit loop would
+        churn through every victim and still fail.
+
+        The scheduler reads this to REFUSE a new load WITHOUT evicting
+        co-resident models (the gate-new-only posture): eviction under live
+        pressure is both destructive and futile. Returns False when live
+        admission is disabled or unsampled (pre-M2 — the static evict loop
+        decides) and when live has room (then the STATIC budget is the
+        blocker, which eviction CAN address). Mirrors the granularity of the
+        static evict loop, which also gates on the weights-only
+        ``model_size`` rather than the full footprint.
+        """
+        if not self._live_memory_enabled or self._live_available_ewma is None:
+            return False
+        live_headroom = int(self._live_available_ewma) - self._budget.safety_margin
+        return live_headroom < model_size
 
     def can_fit_model(self, model_size: int) -> bool:
         """Check if a model of the given size can fit in available VRAM.
