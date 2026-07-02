@@ -574,6 +574,33 @@ class TestLivePressureBlocks:
         assert manager.live_pressure_blocks(20 * _GB) is False
 
 
+class TestLiveHeadroom:
+    """live_headroom(): the single M3-surfaced live term (ewma - margin)."""
+
+    def test_none_when_disabled(self):
+        manager = _make_manager(total_ram="64GB", live_memory_enabled=False)
+        manager._live_available_override = 10 * _GB
+        manager.sample_live_available()
+        assert manager.live_headroom() is None
+
+    def test_none_when_unsampled(self):
+        manager = _make_manager(total_ram="64GB")
+        assert manager.live_headroom() is None
+
+    def test_returns_ewma_minus_safety_margin(self):
+        manager = _make_manager(total_ram="64GB")
+        manager._live_available_override = 10 * _GB
+        manager.sample_live_available()
+        # 10GB EWMA - 2GB safety margin = 8GB — the exact live term that
+        # available_vram mins against and live_pressure_blocks compares.
+        assert manager.live_headroom() == (10 - 2) * _GB
+
+    def test_live_memory_enabled_property_reflects_config(self):
+        assert _make_manager(total_ram="64GB").live_memory_enabled is True
+        disabled = _make_manager(total_ram="64GB", live_memory_enabled=False)
+        assert disabled.live_memory_enabled is False
+
+
 # ---------------------------------------------------------------------------
 # get_eviction_candidates
 # ---------------------------------------------------------------------------

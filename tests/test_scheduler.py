@@ -904,6 +904,14 @@ class TestEnsureModelLoaded:
         # Routed through the same bounded backoff machine as cannot-fit.
         assert "big:latest" in sched._preload_failures
         assert sched._preload_failures["big:latest"].consecutive_failures == 1
+        # M3 observability: the refusal is counted and remembered so
+        # /api/marshal/status can answer "why did that load bounce".
+        assert sched.metrics.live_pressure_refusals == 1
+        assert sched.last_live_refusal is not None
+        assert sched.last_live_refusal["model"] == "big:latest"
+        assert sched.last_live_refusal["model_size"] == 4 * 1024**3
+        assert sched.last_live_refusal["live_available"] == 1 * 1024**3
+        assert "at" in sched.last_live_refusal
 
     async def test_live_pressure_refuses_before_promotion_unload(self):
         """M2 (codex HIGH): live-pressure refusal precedes unload_from cleanup.
@@ -1636,6 +1644,25 @@ class TestSchedulerMetricsRetryFields:
         assert m.retries_succeeded == 0
         assert m.unexpected_unloads == 0
         assert m.reload_count == 0
+
+    def test_live_pressure_refusals_serializes_and_defaults(self):
+        # v0.6.7 (Memory M3): the counter round-trips through the snapshot
+        # and defaults to 0 when loading a pre-v0.6.7 snapshot.
+        from ollama_marshal.scheduler import _METRICS_SCHEMA_VERSION
+
+        d = SchedulerMetrics(live_pressure_refusals=3).to_json_dict()
+        assert d["live_pressure_refusals"] == 3
+
+        m = SchedulerMetrics.from_json_dict(
+            {
+                "schema_version": _METRICS_SCHEMA_VERSION,
+                "requests_served": 1,
+                "model_swaps": 0,
+                "evictions": 0,
+                "total_wait_ms": 0.0,
+            }
+        )
+        assert m.live_pressure_refusals == 0
 
 
 class TestActiveProgramsAccessor:

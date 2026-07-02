@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live-memory observability on status + doctor (Memory M3).** The
+  `/api/marshal/status` `memory` block gains a `live` subsection —
+  `enabled`, the smoothed `available` EWMA (null until the first poll
+  samples), `headroom` (the exact live term admission mins against:
+  `available − safety_margin`), and `last_refusal` (the most recent
+  load bounced by live pressure: model, instance, size, live reading,
+  timestamp; process-local). `metrics` gains a persisted
+  `live_pressure_refusals` lifetime counter (older metrics snapshots
+  load with 0). `marshal doctor` reads both from the same status fetch
+  and renders a live-memory line plus targeted notes: a warning when
+  refusals are non-zero (live free RAM couldn't fit the load — commonly
+  an external consumer holding RAM, though the static budget may also
+  have been short), a cold-start note when live admission is enabled
+  but unsampled, and a visibility note when it's disabled. Answers
+  "why did that load bounce" without grepping logs.
+
 - **Self-learning measured-VRAM footprint, keyed by (model,
   kv_cache_type, num_ctx).** Marshal now learns each model's real VRAM
   from live `/api/ps` observations instead of trusting disk-size/param

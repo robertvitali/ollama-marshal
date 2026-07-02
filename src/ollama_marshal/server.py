@@ -101,6 +101,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _scheduler.metrics.retries_succeeded = restored.retries_succeeded
     _scheduler.metrics.unexpected_unloads = restored.unexpected_unloads
     _scheduler.metrics.reload_count = restored.reload_count
+    # v0.6.7 counter (Memory M3) — omitting this seed would silently
+    # reset the persisted count to 0 on restart AND overwrite the
+    # nonzero on-disk value at the next save (codex P2).
+    _scheduler.metrics.live_pressure_refusals = restored.live_pressure_refusals
     if restored.requests_served or restored.model_swaps or restored.evictions:
         logger.info(
             "server.metrics_restored",
@@ -450,6 +454,20 @@ def _register_routes(app: FastAPI) -> None:
                     "free": sysswap.free,
                     "percent": sysswap.percent,
                 },
+                # NEW in v0.6.7 (Memory M3): the live-aware admission
+                # signal (M2). `available` is the smoothed EWMA of
+                # psutil available RAM (None until the first poll
+                # samples); `headroom` is that minus the safety margin —
+                # the exact live term admission mins against. A negative
+                # headroom means live pressure is refusing every new
+                # load. `last_refusal` records the most recent load the
+                # live term bounced (None if never; process-local).
+                "live": {
+                    "enabled": _memory.live_memory_enabled,
+                    "available": _memory.live_available(),
+                    "headroom": _memory.live_headroom(),
+                    "last_refusal": _scheduler.last_live_refusal,
+                },
             },
             "queue": {
                 "total_pending": await _queues.total_pending(),
@@ -474,6 +492,8 @@ def _register_routes(app: FastAPI) -> None:
                 "retries_succeeded": _scheduler.metrics.retries_succeeded,
                 "unexpected_unloads": _scheduler.metrics.unexpected_unloads,
                 "reload_count": _scheduler.metrics.reload_count,
+                # v0.6.7 (Memory M3): loads refused by LIVE OS memory.
+                "live_pressure_refusals": (_scheduler.metrics.live_pressure_refusals),
             },
         }
 

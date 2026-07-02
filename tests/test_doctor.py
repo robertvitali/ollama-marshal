@@ -210,6 +210,66 @@ class TestRenderReport:
         out = render_report(report)
         assert "Ollama is dropping" not in out
 
+    def test_warns_when_live_pressure_refusals_present(self):
+        # v0.6.7 (Memory M3): non-zero refusal counter renders with a
+        # warning plus the live available/headroom line.
+        report = DoctorReport(
+            total_ram_bytes=64 * 1024**3,
+            loaded_models=[],
+            all_models=[],
+            live_pressure_refusals=3,
+            live_memory={
+                "enabled": True,
+                "available": 10 * 1024**3,
+                "headroom": 8 * 1024**3,
+                "last_refusal": None,
+            },
+        )
+        out = render_report(report)
+        assert "Live-pressure refusals (marshal): 3" in out
+        assert "Live OS memory blocked" in out
+        assert "available=10.0 GB" in out
+        assert "headroom=8.0 GB" in out
+
+    def test_live_memory_disabled_renders_disabled(self):
+        report = DoctorReport(
+            total_ram_bytes=64 * 1024**3,
+            loaded_models=[],
+            all_models=[],
+            live_pressure_refusals=0,
+            live_memory={"enabled": False},
+        )
+        out = render_report(report)
+        assert "Live memory (marshal): DISABLED" in out
+        assert "Live OS memory blocked" not in out
+
+    def test_live_memory_unsampled_renders_unsampled(self):
+        report = DoctorReport(
+            total_ram_bytes=64 * 1024**3,
+            loaded_models=[],
+            all_models=[],
+            live_memory={
+                "enabled": True,
+                "available": None,
+                "headroom": None,
+                "last_refusal": None,
+            },
+        )
+        out = render_report(report)
+        assert "available=unsampled" in out
+
+    def test_no_live_lines_when_marshal_absent(self):
+        # Marshal unreachable / pre-v0.6.7: both fields default to None
+        # and no live lines render.
+        report = DoctorReport(
+            total_ram_bytes=64 * 1024**3,
+            loaded_models=[],
+            all_models=[],
+        )
+        out = render_report(report)
+        assert "Live-pressure refusals" not in out
+        assert "Live memory (marshal)" not in out
+
 
 # ---------------------------------------------------------------------------
 # gather_report integration
@@ -407,3 +467,117 @@ class TestGatherReport:
             )
 
         assert report.unexpected_unloads is None
+
+    async def test_bool_counters_rejected_as_malformed(self, mock_psutil):
+        # bool subclasses int — a malformed payload with boolean counters
+        # must not render as counts (codex finding on the M3 review).
+        handlers = {
+            "/api/tags": lambda m, u, **kw: {"models": []},
+            "/api/ps": lambda m, u, **kw: {"models": []},
+            "/api/marshal/status": lambda m, u, **kw: {
+                "metrics": {
+                    "unexpected_unloads": True,
+                    "live_pressure_refusals": True,
+                }
+            },
+        }
+        with self._install_httpx(handlers):
+            report = await gather_report(
+                ollama_host="http://localhost:11434",
+                marshal_status_url="http://localhost:11435/api/marshal/status",
+            )
+
+        assert report.unexpected_unloads is None
+        assert report.live_pressure_refusals is None
+
+    async def test_includes_live_memory_from_marshal(self, mock_psutil):
+        # v0.6.7 (Memory M3): the doctor reads the memory.live block and
+        # the live_pressure_refusals counter from the same status fetch,
+        # and a non-zero refusal count produces the external-consumer note.
+        live_block = {
+            "enabled": True,
+            "available": 10 * 1024**3,
+            "headroom": 8 * 1024**3,
+            "last_refusal": None,
+        }
+        handlers = {
+            "/api/tags": lambda m, u, **kw: {"models": []},
+            "/api/ps": lambda m, u, **kw: {"models": []},
+            "/api/marshal/status": lambda m, u, **kw: {
+                "metrics": {"unexpected_unloads": 0, "live_pressure_refusals": 2},
+                "memory": {"live": live_block},
+            },
+        }
+        with self._install_httpx(handlers):
+            report = await gather_report(
+                ollama_host="http://localhost:11434",
+                marshal_status_url="http://localhost:11435/api/marshal/status",
+            )
+
+        assert report.live_pressure_refusals == 2
+        assert report.live_memory == live_block
+        assert any("LIVE free RAM" in n for n in report.notes)
+
+    async def test_live_memory_cold_start_note(self, mock_psutil):
+        # Enabled but unsampled → the cold-start note, no refusal note.
+        handlers = {
+            "/api/tags": lambda m, u, **kw: {"models": []},
+            "/api/ps": lambda m, u, **kw: {"models": []},
+            "/api/marshal/status": lambda m, u, **kw: {
+                "metrics": {"live_pressure_refusals": 0},
+                "memory": {
+                    "live": {
+                        "enabled": True,
+                        "available": None,
+                        "headroom": None,
+                        "last_refusal": None,
+                    }
+                },
+            },
+        }
+        with self._install_httpx(handlers):
+            report = await gather_report(
+                ollama_host="http://localhost:11434",
+                marshal_status_url="http://localhost:11435/api/marshal/status",
+            )
+
+        assert any("cold start" in n for n in report.notes)
+        assert not any("LIVE free RAM" in n for n in report.notes)
+
+    async def test_live_memory_disabled_note(self, mock_psutil):
+        handlers = {
+            "/api/tags": lambda m, u, **kw: {"models": []},
+            "/api/ps": lambda m, u, **kw: {"models": []},
+            "/api/marshal/status": lambda m, u, **kw: {
+                "metrics": {},
+                "memory": {"live": {"enabled": False}},
+            },
+        }
+        with self._install_httpx(handlers):
+            report = await gather_report(
+                ollama_host="http://localhost:11434",
+                marshal_status_url="http://localhost:11435/api/marshal/status",
+            )
+
+        assert any("DISABLED" in n for n in report.notes)
+
+    async def test_live_memory_absent_from_old_marshal(self, mock_psutil):
+        # A pre-v0.6.7 marshal payload (no memory.live, no refusal
+        # counter) leaves both fields None and adds no live notes.
+        handlers = {
+            "/api/tags": lambda m, u, **kw: {"models": []},
+            "/api/ps": lambda m, u, **kw: {"models": []},
+            "/api/marshal/status": lambda m, u, **kw: {
+                "metrics": {"unexpected_unloads": 7}
+            },
+        }
+        with self._install_httpx(handlers):
+            report = await gather_report(
+                ollama_host="http://localhost:11434",
+                marshal_status_url="http://localhost:11435/api/marshal/status",
+            )
+
+        assert report.unexpected_unloads == 7
+        assert report.live_pressure_refusals is None
+        assert report.live_memory is None
+        assert not any("LIVE free RAM" in n for n in report.notes)

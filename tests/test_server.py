@@ -941,6 +941,42 @@ class TestMarshalStatus:
         assert m["unexpected_unloads"] == 2
         assert m["reload_count"] == 1
 
+    async def test_status_exposes_live_memory_block(self):
+        # v0.6.7 (Memory M3): memory.live surfaces the M2 live-aware
+        # admission signal (enabled / smoothed available / headroom /
+        # last refusal) and metrics grows live_pressure_refusals, so an
+        # operator can see WHY a load bounced without grepping logs.
+        config = MarshalConfig()
+        app = create_app(config)
+
+        server_mod._queues = _mock_queues()
+        memory = _mock_memory()
+        memory.live_memory_enabled = True
+        memory.live_available.return_value = 10 * 1024**3
+        memory.live_headroom.return_value = 8 * 1024**3
+        server_mod._memory = memory
+        sched = _mock_scheduler()
+        sched.metrics.live_pressure_refusals = 4
+        sched.last_live_refusal = {"model": "big:latest"}
+        server_mod._scheduler = sched
+        server_mod._started_at = time.monotonic() - 60
+
+        status_handler = None
+        for route in app.routes:
+            if isinstance(route, Route) and route.path == "/api/marshal/status":
+                status_handler = route.endpoint
+                break
+
+        assert status_handler is not None
+        result = await status_handler()
+
+        live = result["memory"]["live"]
+        assert live["enabled"] is True
+        assert live["available"] == 10 * 1024**3
+        assert live["headroom"] == 8 * 1024**3
+        assert live["last_refusal"] == {"model": "big:latest"}
+        assert result["metrics"]["live_pressure_refusals"] == 4
+
     async def test_status_exposes_paused_field(self):
         # v0.6.6: ``paused`` surfaced on the canonical status endpoint
         # so the integration suite's autouse pause-prod fixture can
@@ -1819,6 +1855,7 @@ class TestLifespan:
                     "model_swaps": 5,
                     "evictions": 2,
                     "total_wait_ms": 12345.6,
+                    "live_pressure_refusals": 9,
                 }
             )
         )
@@ -1849,11 +1886,16 @@ class TestLifespan:
                 assert scheduler.metrics.model_swaps == 5
                 assert scheduler.metrics.evictions == 2
                 assert scheduler.metrics.total_wait_ms == 12345.6
+                # v0.6.7 (Memory M3, codex P2): the refusal counter must
+                # also be seeded — a missed seed would report 0 after
+                # restart AND clobber the on-disk value at the next save.
+                assert scheduler.metrics.live_pressure_refusals == 9
 
         # Final snapshot was rewritten at shutdown.
         on_disk = json.loads(metrics_path.read_text())
         assert on_disk["requests_served"] == 100
         assert on_disk["schema_version"] == 1
+        assert on_disk["live_pressure_refusals"] == 9
 
     async def test_lifespan_starts_with_fresh_metrics_when_no_file(self, tmp_path):
         """No metrics.json on disk → counters start at zero, no error."""

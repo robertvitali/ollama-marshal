@@ -372,7 +372,13 @@ FastAPI auto-generates Swagger UI and the OpenAPI spec:
     "available": 240000000000,
     "used_by_models": 4500000000,
     "system": {"total": 274877906944, "available": 60000000000, "used": 214877906944, "percent": 78.2},
-    "swap": {"total": 5368709120, "used": 0, "free": 5368709120, "percent": 0.0}
+    "swap": {"total": 5368709120, "used": 0, "free": 5368709120, "percent": 0.0},
+    "live": {
+      "enabled": true,
+      "available": 58000000000,
+      "headroom": 55852528640,
+      "last_refusal": null
+    }
   },
   "queue": {
     "total_pending": 5,
@@ -383,10 +389,19 @@ FastAPI auto-generates Swagger UI and the OpenAPI spec:
     "requests_served": 142,
     "model_swaps": 8,
     "evictions": 3,
-    "average_wait_ms": 250
+    "average_wait_ms": 250,
+    "live_pressure_refusals": 0
   }
 }
 ```
+
+`memory.live` (v0.6.7+) is the live-aware admission signal:
+`available` is the smoothed EWMA of the OS's live available RAM (null
+until the first poll samples), `headroom` is `available −
+safety_margin` — the exact live term admission checks — and
+`last_refusal` records the most recent load refused under live
+pressure. `metrics.live_pressure_refusals` counts those refusals over
+the marshal's lifetime; `marshal doctor` warns when it's non-zero.
 
 ## Multi-instance setup (optional, v0.5.0+)
 

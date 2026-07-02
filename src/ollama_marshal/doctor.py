@@ -71,6 +71,12 @@ class DoctorReport:
         notes: Free-form lines explaining the recommendations.
         unexpected_unloads: Lifetime counter from marshal's
             SchedulerMetrics (or None if marshal isn't reachable).
+        live_pressure_refusals: Lifetime count of loads marshal refused
+            because LIVE OS memory couldn't fit them (M2 admission), or
+            None if marshal isn't reachable / predates v0.6.7.
+        live_memory: Marshal's `memory.live` status block (enabled /
+            available / headroom / last_refusal), or None if marshal
+            isn't reachable / predates v0.6.7.
     """
 
     total_ram_bytes: int
@@ -79,6 +85,8 @@ class DoctorReport:
     recommended_env: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     unexpected_unloads: int | None = None
+    live_pressure_refusals: int | None = None
+    live_memory: dict[str, Any] | None = None
 
 
 async def gather_report(
@@ -145,7 +153,21 @@ async def gather_report(
     _populate_recommendations(report)
 
     if marshal_status_url is not None:
-        report.unexpected_unloads = await _fetch_unexpected_unloads(marshal_status_url)
+        status = await _fetch_marshal_status(marshal_status_url)
+        if status is not None:
+            metrics = status.get("metrics") or {}
+            # bool is an int subclass — reject it so a malformed payload
+            # (e.g. "unexpected_unloads": true) can't render as a count.
+            val = metrics.get("unexpected_unloads")
+            if isinstance(val, int) and not isinstance(val, bool):
+                report.unexpected_unloads = val
+            refusals = metrics.get("live_pressure_refusals")
+            if isinstance(refusals, int) and not isinstance(refusals, bool):
+                report.live_pressure_refusals = refusals
+            live = (status.get("memory") or {}).get("live")
+            if isinstance(live, dict):
+                report.live_memory = live
+            _populate_live_memory_notes(report)
 
     return report
 
@@ -167,7 +189,8 @@ async def _fetch_loaded(ollama_host: str) -> dict[str, int]:
     return out
 
 
-async def _fetch_unexpected_unloads(marshal_status_url: str) -> int | None:
+async def _fetch_marshal_status(marshal_status_url: str) -> dict[str, Any] | None:
+    """Fetch marshal's full /api/marshal/status payload (or None if down)."""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(marshal_status_url, timeout=5)
@@ -175,11 +198,49 @@ async def _fetch_unexpected_unloads(marshal_status_url: str) -> int | None:
             data: dict[str, Any] = resp.json()
     except httpx.HTTPError:
         return None
-    metrics = data.get("metrics") or {}
-    val = metrics.get("unexpected_unloads")
-    if isinstance(val, int):
-        return val
-    return None
+    return data
+
+
+def _populate_live_memory_notes(report: DoctorReport) -> None:
+    """Add notes for the M2 live-aware admission signal (Memory M3).
+
+    Deterministic and testable, mirroring _populate_recommendations:
+
+    1. Refusals observed → the box's REAL free RAM blocked loads (the
+       static budget may or may not have had room); point at likely
+       external consumers without asserting sole causality.
+    2. Live admission enabled but never sampled → the poll loop hasn't
+       seeded the EWMA; admission is running static-only.
+    3. Live admission disabled → say so (one-line visibility).
+    """
+    live = report.live_memory
+    if report.live_pressure_refusals is not None and report.live_pressure_refusals > 0:
+        # Causality is deliberately hedged (codex P3): a refusal proves
+        # live headroom < model size at that moment — the static budget
+        # may ALSO have been insufficient. Common culprits are external
+        # consumers, but this note must not assert the budget had room.
+        report.notes.append(
+            f"marshal refused {report.live_pressure_refusals} model load(s) "
+            "because the box's LIVE free RAM couldn't fit them at the "
+            "time. Frequent causes: an external consumer (another "
+            "inference engine, a build, another app) holding RAM the "
+            "static budget doesn't see. Check `top` sorted by memory, "
+            "and compare marshal's memory budget against reality."
+        )
+    if live is None:
+        return
+    if live.get("enabled") and live.get("available") is None:
+        report.notes.append(
+            "Live-aware admission is enabled but no live-memory sample has "
+            "landed yet (cold start) — admission is running static-only "
+            "until the first poll."
+        )
+    elif not live.get("enabled"):
+        report.notes.append(
+            "Live-aware admission (memory.live_memory_enabled) is DISABLED — "
+            "marshal admits loads from its static budget alone and cannot "
+            "see RAM held by other processes."
+        )
 
 
 def _populate_recommendations(report: DoctorReport) -> None:
@@ -286,6 +347,28 @@ def render_report(report: DoctorReport) -> str:
                 "    ⚠ Ollama is dropping models on its own — apply the "
                 "recommendations below."
             )
+    if report.live_pressure_refusals is not None:
+        lines.append(
+            f"  Live-pressure refusals (marshal): {report.live_pressure_refusals}"
+        )
+        if report.live_pressure_refusals > 0:
+            lines.append("    ⚠ Live OS memory blocked model loads — see Notes.")
+    if report.live_memory is not None:
+        live = report.live_memory
+        if live.get("enabled"):
+            avail = live.get("available")
+            headroom = live.get("headroom")
+            avail_s = (
+                f"{avail / (1024**3):.1f} GB" if isinstance(avail, int) else "unsampled"
+            )
+            head_s = (
+                f"{headroom / (1024**3):.1f} GB" if isinstance(headroom, int) else "n/a"
+            )
+            lines.append(
+                f"  Live memory (marshal): available={avail_s}   headroom={head_s}"
+            )
+        else:
+            lines.append("  Live memory (marshal): DISABLED")
     lines.append("")
 
     if report.loaded_models:

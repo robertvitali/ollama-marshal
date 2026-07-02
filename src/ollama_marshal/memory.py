@@ -533,12 +533,31 @@ class MemoryManager:
         """Smoothed live OS-available bytes (EWMA), or None before any sample.
 
         Read-only view of the M2 live-memory signal for diagnostics and
-        the upcoming M3 status/doctor observability. None means no poll has
+        the M3 status/doctor observability. None means no poll has
         sampled live memory yet (admission is running static-only).
         """
         if self._live_available_ewma is None:
             return None
         return int(self._live_available_ewma)
+
+    @property
+    def live_memory_enabled(self) -> bool:
+        """Whether live-aware admission (M2) is configured on."""
+        return self._live_memory_enabled
+
+    def live_headroom(self) -> int | None:
+        """Smoothed live headroom for a NEW load, or None when inactive (M3).
+
+        ``ewma - safety_margin`` — the single live term that
+        ``available_vram`` mins against and ``live_pressure_blocks``
+        compares against (one arithmetic site, no drift). None when
+        live-aware admission is disabled or no poll has sampled yet —
+        both cases where admission runs the static-only path. Surfaced
+        on ``/api/marshal/status`` under ``memory.live.headroom``.
+        """
+        if not self._live_memory_enabled or self._live_available_ewma is None:
+            return None
+        return int(self._live_available_ewma) - self._budget.safety_margin
 
     def available_vram(self) -> int:
         """Get remaining VRAM available for loading a NEW model (global).
@@ -563,10 +582,10 @@ class MemoryManager:
         admission's evict-to-fit loop in the scheduler.
         """
         static = self._budget.available - self.used_vram()
-        if not self._live_memory_enabled or self._live_available_ewma is None:
+        headroom = self.live_headroom()
+        if headroom is None:
             return static
-        live_headroom = int(self._live_available_ewma) - self._budget.safety_margin
-        return min(static, live_headroom)
+        return min(static, headroom)
 
     def live_pressure_blocks(self, model_size: int) -> bool:
         """Whether LIVE OS memory (not the static budget) bars a new load (M2).
@@ -588,10 +607,10 @@ class MemoryManager:
         static evict loop, which also gates on the weights-only
         ``model_size`` rather than the full footprint.
         """
-        if not self._live_memory_enabled or self._live_available_ewma is None:
+        headroom = self.live_headroom()
+        if headroom is None:
             return False
-        live_headroom = int(self._live_available_ewma) - self._budget.safety_margin
-        return live_headroom < model_size
+        return headroom < model_size
 
     def can_fit_model(self, model_size: int) -> bool:
         """Check if a model of the given size can fit in available VRAM.

@@ -197,8 +197,14 @@ budget eviction (evict-to-fit on a new admission, when the live term has
 room) is unchanged. `available_vram` can read negative under live
 pressure (truthful — `can_fit_model` then refuses every new load).
 Test/integration injection seam: set `_live_available_override` (bypasses
-psutil) and call `sample_live_available`. Observability (status + doctor)
-is M3; integration tests under simulated pressure are M4.
+psutil) and call `sample_live_available`. Observability (M3, v0.6.7):
+the status payload's `memory.live` block (enabled / smoothed available /
+headroom / last_refusal) + the persisted `metrics.
+live_pressure_refusals` counter + doctor notes (external-consumer
+warning on refusals, cold-start, disabled). The live arithmetic has a
+single site — `MemoryManager.live_headroom()` — that `available_vram`,
+`live_pressure_blocks`, and the status payload all share. Integration
+tests under simulated pressure are M4.
 
 ## Testing Rules
 

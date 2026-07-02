@@ -298,6 +298,11 @@ class SchedulerMetrics:
         reload_count: Times marshal reloaded a model at a larger num_ctx
             because an incoming request needed more context than the
             current slot allocation (Surface C1 Dim 4).
+        live_pressure_refusals: Times a new model load was refused because
+            LIVE OS memory couldn't fit it at that moment (M2 gate-new-only
+            admission; the static budget may also have been short).
+            Persistent non-zero values commonly point at an external
+            consumer holding RAM the budget doesn't know about.
         started_at: Monotonic timestamp when the scheduler started.
     """
 
@@ -309,6 +314,7 @@ class SchedulerMetrics:
     retries_succeeded: int = 0
     unexpected_unloads: int = 0
     reload_count: int = 0
+    live_pressure_refusals: int = 0
     started_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -336,6 +342,7 @@ class SchedulerMetrics:
             "retries_succeeded": self.retries_succeeded,
             "unexpected_unloads": self.unexpected_unloads,
             "reload_count": self.reload_count,
+            "live_pressure_refusals": self.live_pressure_refusals,
         }
 
     @classmethod
@@ -362,6 +369,8 @@ class SchedulerMetrics:
             retries_succeeded=int(data.get("retries_succeeded", 0)),
             unexpected_unloads=int(data.get("unexpected_unloads", 0)),
             reload_count=int(data.get("reload_count", 0)),
+            # New v0.6.7 field defaults to 0 if loading an older snapshot.
+            live_pressure_refusals=int(data.get("live_pressure_refusals", 0)),
             # started_at is intentionally fresh — current process clock.
         )
 
@@ -465,6 +474,12 @@ class Scheduler:
         self.lifecycle = lifecycle
         self.config = config
         self.metrics = SchedulerMetrics()
+        # Last live-pressure refusal (M3 observability): what was refused,
+        # how big it was, and what the smoothed live reading said at the
+        # time. Surfaced on /api/marshal/status under memory.live so an
+        # operator can see WHY a load bounced without grepping logs.
+        # Process-local (not persisted) — a restart clears it.
+        self.last_live_refusal: dict[str, Any] | None = None
         # Audit logger — defaults to a NULL implementation so callers
         # don't need `if audit:` branches everywhere. Replaced by the
         # server lifespan with a real AuditLogger when audit.enabled.
@@ -1661,6 +1676,16 @@ class Scheduler:
                     (self.memory.live_available() or 0) / (1024**3), 2
                 ),
             )
+            # M3 observability: count the refusal and remember its shape so
+            # /api/marshal/status can answer "why did that load bounce".
+            self.metrics.live_pressure_refusals += 1
+            self.last_live_refusal = {
+                "model": model,
+                "instance_url": chosen_url,
+                "model_size": model_size,
+                "live_available": self.memory.live_available(),
+                "at": datetime.now(UTC).isoformat(),
+            }
             # Nothing has been unloaded yet (this is BEFORE unload_from and
             # the reload-on-need unload), so is_reload=False — there is no
             # lost slot to sentinel.
