@@ -204,7 +204,13 @@ live_pressure_refusals` counter + doctor notes (external-consumer
 warning on refusals, cold-start, disabled). The live arithmetic has a
 single site — `MemoryManager.live_headroom()` — that `available_vram`,
 `live_pressure_blocks`, and the status payload all share. Integration
-tests under simulated pressure are M4.
+tests under simulated pressure (M4, v0.6.7) live in
+`tests/integration/test_live_pressure.py`: refusal-before-preload +
+fast 503 + status observability, gate-new-only (loaded model keeps
+serving under pressure), and recovery after a transient spike — all
+driven through the `_live_available_override` seam with
+`live_memory_ewma_alpha=1.0` so one sample pins the EWMA
+deterministically.
 
 ## Testing Rules
 
